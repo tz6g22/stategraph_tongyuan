@@ -1,0 +1,25 @@
+# Secrets and local credentials
+apikey/
+*.env
+*.key
+*.pem
+
+# Experiment artifacts and datasets
+outputs/
+data/
+external_baselines/
+*.jsonl
+*.sqlite
+*.db
+*.ses
+
+# Python/build caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Documentation and generated reports are intentionally not published here
+*.md
+

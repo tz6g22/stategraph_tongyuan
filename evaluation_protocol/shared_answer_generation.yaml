@@ -1,0 +1,30 @@
+# This file is byte-identical for StateGraph and every admitted baseline.
+version: agent-memory-comparison-v1
+model:
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  base_url_env: ANSWER_GENERATOR_BASE_URL
+  api_key_env: ANSWER_GENERATOR_API_KEY
+  api_key_fallback_env: DEEPSEEK_API_KEY
+  name: deepseek-chat
+  temperature: 0.0
+  max_tokens: 512
+  seed: null
+context:
+  max_items: 10
+  max_tokens: 16000
+  max_characters: 64000
+  token_estimator: unicode_characters_div_4
+  ordering: retrieval_order
+prompt:
+  system: |
+    Answer the user's question using only the supplied retrieved context.
+    Return the requested fact or value itself, not a field name, label, or explanation.
+    If the context is insufficient, state that the available information is insufficient.
+    Return only the final answer.
+  user_template: |
+    Retrieved context:
+    {retrieved_context}
+
+    Question:
+    {question}
