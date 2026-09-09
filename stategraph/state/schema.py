@@ -89,6 +89,12 @@ class RelationType(str, Enum):
     AFFECTS_ACTION = 'affects-action'
 
 
+class DependencyStrength(str, Enum):
+    STRICT = 'strict_dependency'
+    WEAK = 'weak_dependency'
+    NONE = 'no_dependency'
+
+
 @dataclass(frozen=True, slots=True)
 class TimeScope:
     """Half-open validity interval ``[start, end)``; ``None`` means unbounded."""
@@ -351,9 +357,16 @@ class StateRelation:
     reason: str = ''
     evidence_id: str | None = None
     group_id: str = 'default'
+    dependency_strength: DependencyStrength | None = None
+    verification_reason: str = ''
+    verifier_confidence: float | None = None
+    supporting_evidence_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'created_at', ensure_utc(self.created_at))
+        if self.verifier_confidence is not None and not 0.0 <= self.verifier_confidence <= 1.0:
+            raise ValueError('verifier_confidence must be between 0 and 1')
         if self.source_state_id == self.target_state_id:
             raise ValueError('state relation cannot be a self-loop')
 
@@ -394,6 +407,7 @@ class Observation:
 
 __all__ = [
     'ConditionScope',
+    'DependencyStrength',
     'DependencyRelationSelector',
     'EvidenceNode',
     'Evidence',

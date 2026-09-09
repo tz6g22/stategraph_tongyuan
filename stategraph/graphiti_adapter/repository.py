@@ -15,6 +15,7 @@ from typing import Any
 from stategraph.state.extraction import parse_dependency_relation_selectors
 from stategraph.state.schema import (
     ConditionScope,
+    DependencyStrength,
     EvidenceNode,
     RelationType,
     StateNode,
@@ -88,7 +89,12 @@ RETURN r.relation_id AS relation_id,
        r.created_at AS created_at,
        r.reason AS reason,
        r.evidence_id AS evidence_id,
-       r.group_id AS group_id
+       r.group_id AS group_id,
+       r.dependency_strength AS dependency_strength,
+       r.verification_reason AS verification_reason,
+       r.verifier_confidence AS verifier_confidence,
+       r.supporting_evidence_ids_json AS supporting_evidence_ids_json,
+       r.metadata_json AS metadata_json
 """
 
 
@@ -357,6 +363,15 @@ def _relation_to_row(relation: StateRelation) -> dict[str, Any]:
         'reason': relation.reason,
         'evidence_id': relation.evidence_id,
         'group_id': relation.group_id,
+        'dependency_strength': (
+            relation.dependency_strength.value
+            if relation.dependency_strength is not None
+            else None
+        ),
+        'verification_reason': relation.verification_reason,
+        'verifier_confidence': relation.verifier_confidence,
+        'supporting_evidence_ids_json': _json_dump(relation.supporting_evidence_ids),
+        'metadata_json': _json_dump(relation.metadata),
     }
 
 
@@ -370,6 +385,21 @@ def _relation_from_record(record: Mapping[str, Any]) -> StateRelation:
         reason=str(record.get('reason') or ''),
         evidence_id=record.get('evidence_id'),
         group_id=str(record.get('group_id', 'default')),
+        dependency_strength=(
+            DependencyStrength(record['dependency_strength'])
+            if record.get('dependency_strength')
+            else None
+        ),
+        verification_reason=str(record.get('verification_reason') or ''),
+        verifier_confidence=(
+            float(record['verifier_confidence'])
+            if record.get('verifier_confidence') is not None
+            else None
+        ),
+        supporting_evidence_ids=tuple(
+            _json_load(record.get('supporting_evidence_ids_json'), [])
+        ),
+        metadata=_json_load(record.get('metadata_json'), {}),
     )
 
 

@@ -141,7 +141,10 @@ class GraphitiFactStateExtractor:
             raw_effects = (raw_effects,)
         if isinstance(raw_effects, Sequence) and not isinstance(raw_effects, str | bytes):
             for effect in raw_effects:
-                if not isinstance(effect, Mapping):
+                if not isinstance(effect, Mapping) or any(
+                    not str(effect.get(field) or '').strip()
+                    for field in ('entity', 'attribute', 'value')
+                ):
                     continue
                 effects.append(
                     StateSelector(
@@ -157,7 +160,10 @@ class GraphitiFactStateExtractor:
             raw_conflicts = (raw_conflicts,)
         if isinstance(raw_conflicts, Sequence) and not isinstance(raw_conflicts, str | bytes):
             for conflict in raw_conflicts:
-                if not isinstance(conflict, Mapping):
+                if not isinstance(conflict, Mapping) or any(
+                    not str(conflict.get(field) or '').strip()
+                    for field in ('entity', 'attribute', 'value')
+                ):
                     continue
                 conflicts.append(
                     StateSelector(

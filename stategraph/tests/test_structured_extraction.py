@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from stategraph.graphiti_adapter.state_extraction import GraphitiLLMStateExtractor
 from stategraph.state.extraction import GraphitiFact
-from stategraph.state.schema import Observation
+from stategraph.state.schema import Observation, StateCandidate, StateStatus, TimeScope
 from stategraph.system import StateGraph
 
 
@@ -97,6 +97,89 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(records[0]['evidence_grounding_failures']), 1)
         self.assertEqual(records[0]['validation_failures'], [])
 
+    async def test_malformed_relation_target_fails_closed_without_lifecycle_change(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                if kwargs.get('prompt_name') == 'stategraph.existing_slot_grounding.v1':
+                    data = json.loads(messages[1].content)
+                    old = next(s for s in data['existing_current_states'] if s['attribute'] == 'status')
+                    return {'decision':'SAME_SLOT', 'state_ids':[old['state_id']],
+                            'equivalent_state_ids':[], 'confidence':1,
+                            'observation_span':'User status is new.',
+                            'existing_spans':{old['state_id']:'User status was old.'}, 'reason':'same property'}
+                return {
+                    'states': [
+                        {
+                            'entity': 'user',
+                            'attribute': 'status',
+                            'value': 'new',
+                            'evidence_span': 'User status is new.',
+                            'invalidates': [{'entity': None, 'attribute': None, 'value': None}],
+                            'conflicts': [{'entity': None, 'attribute': None, 'value': None}],
+                        }
+                    ]
+                }
+
+        graph = StateGraph(extractor=GraphitiLLMStateExtractor(FakeLLM()))
+        old = StateCandidate(
+            entity='user',
+            attribute='status',
+            value='old',
+            time_scope=TimeScope(),
+            metadata={'evidence_span':'User status was old.'},
+        )
+        unrelated = StateCandidate(
+            entity='user',
+            attribute='availability',
+            value='available',
+            time_scope=TimeScope(),
+        )
+        await graph.ingest(
+            Observation(
+                'User status was old.',
+                datetime(2030, 1, 1, 0, 0, tzinfo=timezone.utc),
+                'unit-test',
+                observation_id='observation-old',
+                group_id='group-1',
+                observation_index=0,
+            ),
+            candidates=[old],
+        )
+        await graph.ingest(
+            Observation(
+                'User availability is available.',
+                datetime(2030, 1, 1, 0, 0, 30, tzinfo=timezone.utc),
+                'unit-test',
+                observation_id='observation-unrelated',
+                group_id='group-1',
+                observation_index=1,
+            ),
+            candidates=[unrelated],
+        )
+        await graph.ingest(
+            Observation(
+                'User status is new.',
+                datetime(2030, 1, 1, 0, 1, tzinfo=timezone.utc),
+                'unit-test',
+                observation_id='observation-2',
+                group_id='group-1',
+                observation_index=1,
+            )
+        )
+        states = await graph.repository.list_states('group-1')
+        status_states = [state for state in states if state.attribute == 'status']
+        self.assertEqual(
+            [(state.value, state.status) for state in status_states],
+            [('old', StateStatus.STALE), ('new', StateStatus.CURRENT)],
+        )
+        availability_states = [state for state in states if state.attribute == 'availability']
+        self.assertEqual(len(availability_states), 1)
+        self.assertEqual(availability_states[0].status, StateStatus.CURRENT)
+        self.assertEqual(
+            [state.value for state in status_states if state.status == StateStatus.CURRENT],
+            ['new'],
+        )
+
     async def test_source_order_and_duplicate_merge_are_deterministic(self) -> None:
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
@@ -160,6 +243,8 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('base verb predicate', llm.system_prompt)
         self.assertIn('event-noun forms', llm.system_prompt)
         self.assertIn('cancellation, revocation, or "no longer"', llm.system_prompt)
+        self.assertIn('underlying property rather than copying', llm.system_prompt)
+        self.assertIn('Do not replace a source condition with true or false', llm.system_prompt)
         self.assertNotIn('MemoryAgentBench', llm.system_prompt)
         self.assertNotIn('LongMemEval', llm.system_prompt)
 
@@ -294,7 +379,7 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidates[0].attribute, 'uses')
         self.assertIsNone(candidates[0].metadata['attribute_span'])
 
-    async def test_unresolved_value_span_is_rejected(self) -> None:
+    async def test_normalized_value_span_does_not_drop_grounded_candidate(self) -> None:
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
                 if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
@@ -318,11 +403,80 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
             ).extract(self.observation('My status is ready.'), ())
             record = json.loads(trace_path.read_text().strip())
 
-        self.assertEqual(candidates, [])
-        self.assertEqual(
-            record['rejected_candidates'][0]['reason'],
-            'value_span_not_grounded_in_observation',
+        self.assertEqual(len(candidates), 1)
+        self.assertIsNone(candidates[0].metadata['value_span'])
+        self.assertEqual(candidates[0].metadata['value_span_raw'], 'not present')
+        self.assertFalse(candidates[0].metadata['value_span_grounded'])
+        self.assertEqual(record['rejected_candidates'], [])
+
+    async def test_quoted_evidence_and_invalid_model_time_keep_grounded_candidate(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
+                    return {'relations': []}
+                return {
+                    'states': [
+                        {
+                            'entity': 'user',
+                            'attribute': 'availability',
+                            'value': 'unavailable',
+                            'evidence_span': '"The user is unavailable on Friday."',
+                            'time_scope': {'start': 'Friday', 'end': 'Friday'},
+                        }
+                    ]
+                }
+
+        candidates = await GraphitiLLMStateExtractor(FakeLLM()).extract(
+            self.observation('The user is unavailable on Friday.'), ()
         )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].metadata['evidence_span'], 'The user is unavailable on Friday.')
+        self.assertEqual(
+            candidates[0].metadata['time_scope_normalization'],
+            'invalid_model_time_scope_defaulted_to_observation',
+        )
+
+    async def test_schema_placeholder_conditions_are_not_state_conditions(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
+                    return {'relations': []}
+                return {
+                    'states': [{
+                        'entity': 'user', 'attribute': 'status', 'value': 'ready',
+                        'condition_scope': {
+                            'condition name': 'status', 'condition value': 'ready'
+                        },
+                        'evidence_span': 'The user status is ready.',
+                    }]
+                }
+
+        candidates = await GraphitiLLMStateExtractor(FakeLLM()).extract(
+            self.observation('The user status is ready.'), ()
+        )
+
+        self.assertEqual(candidates[0].condition_scope.conditions, ())
+
+    async def test_ungrounded_condition_keys_do_not_split_a_state_slot(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                return {
+                    'states': [
+                        {
+                            'entity': 'record',
+                            'attribute': 'status',
+                            'value': 'ready',
+                            'condition_scope': {'reference_time': 'today'},
+                            'evidence_span': 'The record status is ready today.',
+                        }
+                    ]
+                }
+
+        candidates = await GraphitiLLMStateExtractor(FakeLLM()).extract(
+            self.observation('The record status is ready today.'), ()
+        )
+        self.assertEqual(candidates[0].condition_scope.conditions, ())
 
 
 if __name__ == '__main__':

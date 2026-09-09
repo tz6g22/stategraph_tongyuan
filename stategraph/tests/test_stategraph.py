@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from stategraph import (
     ConditionScope,
     DependencyRelationSelector,
+    DependencyStrength,
     EvidenceNode,
     Observation,
     RelationType,
@@ -21,7 +22,11 @@ from stategraph import (
     build_answer_context,
 )
 from stategraph.evaluation import score_invalidation
-from stategraph.graphiti_adapter import GraphitiAdapter
+from stategraph.graphiti_adapter import (
+    DependencyAssessment,
+    GraphitiAdapter,
+    generate_dependency_candidates,
+)
 from stategraph.graphiti_adapter.repository import (
     _evidence_from_record,
     _evidence_to_row,
@@ -32,12 +37,59 @@ from stategraph.graphiti_adapter.repository import (
 )
 from stategraph.graphiti_adapter.state_extraction import GraphitiLLMStateExtractor
 from stategraph.retrieval import CurrentStateRetrieval, GroundedState, Premise, PremiseChecker, ResponsePolicy
-from stategraph.state import GraphitiFact, GraphitiFactStateExtractor
+from stategraph.state import GraphitiFact, GraphitiFactStateExtractor, SlotIdentity, StateLinker
 from stategraph.state.provenance import attach_canonical_slot_provenance
 from stategraph.storage import InMemoryStateRepository
 
 
 UTC = timezone.utc
+
+
+class StrictDependencyDiscovery:
+    async def discover_and_verify_dependencies(
+        self,
+        observation,
+        *,
+        new_states,
+        all_states,
+        direct_invalidation_seed_ids=(),
+    ):
+        candidates = generate_dependency_candidates(
+            observation,
+            new_states=new_states,
+            all_states=all_states,
+            direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+        )
+        assessments = tuple(
+            DependencyAssessment(
+                candidate,
+                DependencyStrength.STRICT,
+                candidate.proposed_relation,
+                'explicit counterfactual necessity verified',
+                1.0,
+                tuple(
+                    dict.fromkeys(
+                        evidence_id
+                        for state in all_states
+                        if state.state_id
+                        in {candidate.prerequisite_state_id, candidate.dependent_state_id}
+                        for evidence_id in state.evidence_ids
+                    )
+                ),
+                observation.content,
+            )
+            for candidate in candidates
+            if candidate.proposed_relation is not None
+        )
+        return candidates, assessments
+
+
+class StaticStrictExtractor(StrictDependencyDiscovery):
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def extract(self, observation, graphiti_facts):
+        return list(self.candidates)
 
 
 class TimezoneNormalizationTests(unittest.IsolatedAsyncioTestCase):
@@ -57,9 +109,139 @@ class TimezoneNormalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(naive.end.tzinfo, UTC)
 
 
-class ExplicitDependencyPopulationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_relation_only_observation_resolves_and_persists_dependency(self) -> None:
+class StateIdentityResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_production_ingest_uses_frozen_linker_without_legacy_slot_grounding(self) -> None:
+        class Extractor:
+            def extract(self, observation, graphiti_facts):
+                return [StateCandidate(
+                    'user', 'free' if observation.observation_id == 'E1' else 'available',
+                    observation.observation_id == 'E1',
+                    canonical_subject_id='user', canonical_field_id='availability',
+                )]
+
+            async def ground_existing_slot(self, *args, **kwargs):
+                raise AssertionError('legacy slot grounding must not run in production ingest')
+
+        graph = StateGraph(extractor=Extractor())
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        first = await graph.ingest(Observation('User is free.', now, 'test', observation_id='E1'))
+        second = await graph.ingest(
+            Observation('User is unavailable.', now + timedelta(days=1), 'test', observation_id='E2')
+        )
+        self.assertEqual(second.invalidated_state_ids, (first.states[0].state_id,))
+
+    async def test_surface_variants_share_explicit_canonical_slot(self) -> None:
         graph = StateGraph()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        first = await graph.ingest(
+            Observation('User is free.', now, 'test'),
+            candidates=(StateCandidate(
+                'user', 'free', True, canonical_subject_id='user', canonical_field_id='availability'
+            ),),
+        )
+        second = await graph.ingest(
+            Observation('User is available.', now + timedelta(days=1), 'test'),
+            candidates=(StateCandidate(
+                'user', 'available', False, canonical_subject_id='user', canonical_field_id='availability'
+            ),),
+        )
+        self.assertEqual(second.invalidated_state_ids, (first.states[0].state_id,))
+
+    async def test_polarity_alone_cannot_establish_property_identity(self) -> None:
+        old = StateNode.create(
+            entity='user', attribute='state', value='enabled', evidence_id='e1',
+            metadata={'source_span_start': 0, 'evidence_span': 'User state was enabled.'},
+        )
+        new = StateNode.create(
+            entity='user', attribute='status', value='disabled', evidence_id='e2',
+            metadata={'source_span_start': 0, 'evidence_span': 'User state is disabled.'},
+        )
+        self.assertEqual(StateLinker.identity_decision(new, old).decision, SlotIdentity.POSSIBLE_SAME_SLOT)
+
+    async def test_canonical_field_format_variants_share_slot(self) -> None:
+        old = StateNode.create(
+            entity='Ben', attribute='availability', value='enabled', evidence_id='e1',
+            canonical_subject_id='Ben', canonical_field_id='entity_availability',
+        )
+        new = StateNode.create(
+            entity='Ben', attribute='availability', value='disabled', evidence_id='e2',
+            canonical_subject_id='Ben', canonical_field_id='ben_availability_status',
+        )
+        self.assertEqual(StateLinker.identity_decision(new, old).decision, SlotIdentity.SAME_SLOT)
+
+    async def test_different_canonical_fields_do_not_merge(self) -> None:
+        graph = StateGraph()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        await graph.ingest(
+            Observation('User is free.', now, 'test'),
+            candidates=(StateCandidate(
+                'user', 'availability', True, canonical_subject_id='user', canonical_field_id='availability'
+            ),),
+        )
+        result = await graph.ingest(
+            Observation('User is in Paris.', now + timedelta(days=1), 'test'),
+            candidates=(StateCandidate(
+                'user', 'location', 'Paris', canonical_subject_id='user', canonical_field_id='location'
+            ),),
+        )
+        self.assertEqual(result.invalidated_state_ids, ())
+        self.assertEqual(len(await graph.repository.list_states('default', {StateStatus.CURRENT})), 2)
+
+    async def test_identity_decision_fails_closed_for_ambiguous_surface_form(self) -> None:
+        old = StateNode.create(entity='user', attribute='availability', value='free', evidence_id='e1')
+        new = StateNode.create(entity='user', attribute='preference', value='free', evidence_id='e2')
+        decision = StateLinker.identity_decision(new, old)
+        self.assertEqual(decision.decision, SlotIdentity.POSSIBLE_SAME_SLOT)
+
+    async def test_duplicate_consolidation_keeps_one_current_slot(self) -> None:
+        graph = StateGraph()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        canonical = dict(canonical_subject_id='user', canonical_field_id='availability')
+        first = await graph.ingest(
+            Observation('User is free.', now, 'test'),
+            candidates=(StateCandidate('user', 'free', True, **canonical),),
+        )
+        duplicate = await graph.ingest(
+            Observation('User is free.', now, 'test'),
+            candidates=(StateCandidate('user', 'available', True, **canonical),),
+        )
+        current = await graph.repository.list_states('default', {StateStatus.CURRENT})
+        self.assertEqual(len(current), 1)
+        self.assertEqual(duplicate.revisions[0].duplicate_of, first.states[0].state_id)
+
+    async def test_availability_and_preference_do_not_merge(self) -> None:
+        old = StateNode.create(entity='user', attribute='availability', value='free', evidence_id='e1')
+        new = StateNode.create(entity='user', attribute='preference', value='free', evidence_id='e2')
+        self.assertEqual(StateLinker.identity_decision(new, old).decision, SlotIdentity.POSSIBLE_SAME_SLOT)
+
+    async def test_user_availability_and_meeting_feasibility_do_not_merge(self) -> None:
+        old = StateNode.create(entity='user', attribute='availability', value='free', evidence_id='e1')
+        new = StateNode.create(entity='user', attribute='meeting_feasibility', value='feasible', evidence_id='e2')
+        self.assertEqual(StateLinker.identity_decision(new, old).decision, SlotIdentity.POSSIBLE_SAME_SLOT)
+
+    async def test_time_and_condition_scope_are_not_duplicate_merges(self) -> None:
+        graph = StateGraph()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        canonical = dict(canonical_subject_id='user', canonical_field_id='availability')
+        await graph.ingest(
+            Observation('User is free Monday.', now, 'test'),
+            candidates=(StateCandidate('user', 'free', True, time_scope=TimeScope(now, now + timedelta(hours=1)), **canonical),),
+        )
+        result = await graph.ingest(
+            Observation('User is free Tuesday.', now + timedelta(days=1), 'test'),
+            candidates=(StateCandidate('user', 'free', True, time_scope=TimeScope(now + timedelta(days=1), now + timedelta(days=1, hours=1)), **canonical),),
+        )
+        self.assertIsNone(result.revisions[0].duplicate_of)
+
+    async def test_identity_decision_never_uses_value_as_entity(self) -> None:
+        old = StateNode.create(entity='user', attribute='availability', value='free', evidence_id='e1')
+        new = StateNode.create(entity='free', attribute='status', value='user', evidence_id='e2')
+        self.assertEqual(StateLinker.identity_decision(new, old).decision, SlotIdentity.DIFFERENT_SLOT)
+
+
+class ExplicitDependencyPopulationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relation_only_observation_does_not_bypass_verification(self) -> None:
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         await graph.ingest(
             Observation('Alex works at North Site.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
             candidates=[StateCandidate('Alex', 'current_office', 'North Site')],
@@ -76,17 +258,14 @@ class ExplicitDependencyPopulationTests(unittest.IsolatedAsyncioTestCase):
             ),
             candidates=[],
         )
-        self.assertEqual(len(result.dependency_relations), 1)
-        self.assertEqual(
-            result.dependency_relations[0].relation_type, RelationType.DEPENDS_ON
-        )
+        self.assertEqual(result.dependency_relations, ())
         persisted = await graph.repository.list_relations(
             'default', {RelationType.DEPENDS_ON}
         )
-        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted, [])
 
     async def test_no_explicit_relation_phrase_creates_no_dependency(self) -> None:
-        graph = StateGraph()
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         await graph.ingest(
             Observation('A value equals B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
             candidates=[
@@ -159,10 +338,28 @@ class ExplicitDependencyPopulationTests(unittest.IsolatedAsyncioTestCase):
         evidence_row['timestamp'] = evidence_row['timestamp'].replace('+00:00', '')
         reloaded_evidence = _evidence_from_record(evidence_row)
 
-        relation = StateRelation('s1', 's2', RelationType.UPDATES, created_at=datetime(2026, 1, 1))
+        relation = StateRelation(
+            's1',
+            's2',
+            RelationType.DEPENDS_ON,
+            created_at=datetime(2026, 1, 1),
+            dependency_strength=DependencyStrength.STRICT,
+            verification_reason='verified necessity',
+            verifier_confidence=0.9,
+            supporting_evidence_ids=('e1', 'e2'),
+            metadata={'candidate_signals': ['action_precondition']},
+        )
         relation_row = _relation_to_row(relation)
         relation_row['created_at'] = relation_row['created_at'].replace('+00:00', '')
         reloaded_relation = _relation_from_record(relation_row)
+        self.assertEqual(reloaded_relation.dependency_strength, DependencyStrength.STRICT)
+        self.assertEqual(reloaded_relation.verification_reason, 'verified necessity')
+        self.assertEqual(reloaded_relation.verifier_confidence, 0.9)
+        self.assertEqual(reloaded_relation.supporting_evidence_ids, ('e1', 'e2'))
+        self.assertEqual(
+            reloaded_relation.metadata,
+            {'candidate_signals': ['action_precondition']},
+        )
 
         datetimes = (
             reloaded_state.time_scope.start,
@@ -237,11 +434,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        class StaticExtractor:
-            def extract(self, observation, graphiti_facts):
-                return [extracted_candidate]
-
-        graph = StateGraph(extractor=StaticExtractor())
+        graph = StateGraph(extractor=StaticStrictExtractor((extracted_candidate,)))
         prerequisite = await graph.ingest(
             Observation(
                 f'{prerequisite_candidate.entity} has state '
@@ -264,7 +457,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(relation.source_state_id, prerequisite.states[0].state_id)
         self.assertEqual(relation.target_state_id, downstream.states[0].state_id)
         self.assertEqual(relation.relation_type, relation_type)
-        self.assertEqual(relation.reason, reason)
+        self.assertEqual(relation.dependency_strength, DependencyStrength.STRICT)
         self.assertEqual(relation.evidence_id, downstream.states[0].evidence_id)
         self.assertEqual(relation.group_id, 'default')
         persisted = await graph.repository.list_relations('default', {relation_type})
@@ -280,7 +473,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self._assert_semantic_relation_population(RelationType.AFFECTS_ACTION)
 
     async def test_dependency_selector_resolves_new_state_from_same_observation(self) -> None:
-        graph = StateGraph()
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         now = datetime(2026, 1, 1, tzinfo=UTC)
         result = await graph.ingest(
             Observation(
@@ -515,10 +708,18 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     Observation('Deployment is scheduled.', now, 'unit-test'),
                     candidates=(StateCandidate('Deployment', 'action', 'scheduled'),),
                 )
-                await graph.add_dependency(
-                    prerequisite.states[0].state_id,
-                    dependent.states[0].state_id,
-                    relation_type,
+                await graph.repository.apply(
+                    (),
+                    (
+                        StateRelation(
+                            prerequisite.states[0].state_id,
+                            dependent.states[0].state_id,
+                            relation_type,
+                            dependency_strength=DependencyStrength.WEAK,
+                            verification_reason='verified retrieval relation',
+                            verifier_confidence=1.0,
+                        ),
+                    ),
                 )
 
                 retrieved = await graph.retrieve(
@@ -532,7 +733,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(unrelated.states[0].state_id, retrieved.all_state_ids)
 
     async def test_retrieval_does_not_infer_relation_from_value_entity_text(self) -> None:
-        graph = StateGraph()
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         now = datetime(2026, 1, 1, tzinfo=UTC)
         result = await graph.ingest(
             Observation('Alice is married to Bob. Bob lives in Berlin.', now, 'unit-test'),
@@ -620,7 +821,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(current[0].evidence_ids), 2)
 
     async def test_implicit_invalidation_cascades_over_typed_dependencies(self) -> None:
-        graph = StateGraph()
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         friday = datetime(2026, 1, 2, tzinfo=UTC)
         condition = ConditionScope.from_mapping({'day': 'Friday'})
         availability = await graph.ingest(
@@ -632,13 +833,20 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         action = await graph.ingest(
             Observation('Plan dinner for Friday.', friday - timedelta(days=1), 'planner'),
             candidates=(
-                StateCandidate('user', 'dinner-plan', 'booked', condition_scope=condition),
+                StateCandidate(
+                    'user',
+                    'dinner-plan',
+                    'booked',
+                    condition_scope=condition,
+                    dependency_relations=(
+                        DependencyRelationSelector(
+                            RelationType.AFFECTS_ACTION,
+                            StateSelector('user', 'availability', 'free'),
+                            'Plan dinner for Friday.',
+                        ),
+                    ),
+                ),
             ),
-        )
-        await graph.add_dependency(
-            availability.states[0].state_id,
-            action.states[0].state_id,
-            RelationType.AFFECTS_ACTION,
         )
 
         flight = await graph.ingest(
@@ -671,7 +879,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.grounded_states)
 
     async def test_semantically_populated_dependency_propagates_invalidation(self) -> None:
-        graph = StateGraph()
+        graph = StateGraph(extractor=StrictDependencyDiscovery())
         now = datetime(2026, 1, 1, tzinfo=UTC)
         availability = await graph.ingest(
             Observation('Alice is available Friday.', now, 'unit-test'),
@@ -1351,7 +1559,7 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
         identities = [(item.entity, item.attribute, item.value) for item in candidates]
         self.assertEqual(len(identities), len(set(identities)))
 
-    async def test_fact_overflow_runs_relation_only_semantic_extraction(self) -> None:
+    async def test_state_extraction_defers_dependency_discovery_until_ingest(self) -> None:
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
                 self.prompt_name = kwargs['prompt_name']
@@ -1376,24 +1584,7 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
                             },
                         ]
                     }
-                return {
-                    'relations': [
-                        {
-                            'type': 'DEPENDS_ON',
-                            'downstream': {
-                                'entity': 'Friday meeting',
-                                'attribute': 'feasibility',
-                                'value': 'feasible',
-                            },
-                            'prerequisite': {
-                                'entity': 'Alice',
-                                'attribute': 'availability',
-                                'value': 'available Friday',
-                            },
-                            'reason': 'The meeting is feasible because Alice is available.',
-                        }
-                    ]
-                }
+                raise AssertionError('dependency discovery must not run during state extraction')
 
         llm = FakeLLM()
         extractor = GraphitiLLMStateExtractor(llm)
@@ -1423,13 +1614,9 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertEqual(llm.prompt_name, 'stategraph.semantic_relation_extraction.v1')
+        self.assertEqual(llm.prompt_name, 'stategraph.state_extraction.v2')
         downstream = next(item for item in candidates if item.entity == 'Friday meeting')
-        self.assertEqual(len(downstream.dependency_relations), 1)
-        self.assertEqual(
-            downstream.dependency_relations[0].relation_type,
-            RelationType.DEPENDS_ON,
-        )
+        self.assertFalse(downstream.dependency_relations)
 
     async def test_fact_overflow_populates_relation_through_ingest_pipeline(self) -> None:
         now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -1518,6 +1705,52 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
                             for fact in payload['graphiti_facts']
                         ]
                     }
+                if kwargs['prompt_name'] == 'stategraph.dependency_verification.v1':
+                    payload = json.loads(messages[-1].content)
+                    candidate = next(
+                        item
+                        for item in payload['candidates']
+                        if item['proposed_relation'] == 'depends-on'
+                        and item['prerequisite_state']['entity'] == 'Alice'
+                        and item['dependent_state']['entity'] == 'Friday meeting'
+                    )
+                    return {
+                        'assessments': [
+                            {
+                                'prerequisite_state_id': candidate['prerequisite_state_id'],
+                                'dependent_state_id': candidate['dependent_state_id'],
+                                'strength': 'STRICT_DEPENDENCY',
+                                'relation_type': 'DEPENDS_ON',
+                                'verification_reason': (
+                                    'Without availability, feasibility cannot hold.'
+                                ),
+                                'verifier_confidence': 1.0,
+                                'supporting_evidence_ids': [],
+                                'evidence_span': (
+                                    'The Friday meeting is feasible because Alice is available Friday.'
+                                ),
+                            }
+                        ]
+                    }
+                if kwargs['prompt_name'] == 'stategraph.dependency_candidate_discovery.v1':
+                    payload = json.loads(messages[-1].content)
+                    states_by_entity = {item['entity']: item for item in payload['states']}
+                    return {
+                        'candidates': [
+                            {
+                                'prerequisite_state_id': states_by_entity['Alice']['state_id'],
+                                'dependent_state_id': states_by_entity['Friday meeting']['state_id'],
+                                'proposed_relation': 'DEPENDS_ON',
+                                'signal': 'explicit_source_relation',
+                                'candidate_reason': (
+                                    'Meeting feasibility relies on Alice availability.'
+                                ),
+                                'evidence_span': (
+                                    'The Friday meeting is feasible because Alice is available Friday.'
+                                ),
+                            }
+                        ]
+                    }
                 return {
                     'relations': [
                         {
@@ -1559,7 +1792,8 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.states), 61)
         self.assertIn('stategraph.state_extraction.v2', llm.prompt_names)
-        self.assertEqual(llm.prompt_names[-1], 'stategraph.semantic_relation_extraction.v1')
+        self.assertIn('stategraph.dependency_candidate_discovery.v1', llm.prompt_names)
+        self.assertEqual(llm.prompt_names[-1], 'stategraph.dependency_verification.v1')
         self.assertEqual(len(result.dependency_relations), 1)
         relation = result.dependency_relations[0]
         source = await graph.repository.get_state(relation.source_state_id)
@@ -1569,61 +1803,13 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
             (target.entity, target.attribute), ('Friday meeting', 'feasibility')
         )
 
-    async def test_llm_extraction_emits_only_semantic_relation_selectors(self) -> None:
+    async def test_llm_state_extraction_has_no_embedded_dependency_stage(self) -> None:
         class FakeLLM:
             def __init__(self):
                 self.calls = []
 
             async def generate_response(self, messages, **kwargs):
                 self.calls.append((kwargs['prompt_name'], messages))
-                if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
-                    return {
-                        'relations': [
-                            {
-                                'type': 'DEPENDS_ON',
-                                'downstream': {
-                                    'entity': 'Friday meeting',
-                                    'attribute': 'feasibility',
-                                    'value': 'feasible',
-                                },
-                                'prerequisite': {
-                                    'entity': 'Bob',
-                                    'attribute': 'availability',
-                                    'value': 'available Friday',
-                                },
-                                'reason': 'Feasibility relies on Bob being available.',
-                                'target_state_id': 'must-be-ignored',
-                            },
-                            {
-                                'type': 'DERIVED_FROM',
-                                'downstream': {
-                                    'entity': 'Alice',
-                                    'attribute': 'availability',
-                                    'value': 'unavailable Friday',
-                                },
-                                'prerequisite': {
-                                    'entity': 'Alice',
-                                    'attribute': 'flight',
-                                    'value': 'Friday flight',
-                                },
-                                'reason': 'Availability was explicitly derived from the flight.',
-                            },
-                            {
-                                'type': 'AFFECTS_ACTION',
-                                'downstream': {
-                                    'entity': 'Friday meeting',
-                                    'attribute': 'plan',
-                                    'value': 'postponed',
-                                },
-                                'prerequisite': {
-                                    'entity': 'Alice',
-                                    'attribute': 'availability',
-                                    'value': 'unavailable Friday',
-                                },
-                                'reason': 'Availability explicitly affects the meeting plan.',
-                            },
-                        ]
-                    }
                 return {
                     'states': [
                         {
@@ -1658,30 +1844,10 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
             (),
         )
 
-        relations = tuple(
-            relation
-            for candidate in candidates
-            for relation in candidate.dependency_relations
-        )
-        self.assertEqual(
-            tuple(item.relation_type for item in relations),
-            (
-                RelationType.DEPENDS_ON,
-                RelationType.DERIVED_FROM,
-                RelationType.AFFECTS_ACTION,
-            ),
-        )
-        self.assertEqual(
-            {item.prerequisite.entity for item in relations},
-            {'Alice', 'Bob'},
-        )
-        self.assertFalse(hasattr(relations[0], 'target_state_id'))
+        self.assertTrue(all(not item.dependency_relations for item in candidates))
         self.assertEqual(
             [prompt_name for prompt_name, _ in llm.calls],
-            [
-                'stategraph.state_extraction.v2',
-                'stategraph.semantic_relation_extraction.v1',
-            ],
+            ['stategraph.state_extraction.v2'],
         )
         state_payload = json.loads(llm.calls[0][1][1].content)
         self.assertNotIn('semantic_relations', state_payload['state_schema'])

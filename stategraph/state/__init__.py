@@ -6,9 +6,10 @@ from .extraction import (
     extract_explicit_dependency_intents,
 )
 from .extraction_v2 import HybridStateExtractorV2, ObservationLocalStateExtractorV2
-from .linking import LinkedState, StateLinker
+from .linking import LinkedState, SlotIdentity, SlotIdentityDecision, StateLinker
 from .schema import (
     ConditionScope,
+    DependencyStrength,
     DependencyRelationSelector,
     Evidence,
     EvidenceNode,
@@ -28,6 +29,7 @@ from .schema import (
 
 __all__ = [
     'ConditionScope',
+    'DependencyStrength',
     'DependencyRelationSelector',
     'EvidenceNode',
     'Evidence',
@@ -36,6 +38,8 @@ __all__ = [
     'GraphitiFactStateExtractor',
     'HybridStateExtractorV2',
     'LinkedState',
+    'SlotIdentity',
+    'SlotIdentityDecision',
     'Observation',
     'ObservationLocalStateExtractorV2',
     'RelationType',

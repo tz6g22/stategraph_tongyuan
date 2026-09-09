@@ -38,7 +38,13 @@ def attach_canonical_slot_provenance(
     block = _containing_event(content, position)
     subject = _subject_from_block(block)
     field = _field_from_block(block, candidate)
-    if subject is None:
+    if subject is None and not (
+        candidate.canonical_subject_id is not None and candidate.canonical_field_id is not None
+    ):
+        return candidate
+    subject = subject or candidate.canonical_subject_id
+    field = field or candidate.canonical_field_id
+    if subject is None or field is None:
         return candidate
     return replace(
         candidate,

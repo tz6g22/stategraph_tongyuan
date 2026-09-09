@@ -1,5 +1,10 @@
 from .dependency import DEPENDENCY_RELATIONS, DependencyGraph
-from .invalidation import InvalidationPropagation, InvalidationPropagator, InvalidationResult
+from .invalidation import (
+    InvalidationPropagation,
+    InvalidationPropagator,
+    InvalidationResult,
+    PropagationStep,
+)
 
 __all__ = [
     'DEPENDENCY_RELATIONS',
@@ -7,4 +12,5 @@ __all__ = [
     'InvalidationPropagation',
     'InvalidationPropagator',
     'InvalidationResult',
+    'PropagationStep',
 ]

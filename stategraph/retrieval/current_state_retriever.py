@@ -42,6 +42,11 @@ _FIELD_STOPWORDS = frozenset(
         'your',
     }
 )
+_GENERIC_QUERY_WORDS = frozenset(
+    {'can', 'current', 'do', 'does', 'is', 'live', 'lives', 'located', 'status', 'what',
+     'where', 'which', 'who', 'should', 'still'}
+)
+_META_RELATION_MARKERS = frozenset({'independent', 'irrelevant', 'unrelated'})
 
 
 def _display_value(value: object) -> str:
@@ -130,6 +135,7 @@ class CurrentStateRetrieval:
     canonical_subject_ids: tuple[str, ...] = ()
     subject_scoped: bool = False
     retrieval_trace: dict[str, Any] | None = None
+    historical_states: tuple[GroundedState, ...] = ()
 
     @property
     def state_ids(self) -> tuple[str, ...]:
@@ -143,10 +149,15 @@ class CurrentStateRetrieval:
     def all_state_ids(self) -> tuple[str, ...]:
         return (*self.state_ids, *self.candidate_state_ids)
 
+    @property
+    def historical_state_ids(self) -> tuple[str, ...]:
+        return tuple(item.state.state_id for item in self.historical_states)
+
     def grounded_context(self) -> list[str]:
         context = list(self.premise_check.corrections)
         context.extend(item.render() for item in self.grounded_states)
         context.extend(item.render() for item in self.conflict_candidates)
+        context.extend(item.render() for item in self.historical_states)
         return context
 
     def evidence_context(self) -> list[str]:
@@ -154,7 +165,7 @@ class CurrentStateRetrieval:
 
         seen: set[tuple[str, datetime, str]] = set()
         output: list[str] = []
-        for item in (*self.grounded_states, *self.conflict_candidates):
+        for item in (*self.grounded_states, *self.conflict_candidates, *self.historical_states):
             for evidence in item.evidence:
                 key = (evidence.origin, evidence.timestamp, evidence.span)
                 if key not in seen:
@@ -193,6 +204,9 @@ class CurrentStateRetriever:
         available = await self._repository.list_states(
             group_id, {StateStatus.CURRENT, StateStatus.UNCERTAIN}
         )
+        stale_history = await self._repository.list_states(
+            group_id, {StateStatus.STALE, StateStatus.HISTORICAL}
+        )
         current = [state for state in available if state.is_effective(at)]
         current = self._resolve_temporary_exceptions(query, current)
         conflict_candidates = [
@@ -215,7 +229,21 @@ class CurrentStateRetriever:
             RelationType.AFFECTS_ACTION,
         }
         dependencies = await self._repository.list_relations(group_id, dependency_types)
-        selectable = [*current, *conflict_candidates]
+        stale_for_query = [
+            state for state in stale_history
+            if state.status == StateStatus.STALE
+            and state.time_scope.is_effective(at)
+            and self._score(query, state, graphiti_fact_ids) > 0
+        ]
+        shadowed = self._shadowed_current_states(query, current, stale_for_query, graphiti_fact_ids)
+        current = [state for state in current if state.state_id not in shadowed]
+        historical = [
+            state for state in stale_history
+            if state.status == StateStatus.HISTORICAL
+            and state.time_scope.is_effective(at)
+            and self._history_query(query)
+        ]
+        selectable = [*current, *conflict_candidates, *historical]
         canonical_subject_ids = self._resolve_canonical_subjects(
             query, selectable, graphiti_fact_ids
         )
@@ -226,7 +254,15 @@ class CurrentStateRetriever:
                 canonical_subject_ids, selectable, dependencies
             )
             if scoped_ids:
-                selection_pool = [state for state in selectable if state.state_id in scoped_ids]
+                # Subject scope narrows ranking, but it must not erase a
+                # grounded prerequisite/replacement whose wording directly
+                # matches the query (for example a person's availability in
+                # a question about that person's meeting).
+                selection_pool = [
+                    state for state in selectable
+                    if state.state_id in scoped_ids
+                    or self._score(query, state, graphiti_fact_ids) > 0
+                ]
                 subject_scoped = True
         selected, coverage_assignments, expansion_sources, candidate_trace = (
             self._select_dependency_states(
@@ -245,9 +281,11 @@ class CurrentStateRetriever:
             premise_claims,
             conflict_candidates=conflict_candidates,
             dependencies=dependencies,
+            stale_states=stale_for_query,
         )
         grounded: list[GroundedState] = []
         grounded_candidates: list[GroundedState] = []
+        grounded_historical: list[GroundedState] = []
         for state in selected:
             evidence = await self._repository.get_evidence(state.evidence_ids)
             found_ids = {item.evidence_id for item in evidence}
@@ -261,6 +299,8 @@ class CurrentStateRetriever:
             )
             if state.status == StateStatus.CURRENT:
                 grounded.append(item)
+            elif state.status == StateStatus.HISTORICAL:
+                grounded_historical.append(item)
             else:
                 grounded_candidates.append(item)
 
@@ -288,8 +328,12 @@ class CurrentStateRetriever:
                 'coverage_assignments': coverage_assignments,
                 'relation_expansion_sources': expansion_sources,
                 'final_state_ids': [state.state_id for state in selected],
+                'shadowed_current_state_ids': sorted(shadowed),
+                'stale_query_candidates': [state.state_id for state in stale_for_query],
+                'historical_query': bool(historical),
                 'limit': limit,
             },
+            historical_states=tuple(grounded_historical),
         )
 
     async def retrieve_history(
@@ -317,6 +361,11 @@ class CurrentStateRetriever:
     ) -> dict[str, float]:
         graph_score = 0.5 if graphiti_fact_ids.intersection(state.graphiti_fact_ids) else 0.0
         query_tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
+        entity_tokens = set(re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE))
+        query_text = ' '.join(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
+        entity_text = ' '.join(re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE))
+        direct_subject = bool(entity_text and entity_text in query_text)
+        content_query_tokens = query_tokens - entity_tokens if direct_subject else query_tokens
         normalized_attribute = re.sub(r'[_\-\s]+', ' ', state.attribute)
         state_text = ' '.join(
             (
@@ -328,7 +377,11 @@ class CurrentStateRetriever:
             )
         )
         state_tokens = set(re.findall(r'\w+', state_text.casefold(), flags=re.UNICODE))
-        lexical = len(query_tokens & state_tokens) / max(1, len(query_tokens | state_tokens))
+        if direct_subject:
+            state_tokens -= entity_tokens
+        lexical = len(content_query_tokens & state_tokens) / max(
+            1, len(content_query_tokens | state_tokens)
+        )
         # Grounded evidence is a second, query-time recall signal.  It is
         # deliberately separate from the structured entity/field/value score:
         # a source span can contain the user wording even when an extractor's
@@ -336,14 +389,27 @@ class CurrentStateRetriever:
         # remains subject to the same status/premise/fixed-top-k selection.
         evidence_text = str(state.metadata.get('evidence_span', ''))
         evidence_tokens = set(re.findall(r'\w+', evidence_text.casefold(), flags=re.UNICODE))
-        evidence_score = len(query_tokens & evidence_tokens) / max(
-            1, len(query_tokens | evidence_tokens)
+        if direct_subject:
+            evidence_tokens -= entity_tokens
+        evidence_score = len(content_query_tokens & evidence_tokens) / max(
+            1, len(content_query_tokens | evidence_tokens)
         )
-        query_text = ' '.join(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
-        entity_text = ' '.join(
-            re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE)
+        continuity_query = bool(
+            query_tokens
+            & {'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'}
         )
-        entity_anchor = 2.0 if entity_text and entity_text in query_text else 0.0
+        subject_tokens = tuple(
+            token for token in re.findall(
+                r'\w+', (state.canonical_subject_id or state.entity).casefold()
+            )
+            if token not in {'a', 'an', 'the'}
+        )
+        evidence_all_tokens = re.findall(r'\w+', evidence_text.casefold())
+        direct_assertion_score = 0.2 if (
+            continuity_query
+            and subject_tokens
+            and tuple(evidence_all_tokens[:len(subject_tokens)]) == subject_tokens
+        ) else 0.0
         field_match = max(
             (
                 cls._field_overlap(intent, state)
@@ -351,13 +417,21 @@ class CurrentStateRetriever:
             ),
             default=0.0,
         )
+        query_has_specific_term = bool(content_query_tokens - _GENERIC_QUERY_WORDS)
+        entity_anchor = 2.0 if direct_subject and (
+            lexical or evidence_score or field_match or not query_has_specific_term
+        ) else 0.0
         return {
             'graph_score': graph_score,
             'lexical_score': lexical,
             'evidence_score': evidence_score,
+            'direct_assertion_score': direct_assertion_score,
             'field_match_score': field_match,
             'subject_match_score': entity_anchor,
-            'final_score': graph_score + lexical + evidence_score + field_match + entity_anchor,
+            'final_score': (
+                graph_score + lexical + evidence_score + field_match
+                + entity_anchor + direct_assertion_score
+            ),
         }
 
     @staticmethod
@@ -685,6 +759,165 @@ class CurrentStateRetriever:
                 if condition_applies or time_applies:
                     suppressed.add(broad.state_id)
         return [state for state in states if state.state_id not in suppressed]
+
+    @staticmethod
+    def _history_query(query: str) -> bool:
+        tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
+        return bool(tokens & {
+            'history', 'historical', 'previously', 'before', 'formerly', 'used', 'past',
+            '曾经', '过去', '之前',
+        })
+
+    @classmethod
+    def _shadowed_current_states(
+        cls,
+        query: str,
+        current: Sequence[StateNode],
+        stale: Sequence[StateNode],
+        graphiti_fact_ids: set[str],
+    ) -> set[str]:
+        """Hide older same-subject claims when a newer stale claim shadows them.
+
+        This is a query-time selection rule only.  It does not change lifecycle
+        status and is activated only for continuity questions; independent later
+        states remain eligible.
+        """
+
+        query_tokens = set(cls._field_tokens(query))
+        if not query_tokens & {'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'}:
+            return set()
+        shadowed: set[str] = set()
+        def subject_key(state: StateNode) -> tuple[str, ...]:
+            tokens = re.findall(r'\w+', (state.canonical_subject_id or state.entity).casefold())
+            return tuple(token for token in tokens if token not in {'a', 'an', 'the'})
+
+        def slot_surface_compatible(left: StateNode, right: StateNode) -> bool:
+            left_field = left.canonical_field_id or left.attribute
+            right_field = right.canonical_field_id or right.attribute
+            if attributes_compatible(left_field, right_field):
+                return True
+            # Keep the fallback conservative: morphology alone is not enough
+            # to equate a preference value with a preference relation.
+            return False
+
+        def provenance_compatible(left: StateNode, right: StateNode) -> bool:
+            if slot_surface_compatible(left, right):
+                return True
+            left_text = ' '.join(
+                (str(left.value), str(left.metadata.get('evidence_span', '')))
+            ).casefold()
+            right_text = ' '.join(
+                (str(right.value), str(right.metadata.get('evidence_span', '')))
+            ).casefold()
+            left_tokens = set(re.findall(r'\w+', left_text, flags=re.UNICODE))
+            right_tokens = set(re.findall(r'\w+', right_text, flags=re.UNICODE))
+            left_tokens -= set(re.findall(r'\w+', left.entity.casefold(), flags=re.UNICODE))
+            right_tokens -= set(re.findall(r'\w+', right.entity.casefold(), flags=re.UNICODE))
+            provenance_stopwords = {
+                'a', 'an', 'and', 'are', 'be', 'because', 'for', 'from', 'in',
+                'is', 'it', 'no', 'of', 'on', 'or', 'that', 'the', 'this',
+                'to', 'was', 'were', 'with', 'longer',
+            }
+            left_tokens -= provenance_stopwords
+            right_tokens -= provenance_stopwords
+            if left_tokens & right_tokens:
+                return True
+            # A bounded morphological fallback catches grounded variants such
+            # as ``available``/``availability`` without making field labels an
+            # identity rule.  It is only used to hide an older live claim when
+            # a newer stale claim is already present.
+            return any(
+                min(len(left_token), len(right_token)) >= 6
+                and left_token[:6] == right_token[:6]
+                for left_token in left_tokens
+                for right_token in right_tokens
+            )
+
+        def direct_assertion(state: StateNode) -> bool:
+            evidence = str(state.metadata.get('evidence_span', ''))
+            subject = tuple(
+                token for token in re.findall(
+                    r'\w+', (state.canonical_subject_id or state.entity).casefold()
+                )
+                if token not in {'a', 'an', 'the'}
+            )
+            tokens = re.findall(r'\w+', evidence.casefold())
+            return bool(subject and tuple(tokens[:len(subject)]) == subject)
+
+        def meta_relation(state: StateNode) -> bool:
+            text = ' '.join(
+                (
+                    str(state.metadata.get('evidence_span', '')),
+                    state.attribute,
+                    str(state.value),
+                )
+            ).casefold()
+            tokens = set(re.findall(r'\w+', text))
+            return bool(tokens & _META_RELATION_MARKERS) or 'preference is' in text
+
+        for live in current:
+            live_subject = subject_key(live)
+            for old in stale:
+                old_subject = subject_key(old)
+                if live_subject != old_subject:
+                    continue
+                if live.observed_at >= old.observed_at:
+                    continue
+                if not live.time_scope.overlaps(old.time_scope):
+                    continue
+                if not provenance_compatible(live, old):
+                    continue
+                shadowed.add(live.state_id)
+                break
+            if live.state_id in shadowed:
+                continue
+            for newer in current:
+                if live.state_id == newer.state_id or live_subject != subject_key(newer):
+                    continue
+                same_canonical_contract = (
+                    live.canonical_field_id is not None
+                    and newer.canonical_field_id is not None
+                    and len(re.findall(r'\w+', live.canonical_field_id)) == 1
+                    and len(re.findall(r'\w+', newer.canonical_field_id)) == 1
+                )
+                if (
+                    live.observation_id == newer.observation_id
+                    and meta_relation(live)
+                    and direct_assertion(newer)
+                    and not meta_relation(newer)
+                ):
+                    shadowed.add(live.state_id)
+                    break
+                if (
+                    live.observation_id == newer.observation_id
+                    and direct_assertion(live)
+                    and meta_relation(newer)
+                    and not meta_relation(live)
+                ):
+                    continue
+                if not (
+                    slot_surface_compatible(live, newer)
+                    or (same_canonical_contract and provenance_compatible(live, newer))
+                ):
+                    continue
+                same_observation = live.observation_id == newer.observation_id
+                same_evidence = (
+                    live.metadata.get('evidence_span')
+                    and live.metadata.get('evidence_span')
+                    == newer.metadata.get('evidence_span')
+                )
+                if same_observation and same_evidence and live.sequence_index > newer.sequence_index:
+                    shadowed.add(live.state_id)
+                    break
+                if same_observation and same_evidence:
+                    continue
+                if same_observation and live.sequence_index < newer.sequence_index:
+                    shadowed.add(live.state_id)
+                    break
+                if not same_observation and newer.observed_at > live.observed_at:
+                    shadowed.add(live.state_id)
+                    break
+        return shadowed
 
 
 __all__ = [

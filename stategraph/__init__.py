@@ -4,6 +4,7 @@ from .answer_generation import AnswerContext, build_answer_context
 from .system import IngestResult, StateGraph
 from .state import (
     ConditionScope,
+    DependencyStrength,
     DependencyRelationSelector,
     EvidenceNode,
     Observation,
@@ -19,6 +20,7 @@ from .state import (
 __all__ = [
     'AnswerContext',
     'ConditionScope',
+    'DependencyStrength',
     'DependencyRelationSelector',
     'EvidenceNode',
     'IngestResult',

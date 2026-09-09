@@ -39,33 +39,59 @@ class StateRevision:
         new_state: StateNode,
         related_states: Iterable[LinkedState | StateNode],
     ) -> RevisionResult:
+        related = tuple(related_states)
         old_states = [
-            linked.state if isinstance(linked, LinkedState) else linked for linked in related_states
+            linked.state if isinstance(linked, LinkedState) else linked for linked in related
         ]
-        decisions = tuple(self._detector.detect(new_state, old_state) for old_state in old_states)
-
-        duplicate = next(
-            (
-                old
-                for old, decision in zip(old_states, decisions, strict=True)
-                if decision.conflict_type == ConflictType.DUPLICATE
-                and old.status == StateStatus.CURRENT
-            ),
-            None,
+        verified_target_ids = tuple(
+            linked.state.state_id for linked in related if isinstance(linked, LinkedState)
         )
-        if duplicate is not None:
+        # Module 2 has already made the identity decision.  Carry that
+        # provenance into conflict classification instead of asking the
+        # detector to re-run the attribute-string gate.
+        classified_state = (
+            new_state.with_metadata(revision_linked_target_ids=verified_target_ids)
+            if verified_target_ids else new_state
+        )
+        decisions = tuple(
+            self._detector.detect(classified_state, old_state) for old_state in old_states
+        )
+
+        duplicates = [
+            old
+            for old, decision in zip(old_states, decisions, strict=True)
+            if decision.conflict_type == ConflictType.DUPLICATE
+            and old.status == StateStatus.CURRENT
+        ]
+        if duplicates:
+            duplicate = min(
+                duplicates,
+                key=lambda old: (
+                    0 if old.attribute.casefold() == new_state.attribute.casefold() else 1,
+                    old.metadata.get('source_span_start')
+                    if isinstance(old.metadata.get('source_span_start'), int)
+                    else 2**63 - 1,
+                    old.observation_index if old.observation_index is not None else 2**63 - 1,
+                    old.sequence_index,
+                    old.state_id,
+                ),
+            )
             merged = duplicate.with_provenance(new_state)
-            await self._repository.apply((merged,))
+            consolidated = [merged]
+            for other in duplicates:
+                if other.state_id != duplicate.state_id:
+                    consolidated.append(other.with_status(StateStatus.HISTORICAL))
+            await self._repository.apply(tuple(consolidated))
             return RevisionResult(
                 state=merged,
                 decisions=decisions,
-                changed_states=(merged,),
+                changed_states=tuple(consolidated),
                 revision_edges=(),
                 invalidated_state_ids=(),
                 duplicate_of=duplicate.state_id,
             )
 
-        effective_new = new_state
+        effective_new = classified_state
         authoritative_revision = any(
             decision.conflict_type
             in {ConflictType.UPDATE, ConflictType.IMPLICIT_INVALIDATION}
@@ -91,7 +117,8 @@ class StateRevision:
                 relation_type = RelationType.INVALIDATES
                 invalidate_old = True
             elif decision.conflict_type == ConflictType.EXPLICIT_CONFLICT:
-                if new_state.confidence > old_state.confidence:
+                polarity_conflict = decision.reason == 'grounded evidence reverses the state polarity'
+                if new_state.confidence > old_state.confidence or polarity_conflict:
                     relation_type = RelationType.INVALIDATES
                     invalidate_old = True
                 else:

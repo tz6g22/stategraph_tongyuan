@@ -98,8 +98,10 @@ class PremiseChecker:
         *,
         conflict_candidates: Iterable[StateNode] = (),
         dependencies: Iterable[StateRelation] = (),
+        stale_states: Iterable[StateNode] = (),
     ) -> PremiseCheckResult:
         states = tuple(state for state in current_states if state.status == StateStatus.CURRENT)
+        stale = tuple(state for state in stale_states if state.status == StateStatus.STALE)
         candidates = tuple(
             state
             for state in conflict_candidates
@@ -107,7 +109,9 @@ class PremiseChecker:
             and state.metadata.get('uncertainty_kind') == 'unresolved_conflict'
         )
         extracted = tuple(premises) if premises is not None else self.extract(query)
-        checked = tuple(self._check_one(premise, states, candidates) for premise in extracted)
+        checked = tuple(self._check_one(premise, states, candidates, stale) for premise in extracted)
+        if not extracted and stale and self._continuity_query(query):
+            checked = (self._implicit_stale_check(query, stale),)
         conflicts = tuple(
             dict.fromkeys(
                 state_id for result in checked for state_id in result.conflicting_state_ids
@@ -145,13 +149,15 @@ class PremiseChecker:
         premise: Premise,
         states: tuple[StateNode, ...],
         conflict_candidates: tuple[StateNode, ...],
+        stale_states: tuple[StateNode, ...] = (),
     ) -> CheckedPremise:
         candidates = [state for state in states if self._candidate_match(premise, state)]
+        stale_candidates = [state for state in stale_states if self._candidate_match(premise, state)]
         unresolved = [
             state for state in conflict_candidates if self._candidate_match(premise, state)
         ]
         unresolved_ids = tuple(state.state_id for state in unresolved)
-        if not candidates:
+        if not candidates and not stale_candidates:
             return CheckedPremise(
                 premise,
                 PremiseStatus.UNVERIFIED,
@@ -200,10 +206,44 @@ class PremiseChecker:
                 tuple(supporting),
                 conflict_candidate_state_ids=unresolved_ids,
             )
+        if stale_candidates:
+            stale_ids = tuple(state.state_id for state in stale_candidates)
+            corrections = '; '.join(
+                f'{state.entity}.{state.attribute} is stale ({state.value})'
+                for state in stale_candidates
+            )
+            return CheckedPremise(
+                premise,
+                PremiseStatus.CONFLICTED,
+                tuple(),
+                stale_ids,
+                f'Stale premise rejected: {corrections}.',
+                unresolved_ids,
+            )
         return CheckedPremise(
             premise,
             PremiseStatus.UNVERIFIED,
             conflict_candidate_state_ids=unresolved_ids,
+        )
+
+    @staticmethod
+    def _continuity_query(query: str) -> bool:
+        tokens = _tokens(query)
+        return bool(tokens & {'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'})
+
+    @staticmethod
+    def _implicit_stale_check(query: str, stale_states: tuple[StateNode, ...]) -> CheckedPremise:
+        relevant = tuple(stale_states)
+        ids = tuple(state.state_id for state in relevant)
+        correction = '; '.join(
+            f'{state.entity}.{state.attribute} is stale ({state.value})'
+            for state in relevant
+        )
+        return CheckedPremise(
+            Premise(query),
+            PremiseStatus.CONFLICTED,
+            conflicting_state_ids=ids,
+            correction=f'Stale premise rejected: {correction}.',
         )
 
     def _candidate_match(self, premise: Premise, state: StateNode) -> bool:

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, Sequence
 
-from stategraph.state.schema import StateNode, attributes_compatible
+from stategraph.state.linking import SlotIdentity, StateLinker
+from stategraph.state.schema import StateNode
 
 
 class ConflictType(str, Enum):
@@ -86,9 +87,12 @@ class ConflictDetector:
                 new_state.confidence,
             )
 
-        if not new_state.time_scope.overlaps(old_state.time_scope):
+        verified_link = old_state.state_id in tuple(
+            new_state.metadata.get('revision_linked_target_ids', ())
+        )
+        if not new_state.time_scope.overlaps(old_state.time_scope) and not verified_link:
             return ConflictType.CONSISTENT, 'state time scopes do not overlap', 1.0
-        if not new_state.condition_scope.overlaps(old_state.condition_scope):
+        if not new_state.condition_scope.overlaps(old_state.condition_scope) and not verified_link:
             return ConflictType.CONSISTENT, 'state condition scopes do not overlap', 1.0
 
         for rule in self._implicit_rules:
@@ -100,18 +104,16 @@ class ConflictDetector:
         if isinstance(explicit_conflicts, str):
             explicit_conflicts = (explicit_conflicts,)
         explicitly_conflicts = old_state.state_id in explicit_conflicts
-        same_slot = (
-            new_state.has_canonical_slot
-            and old_state.has_canonical_slot
-            and new_state.identity_key == old_state.identity_key
-        ) or not (
-            new_state.identity_key[0] != old_state.identity_key[0]
-            or not attributes_compatible(new_state.attribute, old_state.attribute)
+        same_slot = verified_link or (
+            StateLinker.identity_decision(new_state, old_state).decision == SlotIdentity.SAME_SLOT
         )
         if not same_slot and not explicitly_conflicts:
             return ConflictType.CONSISTENT, 'states describe different attributes', 1.0
 
-        same_value = new_state.normalised_value == old_state.normalised_value
+        same_value = (
+            new_state.normalised_value == old_state.normalised_value
+            or old_state.state_id in new_state.metadata.get('slot_grounding_equivalent_ids', ())
+        )
         same_scope = (
             new_state.time_scope == old_state.time_scope
             and new_state.condition_scope == old_state.condition_scope
@@ -125,6 +127,13 @@ class ConflictDetector:
             return ConflictType.DUPLICATE, 'same identity and value confirm one state slot', 1.0
         if same_slot and same_value:
             return ConflictType.CONSISTENT, 'same value under a compatible scope', 1.0
+
+        if same_slot and _polarity_changed(new_state, old_state):
+            return (
+                ConflictType.EXPLICIT_CONFLICT,
+                'grounded evidence reverses the state polarity',
+                min(new_state.confidence, old_state.confidence),
+            )
 
         bounded_time_exception = (
             old_state.time_scope.contains(new_state.time_scope)
@@ -205,6 +214,28 @@ class ConflictDetector:
 
     def classify(self, new_state: StateNode, old_state: StateNode) -> ConflictDecision:
         return self.detect(new_state, old_state)
+
+
+_NEGATION_PATTERNS = (
+    # Strong revocation/cancellation markers only.  Generic negation such as
+    # ``not`` or boolean ``false`` is intentionally left to normal UPDATE /
+    # conflict ordering so existing low-level state contracts stay stable.
+    'no longer', 'no more', 'unavailable', 'disabled', 'stopped', 'ceased',
+    'cancelled', 'canceled', 'revoked', 'withdrawn',
+)
+
+
+def _is_negated(state: StateNode) -> bool:
+    text = ' '.join(
+        str(state.metadata.get(key, ''))
+        for key in ('evidence_span', 'attribute_span', 'value_span')
+    ) + ' ' + str(state.attribute) + ' ' + str(state.value)
+    folded = text.casefold()
+    return any(marker in folded for marker in _NEGATION_PATTERNS)
+
+
+def _polarity_changed(new_state: StateNode, old_state: StateNode) -> bool:
+    return _is_negated(new_state) != _is_negated(old_state)
 
 
 __all__ = [
