@@ -100,6 +100,8 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_relation_target_fails_closed_without_lifecycle_change(self) -> None:
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
+                if kwargs.get('prompt_name') == 'stategraph.dependency_candidate_discovery.v1':
+                    return {'candidates': []}
                 if kwargs.get('prompt_name') == 'stategraph.existing_slot_grounding.v1':
                     data = json.loads(messages[1].content)
                     old = next(s for s in data['existing_current_states'] if s['attribute'] == 'status')
@@ -220,6 +222,35 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
             candidates[1].metadata['source_span_start'],
         )
 
+    async def test_punctuation_only_attribute_fails_closed_after_normalization(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
+                    return {'relations': []}
+                return {
+                    'states': [
+                        {
+                            'entity': 'user',
+                            'attribute': '-',
+                            'value': 'unknown',
+                            'evidence_span': 'User - unknown.',
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            trace_path = Path(directory) / 'trace.jsonl'
+            candidates = await GraphitiLLMStateExtractor(
+                FakeLLM(), trace_path=trace_path
+            ).extract(self.observation('User - unknown.'), ())
+            record = json.loads(trace_path.read_text().strip())
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(
+            record['rejected_candidates'][0]['reason'],
+            'attribute_empty_after_normalization',
+        )
+
     async def test_prompt_requires_source_faithful_subject_field_and_cancellation(self) -> None:
         class CapturingLLM:
             def __init__(self):
@@ -247,6 +278,68 @@ class StructuredExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Do not replace a source condition with true or false', llm.system_prompt)
         self.assertNotIn('MemoryAgentBench', llm.system_prompt)
         self.assertNotIn('LongMemEval', llm.system_prompt)
+
+    async def test_prompt_requires_turn_complete_role_grounded_coverage(self) -> None:
+        class CapturingLLM:
+            def __init__(self):
+                self.system_prompt = ''
+
+            async def generate_response(self, messages, **kwargs):
+                if kwargs['prompt_name'] == 'stategraph.state_extraction.v2':
+                    self.system_prompt = messages[0].content
+                    return {'states': []}
+                return {'relations': []}
+
+        llm = CapturingLLM()
+        await GraphitiLLMStateExtractor(llm).extract(
+            self.observation(
+                'user_agent: I need to submit the report. '
+                'ai_agent: The report is not approved.'
+            ),
+            (),
+        )
+
+        self.assertIn('Do not rank facts by salience or importance', llm.system_prompt)
+        self.assertIn('each role-labelled turn', llm.system_prompt)
+        self.assertIn('coverage pass over every segment', llm.system_prompt)
+        self.assertIn('ordinary tasks, plans, commitments', llm.system_prompt)
+        self.assertIn('role prefix is authoritative for entity grounding', llm.system_prompt)
+
+    async def test_generic_multi_fact_negative_and_commitment_contract(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                if kwargs['prompt_name'] == 'stategraph.semantic_relation_extraction.v1':
+                    return {'relations': []}
+                return {
+                    'states': [
+                        {
+                            'entity': 'user',
+                            'attribute': 'submit_report',
+                            'value': 'by Friday',
+                            'evidence_span': 'user_agent: I need to submit the report by Friday.',
+                        },
+                        {
+                            'entity': 'report',
+                            'attribute': 'approval',
+                            'value': 'not approved',
+                            'evidence_span': 'ai_agent: The report is not approved.',
+                        },
+                    ]
+                }
+
+        content = (
+            'user_agent: I need to submit the report by Friday. '
+            'ai_agent: The report is not approved. '
+            'ai_agent: Thanks for the update.'
+        )
+        candidates = await GraphitiLLMStateExtractor(FakeLLM()).extract(
+            self.observation(content), ()
+        )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[0].entity, 'user')
+        self.assertEqual(candidates[0].value, 'by Friday')
+        self.assertEqual(candidates[1].value, 'not approved')
 
     async def test_attribute_span_is_grounding_not_a_second_semantic_field(self) -> None:
         class FakeLLM:

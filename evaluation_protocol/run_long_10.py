@@ -27,11 +27,38 @@ def git_commit(name: str) -> str:
 
 
 def answer(question: str, context: str) -> str:
+    provider = os.environ.get('ANSWER_GENERATOR_PROVIDER', 'openai').strip().lower() or 'openai'
+    if provider not in {'openai', 'deepseek'}:
+        raise RuntimeError('ANSWER_GENERATOR_PROVIDER must be openai or deepseek')
+    model = os.environ.get(
+        'ANSWER_GENERATOR_MODEL', 'gpt-5-nano' if provider == 'openai' else 'deepseek-chat'
+    )
+    if provider == 'openai':
+        from openai import OpenAI
+
+        key = os.environ.get('OPENAI_API_KEY') or os.environ.get('ANSWER_GENERATOR_API_KEY')
+        if not key:
+            raise RuntimeError('ANSWER_GENERATOR_API_KEY or OPENAI_API_KEY is required')
+        response = OpenAI(
+            api_key=key,
+            timeout=120,
+            max_retries=0,
+        ).responses.create(
+            model=model,
+            input=[
+                {'role': 'system', 'content': 'Answer using only the retrieved context. Return only the final answer.'},
+                {'role': 'user', 'content': f'Retrieved context:\n{context}\n\nQuestion:\n{question}'},
+            ],
+            max_output_tokens=512,
+            reasoning={'effort': 'minimal'},
+            store=False,
+        )
+        return (response.output_text or '').strip()
+
     key = os.environ.get('ANSWER_GENERATOR_API_KEY') or os.environ.get('DEEPSEEK_API_KEY')
     if not key:
         raise RuntimeError('ANSWER_GENERATOR_API_KEY or DEEPSEEK_API_KEY is required')
     base_url = os.environ.get('ANSWER_GENERATOR_BASE_URL', 'https://api.deepseek.com/v1').rstrip('/')
-    model = os.environ.get('ANSWER_GENERATOR_MODEL', 'deepseek-chat')
     payload = {
         'model': model,
         'temperature': 0,
@@ -57,15 +84,25 @@ def main() -> None:
     cases_dir = OUT / 'cases'
     cases_dir.mkdir(exist_ok=True)
     records = []
+    manifest_provider = os.environ.get('ANSWER_GENERATOR_PROVIDER', 'openai').strip().lower() or 'openai'
+    manifest_model = os.environ.get(
+        'ANSWER_GENERATOR_MODEL',
+        'gpt-5-nano' if manifest_provider == 'openai' else 'deepseek-chat',
+    )
     manifest = {
         'run_id': 'baseline_long_10',
         'created_at': datetime.now(timezone.utc).isoformat(),
         'dataset': str(DATA),
         'dataset_sha256': sha256(DATA.read_text(encoding='utf-8')),
         'answer_generator': {
-            'provider': 'openai-compatible',
-            'base_url': os.environ.get('ANSWER_GENERATOR_BASE_URL', 'https://api.deepseek.com/v1'),
-            'model': os.environ.get('ANSWER_GENERATOR_MODEL', 'deepseek-chat'),
+            'provider': manifest_provider,
+            'base_url': os.environ.get(
+                'ANSWER_GENERATOR_BASE_URL',
+                'https://api.openai.com/v1'
+                if manifest_provider == 'openai'
+                else 'https://api.deepseek.com/v1',
+            ),
+            'model': manifest_model,
             'temperature': 0,
             'stategraph_config_match': False,
             'note': 'StateGraph implementation was removed; shared config match cannot be verified.',

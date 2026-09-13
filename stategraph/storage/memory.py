@@ -66,5 +66,30 @@ class InMemoryStateRepository:
             ]
         return sorted(relations, key=lambda relation: (relation.created_at, relation.relation_id))
 
+    async def clear_group(self, group_id: str) -> None:
+        """Remove only StateGraph records for a resumable snapshot replacement."""
+
+        async with self._lock:
+            state_ids = {
+                state_id
+                for state_id, state in self._states.items()
+                if state.group_id == group_id
+            }
+            self._states = {
+                state_id: state
+                for state_id, state in self._states.items()
+                if state_id not in state_ids
+            }
+            self._relations = {
+                relation_id: relation
+                for relation_id, relation in self._relations.items()
+                if relation.group_id != group_id
+            }
+            self._evidence = {
+                evidence_id: evidence
+                for evidence_id, evidence in self._evidence.items()
+                if evidence.group_id != group_id
+            }
+
 
 __all__ = ['InMemoryStateRepository']

@@ -10,6 +10,17 @@ from typing import Iterable, Protocol, Sequence
 from stategraph.state.schema import StateNode, StateRelation, StateStatus
 
 
+_PREMISE_STOPWORDS = frozenset(
+    {
+        'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'can', 'could',
+        'do', 'does', 'for', 'from', 'has', 'have', 'in', 'is', 'it', 'last',
+        'many', 'of', 'on', 'or', 'should', 'some', 'that', 'the', 'to',
+        'up', 'was', 'were', 'what', 'when', 'where', 'which', 'who', 'why',
+        'with', 'years', 'you', 'your', 'user', 'still', 'based', 'few',
+    }
+)
+
+
 class PremiseStatus(str, Enum):
     SUPPORTED = 'supported'
     CONFLICTED = 'conflicted'
@@ -270,12 +281,12 @@ class PremiseChecker:
             )
             return direct or effect_match
 
-        tokens = _tokens(premise.text)
+        tokens = _tokens(premise.text) - _PREMISE_STOPWORDS
         descriptor_tokens = _tokens(
             ' '.join(
                 (
-                    state.entity,
                     state.attribute,
+                    str(state.value),
                     state.condition_scope.description or '',
                     *(f'{key} {value}' for key, value in state.condition_scope.conditions),
                 )
@@ -284,7 +295,18 @@ class PremiseChecker:
         for effect in state.effects:
             descriptor_tokens.update(_tokens(f'{effect.entity or ""} {effect.attribute or ""}'))
         # An explicit attribute/condition mention is enough; entity-only matches are noisy.
-        return bool(tokens & descriptor_tokens)
+        if tokens & descriptor_tokens:
+            return True
+        if not tokens & _tokens(state.entity):
+            return False
+        value_tokens = _tokens(str(state.value))
+        if self._contains_opposite(tokens, value_tokens):
+            return True
+        return any(
+            min(len(left), len(right)) >= 6 and left[:6] == right[:6]
+            for left in tokens
+            for right in descriptor_tokens
+        )
 
     def _contains_opposite(self, premise_tokens: set[str], value_tokens: set[str]) -> bool:
         for positive, negative in self._opposites:

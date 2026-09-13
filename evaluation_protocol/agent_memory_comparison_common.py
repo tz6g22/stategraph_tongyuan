@@ -64,8 +64,8 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 def load_answer_config() -> tuple[dict[str, Any], bytes, str]:
     config_bytes = CONFIG_PATH.read_bytes()
     config = yaml.safe_load(config_bytes)
-    if config['model']['provider'] != 'deepseek' or config['model']['name'] != 'deepseek-chat':
-        raise RuntimeError('shared answer configuration is not pinned to DeepSeek')
+    if config['model']['provider'] != 'openai' or config['model']['name'] != 'gpt-5-nano':
+        raise RuntimeError('shared answer configuration is not pinned to OpenAI gpt-5-nano')
     if config['context']['ordering'] != 'retrieval_order':
         raise RuntimeError('comparison requires retrieval-order context')
     return config, config_bytes, sha256_bytes(config_bytes)
@@ -139,10 +139,45 @@ def call_deepseek(
     json_object: bool = False,
     max_tokens: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Call the pinned OpenAI-compatible endpoint without persisting credentials."""
+    """Call the configured model endpoint without persisting credentials.
+
+    The historical function name is retained for existing runner imports. The
+    default shared configuration now uses OpenAI Responses with gpt-5-nano.
+    """
 
     model_config = config['model']
     base_url = os.environ.get(model_config['base_url_env'], model_config['base_url']).rstrip('/')
+    if model_config['provider'] == 'openai':
+        from openai import OpenAI
+
+        request: dict[str, Any] = {
+            'model': model_config['name'],
+            'input': messages,
+            'max_output_tokens': max_tokens or model_config['max_tokens'],
+            'reasoning': {'effort': 'minimal'},
+            'store': False,
+        }
+        if json_object:
+            request['text'] = {'format': {'type': 'json_object'}}
+        response = OpenAI(
+            api_key=_api_key(model_config),
+            base_url=base_url,
+            timeout=180,
+            max_retries=0,
+        ).responses.create(**request)
+        content = (response.output_text or '').strip()
+        if not content:
+            raise RuntimeError('OpenAI Responses endpoint returned empty output')
+        usage = getattr(response, 'usage', None)
+        if hasattr(usage, 'model_dump'):
+            usage = usage.model_dump()
+        return content, {
+            'response_id': getattr(response, 'id', None),
+            'model': getattr(response, 'model', model_config['name']),
+            'usage': usage,
+            'status': getattr(response, 'status', None),
+            'attempt': 1,
+        }
     payload: dict[str, Any] = {
         'model': model_config['name'],
         'temperature': model_config['temperature'],
@@ -180,12 +215,12 @@ def call_deepseek(
             last_error = exc
             if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
                 detail = exc.read().decode('utf-8', errors='replace')[:2000]
-                raise RuntimeError(f'DeepSeek HTTP {exc.code}: {detail}') from exc
+                raise RuntimeError(f'Model HTTP {exc.code}: {detail}') from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             last_error = exc
         if attempt < 3:
             time.sleep(2**attempt)
-    raise RuntimeError(f'DeepSeek request failed after 4 attempts: {last_error}')
+    raise RuntimeError(f'Model request failed after 4 attempts: {last_error}')
 
 
 def load_runtime_diagnostics(method_dir: Path) -> dict[str, Any] | None:

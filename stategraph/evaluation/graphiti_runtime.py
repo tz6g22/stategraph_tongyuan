@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import os
 from pathlib import Path
 from typing import Any, Type
 
+from stategraph.evaluation.provider_resilience import (
+    FINISH_REASON_INCOMPLETE,
+    MALFORMED_STRUCTURED_OUTPUT,
+    TIMEOUT,
+    TPM_RATE_LIMIT,
+    TRANSPORT_FAILURE,
+    FinishReasonIncomplete,
+    MalformedStructuredOutput,
+    ProviderRetryPolicy,
+    TokenPacer,
+    bounded_async_call,
+    request_sha256,
+)
+from stategraph.evaluation.profiling import StageProfiler
+
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PROVIDER = 'openai'
+DEFAULT_MODEL = 'gpt-5-nano'
 
 
 def _workspace_gateway_config(path: Path) -> dict[str, Any]:
@@ -47,20 +66,44 @@ def _strip_json_fence(text: str) -> str:
 
 def _parse_json_object(text: str) -> dict[str, Any]:
     cleaned = _strip_json_fence(text)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find('{')
-        end = cleaned.rfind('}')
-        if start < 0 or end <= start:
-            raise
-        parsed = json.loads(cleaned[start : end + 1])
+    parsed = json.loads(cleaned)
     if not isinstance(parsed, dict):
         raise RuntimeError('LLM did not return a JSON object')
     return parsed
 
 
-def _create_responses_llm(config: Any, gateway: dict[str, Any]) -> Any:
+def _strict_pydantic_schema(response_model: Any) -> dict[str, Any]:
+    """Make Graphiti's Pydantic schema acceptable to Responses strict JSON mode."""
+
+    schema = copy.deepcopy(response_model.model_json_schema())
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get('type') == 'object' or 'properties' in node:
+                properties = node.get('properties', {})
+                node['additionalProperties'] = False
+                node['required'] = list(properties)
+                for child in properties.values():
+                    visit(child)
+            for key in ('$defs', 'definitions'):
+                for child in node.get(key, {}).values():
+                    visit(child)
+            if 'items' in node:
+                visit(node['items'])
+            for key in ('anyOf', 'allOf', 'oneOf'):
+                for child in node.get(key, ()):
+                    visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(schema)
+    return schema
+
+
+def _create_responses_llm(
+    config: Any, gateway: dict[str, Any], *, profiler: StageProfiler | None = None
+) -> Any:
     """Create a Graphiti LLM client for an OpenAI-compatible Responses endpoint."""
 
     from openai import AsyncOpenAI
@@ -78,8 +121,135 @@ def _create_responses_llm(config: Any, gateway: dict[str, Any]) -> Any:
                 base_url=gateway['base_url'],
                 default_headers=gateway['headers'],
                 timeout=float(os.environ.get('STATEGRAPH_LLM_TIMEOUT', '180')),
-                max_retries=1,
+                # Keep transient transport recovery bounded and opt-in; this is
+                # execution robustness, not semantic retry-until-success.
+                # Retry policy is owned by the wrapper below so every attempt is
+                # bounded and logged consistently.
+                max_retries=0,
             )
+            self.retry_policy = ProviderRetryPolicy.from_env()
+            self.token_pacer = TokenPacer(self.retry_policy)
+            self.attempt_trace: list[dict[str, Any]] = []
+            self.last_attempt_trace: list[dict[str, Any]] = []
+            self._last_attempt_hash: str | None = None
+            self.last_error_trace: list[dict[str, Any]] = []
+            self.error_trace: list[dict[str, Any]] = []
+            self.calls: list[dict[str, Any]] = []
+            self.last_raw_response_text: str | None = None
+            self.last_response_metadata: dict[str, Any] | None = None
+            self._active_candidate_schema: dict[str, Any] | None = None
+            self._active_prompt_name: str | None = None
+            self._active_request_snapshot: dict[str, Any] | None = None
+            self._active_request_hash: str | None = None
+            self._profiler = profiler
+
+        def _record_attempt(self, details: dict[str, Any]) -> None:
+            metadata = self.last_response_metadata or {}
+            actual_request_hash = metadata.get('request_hash') or self._active_request_hash
+            if actual_request_hash:
+                details['request_hash'] = actual_request_hash
+            if self._active_prompt_name is not None:
+                details['prompt_name'] = self._active_prompt_name
+            if details.get('taxonomy') == 'VALID_RESPONSE':
+                details.setdefault('finish_reason', metadata.get('finish_reason'))
+                details.setdefault('response_metadata', metadata)
+                details.setdefault('raw_response_available', self.last_raw_response_text is not None)
+                details.setdefault(
+                    'raw_response_chars',
+                    len(self.last_raw_response_text or ''),
+                )
+                if self.last_raw_response_text is not None:
+                    details.setdefault('raw_response_text', self.last_raw_response_text)
+            request_hash = details.get('request_hash')
+            if request_hash != self._last_attempt_hash:
+                self.last_attempt_trace = []
+                self.last_error_trace = []
+                self._last_attempt_hash = request_hash
+            self.last_attempt_trace.append(details)
+            self.attempt_trace.append(details)
+            if details.get('taxonomy') != 'VALID_RESPONSE':
+                self.last_error_trace.append(details)
+                self.error_trace.append(details)
+            if self._profiler is not None:
+                self._profiler.record_provider_attempt(
+                    details,
+                    request_snapshot=self._active_request_snapshot,
+                )
+
+        async def _generate_response_with_retry(
+            self,
+            messages: list[Message],
+            response_model: Type[BaseModel] | None = None,
+            max_tokens: int = DEFAULT_MAX_TOKENS,
+            model_size: ModelSize = ModelSize.medium,
+        ) -> dict[str, Any]:
+            """Replace Graphiti's unbounded/random retry decorator with one policy."""
+
+            return await bounded_async_call(
+                lambda: self._generate_response(messages, response_model, max_tokens, model_size),
+                request_snapshot={
+                    'model': self.small_model if model_size == ModelSize.small else self.model,
+                    'messages': [message.model_dump() for message in messages],
+                    'max_output_tokens': max_tokens,
+                    'response_schema': (
+                        _strict_pydantic_schema(response_model)
+                        if response_model is not None
+                        else self._active_candidate_schema
+                    ),
+                },
+                provider='openai',
+                model=self.small_model if model_size == ModelSize.small else self.model,
+                policy=self.retry_policy,
+                pacer=self.token_pacer,
+                record=self._record_attempt,
+                allowed_taxonomies={
+                    TRANSPORT_FAILURE,
+                    TPM_RATE_LIMIT,
+                    TIMEOUT,
+                    FINISH_REASON_INCOMPLETE,
+                    MALFORMED_STRUCTURED_OUTPUT,
+                },
+            )
+
+        async def generate_response(
+            self,
+            messages,
+            response_model=None,
+            max_tokens=None,
+            model_size=ModelSize.medium,
+            group_id=None,
+            prompt_name=None,
+            *,
+            attribute_extraction=False,
+            candidate_schema=None,
+        ):
+            """Keep the shared endpoint contract available to production callers."""
+            previous_prompt_name = self._active_prompt_name
+            self._active_prompt_name = prompt_name
+            try:
+                if candidate_schema is None:
+                    return await super().generate_response(
+                        messages,
+                        response_model=response_model,
+                        max_tokens=max_tokens,
+                        model_size=model_size,
+                        group_id=group_id,
+                        prompt_name=prompt_name,
+                        attribute_extraction=attribute_extraction,
+                    )
+                self._active_candidate_schema = candidate_schema
+                return await super().generate_response(
+                    messages,
+                    response_model=None,
+                    max_tokens=max_tokens,
+                    model_size=model_size,
+                    group_id=group_id,
+                    prompt_name=prompt_name,
+                    attribute_extraction=attribute_extraction,
+                )
+            finally:
+                self._active_candidate_schema = None
+                self._active_prompt_name = previous_prompt_name
 
         async def _generate_response(
             self,
@@ -88,7 +258,12 @@ def _create_responses_llm(config: Any, gateway: dict[str, Any]) -> Any:
             max_tokens: int = DEFAULT_MAX_TOKENS,
             model_size: ModelSize = ModelSize.medium,
         ) -> dict[str, Any]:
+            delay = float(os.environ.get('STATEGRAPH_LLM_REQUEST_DELAY_SECONDS', '0'))
+            if delay > 0:
+                await asyncio.sleep(delay)
             model = self.small_model if model_size == ModelSize.small else self.model
+            self.last_raw_response_text = None
+            self.last_response_metadata = None
             request: dict[str, Any] = {
                 'model': model,
                 'input': [message.model_dump() for message in messages],
@@ -100,8 +275,24 @@ def _create_responses_llm(config: Any, gateway: dict[str, Any]) -> Any:
             )
             if reasoning_effort:
                 request['reasoning'] = {'effort': reasoning_effort}
-            if response_model is not None:
-                request['text'] = {'format': {'type': 'json_object'}}
+            schema = self._active_candidate_schema
+            if schema is not None:
+                request['text'] = {'format': {
+                    'type': 'json_schema',
+                    'name': 'stategraph_dependency_candidate_discovery',
+                    'schema': schema,
+                    'strict': True,
+                }}
+            elif response_model is not None:
+                request['text'] = {'format': {
+                    'type': 'json_schema',
+                    'name': response_model.__name__,
+                    'schema': _strict_pydantic_schema(response_model),
+                    'strict': True,
+                }}
+            request_hash = request_sha256(request)
+            self._active_request_snapshot = request
+            self._active_request_hash = request_hash
             # The workspace gateway sits behind a 120-second proxy. Streaming keeps
             # long structured Graphiti extractions alive while preserving the exact
             # response body assembled below.
@@ -122,21 +313,77 @@ def _create_responses_llm(config: Any, gateway: dict[str, Any]) -> Any:
                     ) from exc
                 raise
             chunks: list[str] = []
+            completion_status = None
+            stream_error: Exception | None = None
             try:
-                async for event in stream:
-                    if event.type == 'response.output_text.delta':
-                        chunks.append(event.delta)
+                try:
+                    async for event in stream:
+                        if event.type == 'response.output_text.delta':
+                            chunks.append(event.delta)
+                        elif event.type == 'response.completed':
+                            completion_status = getattr(getattr(event, 'response', None), 'status', None)
+                except Exception as exc:
+                    stream_error = exc
             finally:
                 await stream.close()
-            output = _strip_json_fence(''.join(chunks))
+            if stream_error is not None:
+                import httpx
+
+                if not isinstance(stream_error, httpx.RemoteProtocolError):
+                    raise stream_error
+                # One non-stream fallback handles a broken chunked transport;
+                # the request schema and semantic payload stay identical.
+                response = await self.client.with_options(max_retries=0).responses.create(
+                    **request,
+                    stream=False,
+                )
+                output = _strip_json_fence(response.output_text or '')
+                completion_status = getattr(response, 'status', None)
+            else:
+                output = _strip_json_fence(''.join(chunks))
+            self.last_raw_response_text = output
+            self.last_response_metadata = {
+                'status': completion_status,
+                'finish_reason': completion_status,
+                'model': model,
+                'max_output_tokens': max_tokens,
+                'request_hash': request_hash,
+            }
+            if completion_status == 'incomplete':
+                raise FinishReasonIncomplete(
+                    f'workspace structured response incomplete raw_chars={len(output)}',
+                    raw_text=output,
+                    metadata=self.last_response_metadata,
+                )
             if not output:
-                raise RuntimeError('workspace Responses endpoint returned empty output')
-            return _parse_json_object(output)
+                raise MalformedStructuredOutput(
+                    'workspace Responses endpoint returned empty output',
+                    raw_text=output,
+                    metadata=self.last_response_metadata,
+                )
+            try:
+                parsed = _parse_json_object(output)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise MalformedStructuredOutput(
+                    f'workspace structured response malformed: {exc}; raw_chars={len(output)}',
+                    raw_text=output,
+                    metadata=self.last_response_metadata,
+                ) from exc
+            self.calls.append({
+                'provider': 'openai',
+                'model': model,
+                'raw_response': output,
+                'finish_reason': completion_status,
+                'max_output_tokens': max_tokens,
+                'request_hash': request_hash,
+            })
+            self._active_request_snapshot = request
+            return parsed
 
     return ResponsesLLMClient()
 
 
-def create_llm() -> tuple[Any, Any]:
+def create_llm(*, profiler: StageProfiler | None = None) -> tuple[Any, Any]:
     """Create the configured Graphiti-compatible LLM and its LLMConfig."""
 
     from openai import AsyncOpenAI
@@ -145,52 +392,60 @@ def create_llm() -> tuple[Any, Any]:
     from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
     use_workspace_gateway = os.environ.get('STATEGRAPH_USE_WORKSPACE_GATEWAY') == '1'
+    provider = os.environ.get('STATEGRAPH_LLM_PROVIDER', DEFAULT_PROVIDER).strip().lower() or DEFAULT_PROVIDER
+    if provider not in {'openai', 'deepseek'}:
+        raise RuntimeError('STATEGRAPH_LLM_PROVIDER must be openai or deepseek')
     gateway = None
     if use_workspace_gateway:
         gateway = _workspace_gateway_config(ROOT / 'apikey' / '第三方api.txt')
         api_key = gateway['api_key']
-        using_deepseek = False
+        provider = 'openai'
     else:
+        key_name = 'OPENAI_API_KEY' if provider == 'openai' else 'DEEPSEEK_API_KEY'
         api_key = (
-            os.environ.get('STATEGRAPH_LLM_API_KEY')
-            or os.environ.get('OPENAI_API_KEY')
-            or os.environ.get('DEEPSEEK_API_KEY')
+            os.environ.get(key_name) or os.environ.get('STATEGRAPH_LLM_API_KEY')
+            if provider == 'openai'
+            else os.environ.get('DEEPSEEK_API_KEY') or os.environ.get('STATEGRAPH_LLM_API_KEY')
         )
         if not api_key:
             raise RuntimeError(
-                'STATEGRAPH_LLM_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, or '
-                'STATEGRAPH_USE_WORKSPACE_GATEWAY=1 is required'
+                f'STATEGRAPH_LLM_API_KEY or {key_name} is required '
+                '(or STATEGRAPH_USE_WORKSPACE_GATEWAY=1)'
             )
-        using_deepseek = bool(os.environ.get('DEEPSEEK_API_KEY')) and not bool(
-            os.environ.get('OPENAI_API_KEY') or os.environ.get('STATEGRAPH_LLM_API_KEY')
-        )
+    default_base_url = (
+        'https://api.openai.com/v1' if provider == 'openai' else 'https://api.deepseek.com'
+    )
+    default_model = DEFAULT_MODEL if provider == 'openai' else 'deepseek-chat'
+    default_reasoning_effort = 'minimal' if provider == 'openai' else ''
+    base_url = os.environ.get(
+        'STATEGRAPH_LLM_BASE_URL', gateway['base_url'] if gateway else default_base_url
+    )
+    model = os.environ.get(
+        'STATEGRAPH_LLM_MODEL', gateway['model'] if gateway else default_model
+    )
     config = LLMConfig(
         api_key=api_key,
-        base_url=os.environ.get(
-            'STATEGRAPH_LLM_BASE_URL',
-            gateway['base_url']
-            if gateway
-            else ('https://api.deepseek.com' if using_deepseek else 'https://api.openai.com/v1'),
-        ),
-        model=os.environ.get(
-            'STATEGRAPH_LLM_MODEL',
-            gateway['model']
-            if gateway
-            else ('deepseek-chat' if using_deepseek else 'gpt-4.1-mini'),
-        ),
-        small_model=os.environ.get(
-            'STATEGRAPH_LLM_MODEL',
-            gateway['model']
-            if gateway
-            else ('deepseek-chat' if using_deepseek else 'gpt-4.1-mini'),
-        ),
+        base_url=base_url,
+        model=model,
+        small_model=model,
         temperature=0,
         max_tokens=int(os.environ.get('STATEGRAPH_LLM_MAX_TOKENS', '8192')),
     )
-    llm = (
-        _create_responses_llm(config, gateway)
-        if gateway
-        else OpenAIGenericClient(
+    if provider == 'openai':
+        # GPT-5 models use the Responses API path so max_output_tokens and
+        # reasoning_effort are passed with their native contract.
+        response_gateway = gateway or {
+            'api_key': api_key,
+            'base_url': base_url,
+            'headers': {},
+            'model': model,
+            'reasoning_effort': os.environ.get(
+                'STATEGRAPH_LLM_REASONING_EFFORT', default_reasoning_effort
+            ),
+        }
+        llm = _create_responses_llm(config, response_gateway, profiler=profiler)
+    else:
+        llm = OpenAIGenericClient(
             config=config,
             client=AsyncOpenAI(
                 api_key=config.api_key,
@@ -201,11 +456,10 @@ def create_llm() -> tuple[Any, Any]:
             max_tokens=config.max_tokens,
             structured_output_mode='json_object',
         )
-    )
     return llm, config
 
 
-def create_graphiti(state_dir: Path) -> Any:
+def create_graphiti(state_dir: Path, *, profiler: StageProfiler | None = None) -> Any:
     """Create Graphiti with embedded FalkorDB and a local deterministic embedder."""
 
     from sentence_transformers import SentenceTransformer
@@ -234,7 +488,7 @@ def create_graphiti(state_dir: Path) -> Any:
     state_dir.mkdir(parents=True, exist_ok=True)
     client = AsyncFalkorDB(dbfilename=str(state_dir / 'falkordb.db'))
     driver = FalkorDriver(falkor_db=client, database='stategraph_agent_memory_10')
-    llm, config = create_llm()
+    llm, config = create_llm(profiler=profiler)
     return Graphiti(
         graph_driver=driver,
         llm_client=llm,

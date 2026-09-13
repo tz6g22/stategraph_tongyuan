@@ -18,8 +18,12 @@ from stategraph import (
 )
 from stategraph.graphiti_adapter.dependency_discovery import (
     AutomaticDependencyDiscovery,
+    CANDIDATE_BATCH_MAX_CHARS,
+    CANDIDATE_BATCH_MAX_ENDPOINT_RECORDS,
     CounterfactualDependencyVerifier,
     DependencyAssessment,
+    _candidate_batch_pair_coverage,
+    _candidate_state_batches,
     generate_dependency_candidates,
 )
 from stategraph.propagation import InvalidationPropagation
@@ -553,6 +557,147 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
             states=(_node('A'), _node('B')),
         )
         self.assertEqual(result[0].strength, DependencyStrength.NONE)
+
+    async def test_candidate_discovery_batches_large_state_sets_and_merges(self) -> None:
+        states = tuple(_node(f's{index:03d}') for index in range(70))
+        observation = Observation(
+            'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
+        )
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+
+            async def generate_response(self, messages, **kwargs):
+                payload = json.loads(messages[-1].content)
+                self.calls.append(payload)
+                source_ids = payload['source_endpoint_ids']
+                dependent_ids = payload['dependent_endpoint_ids']
+                if not source_ids or not dependent_ids or source_ids[0] == dependent_ids[0]:
+                    return {'candidates': []}
+                return {'candidates': [{
+                    'prerequisite_state_id': source_ids[0],
+                    'dependent_state_id': dependent_ids[0],
+                    'proposed_relation': 'DEPENDS_ON',
+                    'signal': 'explicit_source_relation',
+                    'candidate_reason': 'explicit requirement',
+                    'evidence_span': 'A requires B.',
+                }]}
+
+        llm = FakeLLM()
+        candidates = await AutomaticDependencyDiscovery(llm).discover_candidates(
+            observation, new_states=states, all_states=states
+        )
+        self.assertGreater(len(llm.calls), 1)
+        self.assertTrue(all(len(json.dumps(item)) <= 26000 for item in llm.calls))
+        self.assertGreaterEqual(len(candidates), 2)
+        self.assertEqual(
+            {item.dependent_state_id for item in candidates},
+            {
+                item['dependent_endpoint_ids'][0]
+                for item in llm.calls
+                if item['source_endpoint_ids']
+                and item['dependent_endpoint_ids']
+                and item['source_endpoint_ids'][0] != item['dependent_endpoint_ids'][0]
+            },
+        )
+
+    async def test_candidate_batch_budget_includes_long_observation(self) -> None:
+        states = tuple(_node(f's{index:03d}') for index in range(70))
+        observation = Observation(
+            'long observation ' + ('x' * 12000),
+            datetime(2030, 1, 1, tzinfo=UTC), 'test',
+        )
+
+        class FakeLLM:
+            def __init__(self):
+                self.payloads = []
+
+            async def generate_response(self, messages, **kwargs):
+                payload = json.loads(messages[-1].content)
+                self.payloads.append(payload)
+                return {'candidates': []}
+
+        llm = FakeLLM()
+        await AutomaticDependencyDiscovery(llm).discover_candidates(
+            observation, new_states=states, all_states=states
+        )
+        self.assertGreater(len(llm.payloads), 1)
+        self.assertLessEqual(
+            max(len(json.dumps(payload, ensure_ascii=False)) for payload in llm.payloads),
+            CANDIDATE_BATCH_MAX_CHARS,
+        )
+
+    async def test_candidate_discovery_rejects_invalid_item_fail_closed(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                return {'candidates': [{
+                    'prerequisite_state_id': 'unknown',
+                    'dependent_state_id': 'B',
+                    'proposed_relation': 'DEPENDS_ON',
+                    'signal': 'explicit_source_relation',
+                    'candidate_reason': 'invalid endpoint',
+                    'evidence_span': 'A requires B.',
+                }]}
+
+        with self.assertRaises(ValueError):
+            await AutomaticDependencyDiscovery(FakeLLM()).discover_candidates(
+                Observation('A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+                new_states=(_node('B'),), all_states=(_node('A'), _node('B')),
+            )
+
+    async def test_candidate_discovery_rejects_out_of_batch_dependent(self) -> None:
+        with self.assertRaises(ValueError):
+            from stategraph.graphiti_adapter.dependency_discovery import _parse_discovered_candidates
+
+            _parse_discovered_candidates(
+                {'candidates': [{
+                    'prerequisite_state_id': 'A',
+                    'dependent_state_id': 'C',
+                    'proposed_relation': 'DEPENDS_ON',
+                    'signal': 'explicit_source_relation',
+                    'candidate_reason': 'out of batch',
+                    'evidence_span': 'A requires B.',
+                }]},
+                states={'A': _node('A'), 'B': _node('B')},
+                new_state_ids={'B'},
+                source_state_ids={'A'},
+                observation=Observation(
+                    'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
+                ),
+            )
+
+    async def test_candidate_discovery_rejects_malformed_envelope(self) -> None:
+        class FakeLLM:
+            async def generate_response(self, messages, **kwargs):
+                return {'candidates': [], 'unexpected': True}
+
+        with self.assertRaises(ValueError):
+            await AutomaticDependencyDiscovery(FakeLLM()).discover_candidates(
+                Observation('A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+                new_states=(_node('A'), _node('B')),
+                all_states=(_node('A'), _node('B')),
+            )
+
+    async def test_candidate_batch_pair_coverage_is_complete_across_blocks(self) -> None:
+        states = tuple(_node(f's{index:03d}') for index in range(70))
+        new_ids = {f's{index:03d}' for index in range(35, 70)}
+        batches = _candidate_state_batches(
+            states, new_ids, observation_content='bounded observation'
+        )
+        expected = {
+            (source.state_id, dependent.state_id)
+            for source in states
+            for dependent in states
+            if dependent.state_id in new_ids and source.state_id != dependent.state_id
+        }
+        self.assertEqual(_candidate_batch_pair_coverage(batches), expected)
+        self.assertTrue(
+            all(len(batch.states) <= CANDIDATE_BATCH_MAX_ENDPOINT_RECORDS for batch in batches)
+        )
+        self.assertTrue(
+            all(source != dependent for source, dependent in _candidate_batch_pair_coverage(batches))
+        )
 
 
 def _node(state_id: str, *, evidence_id: str | None = None) -> StateNode:

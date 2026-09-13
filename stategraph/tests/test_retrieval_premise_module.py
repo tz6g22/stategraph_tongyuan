@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 from stategraph import EvidenceNode, StateNode, StateStatus, TimeScope
 from stategraph.retrieval import CurrentStateRetriever, Premise, PremiseChecker, ResponsePolicy
@@ -199,6 +200,73 @@ class RetrievalPremiseModuleTests(unittest.IsolatedAsyncioTestCase):
             'Is the schedule still valid?', group_id='retrieval-test', at=NOW
         )
         self.assertEqual(result.state_ids, ('direct',))
+
+    async def test_continuity_does_not_shadow_distinct_same_observation_values(self) -> None:
+        repo = await _repository(
+            _state(
+                'field-work', 'to_do_list', 'plan field work',
+                text='Alice needs to plan field work', observation_id='obs',
+            ),
+            _state(
+                'proposal', 'to_do', 'update proposal',
+                text='Alice needs to update proposal', observation_id='obs',
+            ),
+        )
+        result = await CurrentStateRetriever(repo).retrieve(
+            'What tasks remain on my todo list?', group_id='retrieval-test', at=NOW,
+        )
+        self.assertIn('field-work', result.state_ids)
+        self.assertIn('proposal', result.state_ids)
+
+    async def test_compound_field_tokens_match_spaced_query(self) -> None:
+        repo = await _repository(
+            _state('todo', 'to_do', 'update proposal'),
+        )
+        result = await CurrentStateRetriever(repo).retrieve(
+            'What is on my todo list?', group_id='retrieval-test', at=NOW,
+        )
+        self.assertIn('todo', result.state_ids)
+
+    async def test_single_shared_word_does_not_shadow_distinct_current_slot(self) -> None:
+        old = replace(
+            _state(
+                'old-plan', 'planning', 'plan conference tasks',
+                status=StateStatus.STALE,
+                text='Alice plans conference tasks',
+            ),
+            observed_at=NOW - timedelta(days=1),
+        )
+        new = replace(
+            _state(
+                'new-todo', 'to_do_list', 'plan field work',
+                text='Alice needs to plan field work',
+            ),
+            observed_at=NOW,
+        )
+        shadowed = CurrentStateRetriever._shadowed_current_states(
+            'What tasks remain on my todo list?', [new], [old], set()
+        )
+        self.assertNotIn('new-todo', shadowed)
+
+    async def test_provenance_siblings_fill_bounded_context(self) -> None:
+        repo = await _repository(
+            _state(
+                'anchor', 'title', 'Secure research proposal',
+                text='The project proposal title is Secure research proposal',
+                observation_id='obs',
+            ),
+            _state(
+                'sibling', 'timeline', '24 months',
+                text='The project is planned to span 24 months',
+                observation_id='obs',
+            ),
+            _state('distractor', 'weather', 'sunny', text='The weather is sunny', observation_id='other'),
+        )
+        result = await CurrentStateRetriever(repo).retrieve(
+            'Write a project proposal for Secure research proposal',
+            group_id='retrieval-test', at=NOW, limit=2,
+        )
+        self.assertEqual(set(result.state_ids), {'anchor', 'sibling'})
 
 
 if __name__ == '__main__':

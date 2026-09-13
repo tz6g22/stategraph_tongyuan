@@ -39,5 +39,7 @@ class StateRepository(Protocol):
         relation_types: set[RelationType] | None = None,
     ) -> list[StateRelation]: ...
 
+    async def clear_group(self, group_id: str) -> None: ...
+
 
 __all__ = ['StateRepository']

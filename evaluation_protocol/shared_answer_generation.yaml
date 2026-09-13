@@ -1,12 +1,12 @@
 # This file is byte-identical for StateGraph and every admitted baseline.
 version: agent-memory-comparison-v1
 model:
-  provider: deepseek
-  base_url: https://api.deepseek.com/v1
+  provider: openai
+  base_url: https://api.openai.com/v1
   base_url_env: ANSWER_GENERATOR_BASE_URL
-  api_key_env: ANSWER_GENERATOR_API_KEY
-  api_key_fallback_env: DEEPSEEK_API_KEY
-  name: deepseek-chat
+  api_key_env: OPENAI_API_KEY
+  api_key_fallback_env: ANSWER_GENERATOR_API_KEY
+  name: gpt-5-nano
   temperature: 0.0
   max_tokens: 512
   seed: null

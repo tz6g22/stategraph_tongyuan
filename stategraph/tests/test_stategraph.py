@@ -1418,6 +1418,29 @@ class RetrievalCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(retrieved.state_ids, ())
 
+    async def test_continuity_query_does_not_promote_unrelated_states_over_stale_match(self) -> None:
+        graph = StateGraph()
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        old = await graph.ingest(
+            Observation('The user is based in Paris.', now, 'unit-test'),
+            candidates=(StateCandidate('user', 'based_in', 'Paris'),),
+        )
+        distractors = await graph.ingest(
+            Observation('Unrelated user notes.', now + timedelta(minutes=1), 'unit-test'),
+            candidates=(
+                StateCandidate('user', 'favorite_color', 'green'),
+                StateCandidate('user', 'weekly_goal', 'read more'),
+            ),
+        )
+        await graph.repository.apply((old.states[0].with_status(StateStatus.STALE),))
+
+        retrieved = await graph.retrieve('Does the user still live in Paris?', limit=3)
+
+        self.assertEqual(retrieved.state_ids, ())
+        self.assertEqual(retrieved.premise_check.conflicting_state_ids, (old.states[0].state_id,))
+        self.assertNotIn(distractors.states[0].state_id, retrieved.all_state_ids)
+        self.assertNotIn(distractors.states[1].state_id, retrieved.all_state_ids)
+
 
 class InvalidationMetricTests(unittest.TestCase):
     def test_precision_and_recall(self) -> None:
@@ -1480,6 +1503,18 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(len(llm.state_inputs), 1)
         self.assertEqual(''.join(llm.state_inputs), content)
+
+    async def test_long_single_line_is_bounded_without_loss(self) -> None:
+        content = ' '.join(f'fact-{index}' for index in range(300))
+        llm = self._batching_llm()
+        extractor = GraphitiLLMStateExtractor(llm, max_llm_characters=220)
+
+        await extractor.extract(
+            Observation(content, datetime(2026, 1, 1, tzinfo=UTC), 'unit-test'), ()
+        )
+
+        self.assertEqual(''.join(llm.state_inputs), content)
+        self.assertTrue(all(len(item) <= 220 for item in llm.state_inputs))
 
     async def test_short_observation_keeps_single_extraction_path(self) -> None:
         content = 'State 0\nEVENT Entity-0 value-0\n'
@@ -1735,6 +1770,8 @@ class GraphitiAdapterFlowTests(unittest.IsolatedAsyncioTestCase):
                 if kwargs['prompt_name'] == 'stategraph.dependency_candidate_discovery.v1':
                     payload = json.loads(messages[-1].content)
                     states_by_entity = {item['entity']: item for item in payload['states']}
+                    if 'Alice' not in states_by_entity or 'Friday meeting' not in states_by_entity:
+                        return {'candidates': []}
                     return {
                         'candidates': [
                             {

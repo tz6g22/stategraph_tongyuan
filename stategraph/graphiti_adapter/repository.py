@@ -201,6 +201,19 @@ class GraphitiStateRepository:
         records = await _execute_read(driver, query, **kwargs)
         return [_relation_from_record(record) for record in records]
 
+    async def clear_group(self, group_id: str) -> None:
+        """Replace only StateGraph labels; Graphiti's native labels are untouched."""
+
+        driver = await self._driver_for_group(group_id)
+        await driver.execute_query(
+            'MATCH (s:StateGraphState {group_id: $group_id}) DETACH DELETE s',
+            group_id=group_id,
+        )
+        await driver.execute_query(
+            'MATCH (e:StateGraphEvidence {group_id: $group_id}) DELETE e',
+            group_id=group_id,
+        )
+
     async def _driver_for_group(self, group_id: str) -> Any:
         """Use the same physical graph partition for every state write and read."""
 

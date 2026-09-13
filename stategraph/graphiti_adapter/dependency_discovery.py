@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import dataclass, replace
@@ -16,11 +17,103 @@ from stategraph.state.schema import (
     StateNode,
     StateStatus,
 )
+from stategraph.evaluation.provider_resilience import (
+    SEMANTIC_CONTRACT_FAILURE,
+    ContractViolation,
+    ProviderRetryPolicy,
+    bounded_async_call,
+    classify_error,
+)
+from stategraph.evaluation.profiling import StageProfiler
 
 
 DEPENDENCY_RELATION_TYPES = frozenset(
     {RelationType.DEPENDS_ON, RelationType.DERIVED_FROM, RelationType.AFFECTS_ACTION}
 )
+_CANDIDATE_RELATION_VALUES = (
+    RelationType.DEPENDS_ON.value,
+    RelationType.DERIVED_FROM.value,
+    RelationType.AFFECTS_ACTION.value,
+)
+_CANDIDATE_SIGNAL_VALUES = (
+    'used_by_relation',
+    'derived_claim_relation',
+    'action_precondition',
+    'explicit_source_relation',
+    'existing_semantic_relation',
+)
+
+# Keep semantic candidate requests bounded.  Endpoint blocks are paired
+# Cartesianly, so each request can expose up to 64 source and 64 dependent
+# records while the serialized payload remains the hard safety bound.
+CANDIDATE_BATCH_MAX_STATES = 64  # maximum states in either endpoint block
+CANDIDATE_BATCH_MAX_ENDPOINT_RECORDS = CANDIDATE_BATCH_MAX_STATES * 2
+# This limit applies to the complete user payload (observation + states + schema),
+# not just the state array.  The previous state-only limit allowed 70k+ requests
+# on long observations and defeated the batching contract.
+CANDIDATE_BATCH_MAX_CHARS = 26000
+# Large observations can still make a model emit a dense candidate array even
+# when the input payload is bounded.  Keep the response contract deliberately
+# small, and give that bounded response enough room to close its JSON envelope.
+# This is an output-density guard, not a retry or fuzzy-repair mechanism.
+CANDIDATE_BATCH_MAX_OUTPUT_TOKENS = 2048
+CANDIDATE_BATCH_MAX_ITEMS = 16
+CANDIDATE_FULL_OBSERVATION_MAX_CHARS = 8000
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateEndpointBatch:
+    """One deterministic source-endpoint x dependent-endpoint request."""
+
+    source_states: tuple[StateNode, ...]
+    dependent_states: tuple[StateNode, ...]
+
+    @property
+    def states(self) -> tuple[StateNode, ...]:
+        by_id: dict[str, StateNode] = {}
+        for state in (*self.source_states, *self.dependent_states):
+            by_id.setdefault(state.state_id, state)
+        return tuple(by_id.values())
+
+    @property
+    def source_ids(self) -> set[str]:
+        return {state.state_id for state in self.source_states}
+
+    @property
+    def dependent_ids(self) -> set[str]:
+        return {state.state_id for state in self.dependent_states}
+
+CANDIDATE_DISCOVERY_OUTPUT_SCHEMA = {
+    'type': 'object',
+    'additionalProperties': False,
+    'required': ['candidates'],
+    'properties': {
+        'candidates': {
+            'type': 'array',
+            'maxItems': CANDIDATE_BATCH_MAX_ITEMS,
+            'items': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': [
+                    'prerequisite_state_id', 'dependent_state_id',
+                    'proposed_relation', 'signal', 'candidate_reason',
+                    'evidence_span',
+                ],
+                'properties': {
+                    'prerequisite_state_id': {'type': 'string'},
+                    'dependent_state_id': {'type': 'string'},
+                    'proposed_relation': {
+                        'type': 'string',
+                        'enum': list(_CANDIDATE_RELATION_VALUES),
+                    },
+                    'signal': {'type': 'string', 'enum': list(_CANDIDATE_SIGNAL_VALUES)},
+                    'candidate_reason': {'type': 'string'},
+                    'evidence_span': {'type': 'string'},
+                },
+            },
+        },
+    },
+}
 
 # Shared with the OpenAI Responses adapter.  Keeping this contract next to the
 # verifier prevents the transport wrapper from silently accepting a looser shape.
@@ -264,11 +357,18 @@ def generate_dependency_candidates(
 class CounterfactualDependencyVerifier:
     """Verify every candidate with the configured Graphiti LLM client."""
 
-    def __init__(self, llm_client: Any, *, trace_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        llm_client: Any,
+        *,
+        trace_path: str | Path | None = None,
+        profiler: StageProfiler | None = None,
+    ) -> None:
         if not hasattr(llm_client, 'generate_response'):
             raise TypeError('llm_client must provide generate_response()')
         self._llm_client = llm_client
         self._trace_path = Path(trace_path) if trace_path is not None else None
+        self._profiler = profiler
 
     async def verify(
         self,
@@ -376,11 +476,28 @@ class CounterfactualDependencyVerifier:
                 default=str,
             ),
         )
-        response = await self._llm_client.generate_response(
-            [system, user],
-            group_id=observation.group_id,
-            prompt_name='stategraph.dependency_verification.v1',
+        scope = (
+            self._profiler.stage(
+                'DEPENDENCY_VERIFICATION',
+                observation_id=observation.observation_id,
+                batch_id=f'{observation.observation_id}:verification',
+            )
+            if self._profiler is not None
+            else None
         )
+        if scope is None:
+            response = await self._llm_client.generate_response(
+                [system, user],
+                group_id=observation.group_id,
+                prompt_name='stategraph.dependency_verification.v1',
+            )
+        else:
+            with scope:
+                response = await self._llm_client.generate_response(
+                    [system, user],
+                    group_id=observation.group_id,
+                    prompt_name='stategraph.dependency_verification.v1',
+                )
         verified = _parse_assessments(
             response, verifiable, state_by_id, observation.content
         )
@@ -510,12 +627,20 @@ class CounterfactualDependencyVerifier:
 class AutomaticDependencyDiscovery:
     """Generate every candidate first, then verify every candidate once."""
 
-    def __init__(self, llm_client: Any, *, trace_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        llm_client: Any,
+        *,
+        trace_path: str | Path | None = None,
+        profiler: StageProfiler | None = None,
+    ) -> None:
         if not hasattr(llm_client, 'generate_response'):
             raise TypeError('llm_client must provide generate_response()')
         self._llm_client = llm_client
+        self._trace_path = Path(trace_path) if trace_path is not None else None
+        self._profiler = profiler
         self._verifier = CounterfactualDependencyVerifier(
-            llm_client, trace_path=trace_path
+            llm_client, trace_path=trace_path, profiler=profiler
         )
 
     async def discover_and_verify(
@@ -552,6 +677,32 @@ class AutomaticDependencyDiscovery:
         all_states: Sequence[StateNode],
         direct_invalidation_seed_ids: Sequence[str] = (),
     ) -> tuple[DependencyCandidate, ...]:
+        if self._profiler is None:
+            return await self._discover_candidates_unprofiled(
+                observation,
+                new_states=new_states,
+                all_states=all_states,
+                direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            )
+        with self._profiler.stage(
+            'DEPENDENCY_CANDIDATE_DISCOVERY',
+            observation_id=observation.observation_id,
+        ):
+            return await self._discover_candidates_unprofiled(
+                observation,
+                new_states=new_states,
+                all_states=all_states,
+                direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            )
+
+    async def _discover_candidates_unprofiled(
+        self,
+        observation: Observation,
+        *,
+        new_states: Sequence[StateNode],
+        all_states: Sequence[StateNode],
+        direct_invalidation_seed_ids: Sequence[str] = (),
+    ) -> tuple[DependencyCandidate, ...]:
         """Production candidate stage; no verifier is called here."""
         candidates = generate_dependency_candidates(
             observation,
@@ -568,6 +719,24 @@ class AutomaticDependencyDiscovery:
         return _merge_candidates((*candidates, *semantic_candidates))
 
     async def verify_typed_candidates(
+        self,
+        observation: Observation,
+        *,
+        candidates: Sequence[DependencyCandidate],
+        states: Sequence[StateNode],
+    ) -> tuple[DependencyAssessment, ...]:
+        if self._profiler is None:
+            return await self._verify_typed_candidates_unprofiled(
+                observation, candidates=candidates, states=states
+            )
+        with self._profiler.stage(
+            'DEPENDENCY_VERIFICATION', observation_id=observation.observation_id
+        ):
+            return await self._verify_typed_candidates_unprofiled(
+                observation, candidates=candidates, states=states
+            )
+
+    async def _verify_typed_candidates_unprofiled(
         self,
         observation: Observation,
         *,
@@ -610,53 +779,400 @@ class AutomaticDependencyDiscovery:
                 'state records, and provenance. Direction is always prerequisite/source -> '
                 'downstream/dependent. Do NOT reverse the dependency direction. The prerequisite '
                 'is the state whose invalidation may affect another state; the dependent is the '
-                'state whose validity may then fail and must be one of new_state_ids. '
+                'state whose validity may then fail and must be one of dependent_endpoint_ids. '
                 'Propose DEPENDS_ON for an explicit validity prerequisite, DERIVED_FROM for an '
                 'explicitly derived claim, and AFFECTS_ACTION for an action or plan precondition. '
                 'This stage proposes candidates only; it does not decide whether a dependency is '
                 'strict. Same entity, temporal overlap, semantic similarity, ordinary knowledge '
                 'relations, and value-to-entity matches are not semantic dependency evidence. '
                 'Each candidate must cite an exact verbatim evidence_span from the observation. '
-                'Do not add quotation marks around the copied span. Choose one proposed relation '
+                'Use only an evidence_span present in allowed_evidence_spans for this request; '
+                'copy it character-for-character, preserving spaces, punctuation, and case; '
+                'never replace spaces with underscores or normalized field names. Do not invent '
+                'a span or copy unrelated observation text. Do not add quotation '
+                'marks around the copied span. Choose one proposed relation '
                 'type per candidate; do not collapse different relation types for the same state '
-                'pair. '
+                'pair. The signal must be exactly one of: used_by_relation, '
+                'derived_claim_relation, action_precondition, explicit_source_relation, or '
+                'existing_semantic_relation. Never use the same state ID as both prerequisite '
+                'and dependent. Every prerequisite_state_id must be copied from '
+                'source_endpoint_ids, and every dependent_state_id must be copied from '
+                'dependent_endpoint_ids in the current batch. If no valid candidate exists, '
+                'return an empty array. '
                 'Return JSON only as {"candidates": [...]}. '
             ),
         )
-        user = Message(
-            role='user',
-            content=json.dumps(
-                {
-                    'observation': observation.content,
-                    'new_state_ids': sorted(new_ids),
-                    'states': [_state_payload(state) for state in relevant],
-                    'candidate_schema': {
-                        'prerequisite_state_id': 'string',
-                        'dependent_state_id': 'string from new_state_ids',
-                        'proposed_relation': 'DEPENDS_ON|DERIVED_FROM|AFFECTS_ACTION',
-                        'signal': (
-                            'used_by_relation|derived_claim_relation|action_precondition|'
-                            'explicit_source_relation|existing_semantic_relation'
-                        ),
-                        'candidate_reason': 'short grounded reason',
-                        'evidence_span': 'exact observation span',
+        batches = _candidate_state_batches(
+            relevant,
+            new_ids,
+            observation_content=observation.content,
+        )
+        discovered: list[DependencyCandidate] = []
+        for batch_index, batch in enumerate(batches):
+            batch_states = batch.states
+            batch_new_ids = batch.dependent_ids
+            candidate_observation = _candidate_observation_context(
+                observation.content, batch_states
+            )
+            payload = _candidate_batch_payload(
+                candidate_observation,
+                batch_states,
+                batch_new_ids,
+                source_state_ids=batch.source_ids,
+                dependent_state_ids=batch.dependent_ids,
+                evidence_spans=_candidate_evidence_spans(
+                    observation.content, batch_states
+                ),
+            )
+            batch_schema = _candidate_discovery_schema(
+                batch.source_ids,
+                batch.dependent_ids,
+                evidence_spans=_candidate_evidence_spans(
+                    observation.content, batch_states
+                ),
+            )
+            user = Message(
+                role='user',
+                content=json.dumps(payload, ensure_ascii=False, default=str),
+            )
+            started = __import__('time').perf_counter()
+            response = None
+            contract_retries = 0
+
+            async def request_and_parse() -> tuple[Mapping[str, Any], tuple[DependencyCandidate, ...]]:
+                nonlocal response, contract_retries
+                attempt_messages = [
+                    item.model_copy(deep=True) if hasattr(item, 'model_copy') else copy.deepcopy(item)
+                    for item in (system, user)
+                ]
+                response = await self._llm_client.generate_response(
+                    attempt_messages,
+                    group_id=observation.group_id,
+                    prompt_name='stategraph.dependency_candidate_discovery.v1',
+                    max_tokens=CANDIDATE_BATCH_MAX_OUTPUT_TOKENS,
+                    candidate_schema=batch_schema,
+                )
+                _assert_complete_structured_response(self._llm_client, response)
+                try:
+                    parsed = _parse_discovered_candidates(
+                        response,
+                        states={state.state_id: state for state in batch_states},
+                        new_state_ids=batch_new_ids,
+                        source_state_ids=batch.source_ids,
+                        observation=observation,
+                        # Validate against the full raw observation.  The request
+                        # uses bounded evidence projection for scale, but a model
+                        # may cite an exact span outside that projection; raw
+                        # grounding remains fail-closed.
+                        evidence_context=observation.content,
+                    )
+                except ValueError as exc:
+                    if classify_error(exc) != SEMANTIC_CONTRACT_FAILURE:
+                        raise
+                    contract_retries += 1
+                    raise ContractViolation(str(exc)) from exc
+                return response, parsed
+            try:
+                scope = (
+                    self._profiler.stage(
+                        'DEPENDENCY_CANDIDATE_DISCOVERY',
+                        observation_id=observation.observation_id,
+                        batch_id=f'{observation.observation_id}:candidate-{batch_index}',
+                        batch_index=batch_index,
+                    )
+                    if self._profiler is not None
+                    else None
+                )
+                kwargs = {
+                    'request_snapshot': {
+                        'system': system.content,
+                        'user': user.content,
+                        'schema': batch_schema,
                     },
-                },
-                ensure_ascii=False,
-                default=str,
+                    'provider': getattr(self._llm_client, 'provider', 'openai'),
+                    'model': getattr(self._llm_client, 'model', 'unknown'),
+                    'policy': getattr(
+                        self._llm_client, 'retry_policy', ProviderRetryPolicy.from_env()
+                    ),
+                    'record': getattr(self._llm_client, '_record_attempt', None),
+                    'allowed_taxonomies': {SEMANTIC_CONTRACT_FAILURE},
+                }
+                if scope is None:
+                    response, parsed = await bounded_async_call(request_and_parse, **kwargs)
+                else:
+                    with scope:
+                        response, parsed = await bounded_async_call(request_and_parse, **kwargs)
+            except Exception as exc:
+                self._write_candidate_trace(
+                    observation=observation,
+                    batch_index=batch_index,
+                    batch_count=len(batches),
+                    states=batch_states,
+                    new_state_ids=batch_new_ids,
+                    payload=payload,
+                    response=response,
+                    parsed=(),
+                    contract_retries=contract_retries,
+                    elapsed_seconds=__import__('time').perf_counter() - started,
+                    error=f'{type(exc).__name__}: {exc}',
+                )
+                raise
+            discovered.extend(parsed)
+            self._write_candidate_trace(
+                observation=observation,
+                batch_index=batch_index,
+                batch_count=len(batches),
+                states=batch_states,
+                new_state_ids=batch_new_ids,
+                payload=payload,
+                response=response,
+                parsed=parsed,
+                contract_retries=contract_retries,
+                elapsed_seconds=__import__('time').perf_counter() - started,
+            )
+        return _merge_candidates(discovered)
+
+    def _write_candidate_trace(
+        self, *, observation, batch_index, batch_count, states, new_state_ids,
+        payload, response, parsed, elapsed_seconds, error=None,
+        contract_retries=0,
+    ) -> None:
+        if self._trace_path is None:
+            return
+        record = {
+            'stage': 'candidate_discovery',
+            'observation_id': observation.observation_id,
+            'batch_index': batch_index,
+            'batch_count': batch_count,
+            'state_count': len(states),
+            'new_state_count': len(new_state_ids),
+            'source_endpoint_ids': list(payload.get('source_endpoint_ids', ())),
+            'dependent_endpoint_ids': list(payload.get('dependent_endpoint_ids', ())),
+            'source_endpoint_count': len(payload.get('source_endpoint_ids', ())),
+            'dependent_endpoint_count': len(payload.get('dependent_endpoint_ids', ())),
+            'input_chars': len(json.dumps(payload, ensure_ascii=False, default=str)),
+            'estimated_input_tokens': len(json.dumps(payload, ensure_ascii=False, default=str)) // 4,
+            'output_item_count': len(response.get('candidates', ())) if isinstance(response, Mapping) else None,
+            'raw_model_response': response,
+            'raw_model_response_text': getattr(self._llm_client, 'last_raw_response_text', None),
+            'response_metadata': getattr(self._llm_client, 'last_response_metadata', None),
+            'provider_attempts': getattr(self._llm_client, 'last_attempt_trace', None),
+            'provider_errors': getattr(self._llm_client, 'last_error_trace', None),
+            'parsed_candidates': [_candidate_payload(item) for item in parsed],
+            'contract_retry_count': min(1, contract_retries),
+            'error': error,
+            'elapsed_seconds': elapsed_seconds,
+        }
+        self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._trace_path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+
+
+def _candidate_state_batches(
+    states: Sequence[StateNode],
+    new_state_ids: set[str],
+    *,
+    observation_content: str = '',
+) -> tuple[_CandidateEndpointBatch, ...]:
+    """Partition the complete directed endpoint universe deterministically.
+
+    A state-list window cannot expose a prerequisite in one window to a
+    dependent in another.  Source and dependent blocks therefore form a
+    Cartesian product.  Every admissible ``source -> dependent`` pair appears
+    in exactly one request (apart from an intentional source/target overlap,
+    where the parser still rejects self-loops).
+    """
+    sources = tuple(states)
+    dependents = tuple(state for state in states if state.state_id in new_state_ids)
+    if not sources or not dependents:
+        return ()
+
+    block_size = CANDIDATE_BATCH_MAX_STATES
+
+    def blocks(items: Sequence[StateNode]) -> tuple[tuple[StateNode, ...], ...]:
+        return tuple(
+            tuple(items[index:index + block_size])
+            for index in range(0, len(items), block_size)
+        )
+
+    result: list[_CandidateEndpointBatch] = []
+
+    def add_pair(
+        source_block: Sequence[StateNode],
+        dependent_block: Sequence[StateNode],
+    ) -> None:
+        batch = _CandidateEndpointBatch(tuple(source_block), tuple(dependent_block))
+        payload = _candidate_batch_payload(
+            _candidate_observation_context(observation_content, batch.states),
+            batch.states,
+            batch.dependent_ids,
+            source_state_ids=batch.source_ids,
+            dependent_state_ids=batch.dependent_ids,
+            evidence_spans=_candidate_evidence_spans(
+                observation_content, batch.states
             ),
         )
-        response = await self._llm_client.generate_response(
-            [system, user],
-            group_id=observation.group_id,
-            prompt_name='stategraph.dependency_candidate_discovery.v1',
+        fits = (
+            len(batch.states) <= CANDIDATE_BATCH_MAX_ENDPOINT_RECORDS
+            and len(json.dumps(payload, ensure_ascii=False, default=str))
+            <= CANDIDATE_BATCH_MAX_CHARS
         )
-        return _parse_discovered_candidates(
-            response,
-            states={state.state_id: state for state in relevant},
-            new_state_ids=new_ids,
-            observation=observation,
+        if fits:
+            result.append(batch)
+            return
+        if len(source_block) > 1 and len(source_block) >= len(dependent_block):
+            midpoint = len(source_block) // 2
+            add_pair(source_block[:midpoint], dependent_block)
+            add_pair(source_block[midpoint:], dependent_block)
+            return
+        if len(dependent_block) > 1:
+            midpoint = len(dependent_block) // 2
+            add_pair(source_block, dependent_block[:midpoint])
+            add_pair(source_block, dependent_block[midpoint:])
+            return
+        raise ValueError(
+            'dependency candidate request cannot fit bounded endpoint batch: '
+            f'source={source_block[0].state_id} dependent={dependent_block[0].state_id}'
         )
+
+    for source_block in blocks(sources):
+        for dependent_block in blocks(dependents):
+            add_pair(source_block, dependent_block)
+    return tuple(result)
+
+
+def _candidate_batch_payload(
+    observation_content: str,
+    states: Sequence[StateNode],
+    new_state_ids: set[str],
+    *,
+    source_state_ids: set[str] | None = None,
+    dependent_state_ids: set[str] | None = None,
+    evidence_spans: Sequence[str] = (),
+) -> dict[str, Any]:
+    dependent_ids = dependent_state_ids or set(new_state_ids)
+    source_ids = source_state_ids or {state.state_id for state in states}
+    return {
+        'observation': observation_content,
+        'source_endpoint_ids': sorted(source_ids),
+        'dependent_endpoint_ids': sorted(dependent_ids),
+        # Kept as a compatibility alias for existing runners and traces.
+        'new_state_ids': sorted(dependent_ids),
+        'allowed_evidence_spans': list(dict.fromkeys(evidence_spans)),
+        'states': [_candidate_state_payload(state) for state in states],
+        'candidate_schema': CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
+    }
+
+
+def _candidate_discovery_schema(
+    source_state_ids: set[str],
+    dependent_state_ids: set[str],
+    *,
+    evidence_spans: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build a per-request enum contract for endpoint IDs."""
+    schema = copy.deepcopy(CANDIDATE_DISCOVERY_OUTPUT_SCHEMA)
+    item_properties = schema['properties']['candidates']['items']['properties']
+    item_properties['prerequisite_state_id']['enum'] = sorted(source_state_ids)
+    item_properties['dependent_state_id']['enum'] = sorted(dependent_state_ids)
+    # Evidence spans containing quote/newline characters are not accepted by
+    # some provider strict-schema implementations.  Constrain the safe subset
+    # in-schema; the full allow-list remains in the payload and raw-literal
+    # validation remains fail-closed for providers without this constraint.
+    safe_spans = tuple(dict.fromkeys(evidence_spans))
+    safe_enum = tuple(
+        span for span in safe_spans
+        if not any(char in span for char in '\"\n\r\\')
+    )
+    if safe_enum:
+        item_properties['evidence_span']['enum'] = list(safe_enum)
+    else:
+        item_properties['evidence_span']['minLength'] = 1
+    return schema
+
+
+def _candidate_evidence_spans(
+    observation_content: str,
+    states: Sequence[StateNode],
+) -> tuple[str, ...]:
+    folded = observation_content.casefold()
+    return tuple(
+        dict.fromkeys(
+            span
+            for span in (
+                str(state.metadata.get('evidence_span') or '').strip()
+                for state in states
+            )
+            if span and span.casefold() in folded
+        )
+    )
+
+
+def _candidate_state_payload(state: StateNode) -> dict[str, Any]:
+    """Compact endpoint record; full provenance remains in the parsed node."""
+    return {
+        'state_id': state.state_id,
+        'entity': state.entity,
+        'attribute': state.attribute,
+        'value': state.value,
+    }
+
+
+def _candidate_batch_pair_coverage(
+    batches: Sequence[_CandidateEndpointBatch],
+) -> set[tuple[str, str]]:
+    """Return directed endpoint pairs exposed by a batch plan."""
+    return {
+        (source.state_id, dependent.state_id)
+        for batch in batches
+        for source in batch.source_states
+        for dependent in batch.dependent_states
+        if source.state_id != dependent.state_id
+    }
+
+
+def _candidate_observation_context(
+    observation_content: str,
+    states: Sequence[StateNode],
+) -> str:
+    """Return bounded, deterministic evidence context for candidate discovery.
+
+    For ordinary observations the complete text is retained.  For very large
+    observations, every state in the current batch contributes its grounded
+    evidence span in source order.  This avoids query/gold filtering while
+    preventing the same 48k observation from being serialized into every batch.
+    """
+    if len(observation_content) <= CANDIDATE_FULL_OBSERVATION_MAX_CHARS:
+        return observation_content
+    spans: list[tuple[int, str]] = []
+    for state in states:
+        span = str(state.metadata.get('evidence_span') or '').strip()
+        if not span or span.casefold() not in observation_content.casefold():
+            continue
+        start = observation_content.casefold().find(span.casefold())
+        spans.append((start, span))
+    unique: dict[tuple[int, str], None] = {}
+    for item in spans:
+        unique.setdefault(item, None)
+    return '\n'.join(
+        f'[source_offset={start}] {span}' for start, span in sorted(unique)
+    )
+
+
+def _assert_complete_structured_response(
+    llm_client: Any,
+    response: Mapping[str, Any],
+) -> None:
+    metadata = getattr(llm_client, 'last_response_metadata', None)
+    finish_reason = metadata.get('finish_reason') if isinstance(metadata, Mapping) else None
+    if finish_reason in {'length', 'content_filter', 'incomplete'}:
+        raw = getattr(llm_client, 'last_raw_response_text', '') or ''
+        raise ValueError(
+            'dependency candidate structured response incomplete: '
+            f'finish_reason={finish_reason} raw_chars={len(raw)}'
+        )
+    if not isinstance(response, Mapping):
+        raise ValueError('dependency candidate response must be a JSON object')
 
 
 def _relevant_states(
@@ -689,30 +1205,38 @@ def _parse_discovered_candidates(
     *,
     states: Mapping[str, StateNode],
     new_state_ids: set[str],
+    source_state_ids: set[str] | None = None,
     observation: Observation,
+    evidence_context: str | None = None,
 ) -> tuple[DependencyCandidate, ...]:
+    observation_text = evidence_context or observation.content
+    if not isinstance(response, Mapping) or set(response) != {'candidates'}:
+        raise ValueError('candidate discovery response must be exactly {"candidates": [...]}')
     raw = response.get('candidates', ())
     if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
-        return ()
+        raise ValueError('candidate discovery response candidates must be an array')
+    if len(raw) > CANDIDATE_BATCH_MAX_ITEMS:
+        raise ValueError('candidate discovery response exceeded maxItems')
     output: list[DependencyCandidate] = []
-    allowed_signals = {
-        'used_by_relation',
-        'derived_claim_relation',
-        'action_precondition',
-        'explicit_source_relation',
-        'existing_semantic_relation',
-    }
+    allowed_signals = set(_CANDIDATE_SIGNAL_VALUES)
+    allowed_source_ids = source_state_ids if source_state_ids is not None else set(states)
     for item in raw:
         if not isinstance(item, Mapping):
-            continue
+            raise ValueError('candidate discovery item must be an object')
+        if set(item) != {
+            'prerequisite_state_id', 'dependent_state_id', 'proposed_relation',
+            'signal', 'candidate_reason', 'evidence_span',
+        }:
+            raise ValueError('candidate discovery item has invalid fields')
         prerequisite_id = str(item.get('prerequisite_state_id') or '').strip()
         dependent_id = str(item.get('dependent_state_id') or '').strip()
         relation_type = _relation_type(item.get('proposed_relation'))
         signal = str(item.get('signal') or '').strip()
         reason = str(item.get('candidate_reason') or '').strip()
-        evidence_span = _literal_span(item.get('evidence_span'), observation.content)
+        evidence_span = _literal_span(item.get('evidence_span'), observation_text)
         if (
-            prerequisite_id not in states
+            prerequisite_id not in allowed_source_ids
+            or prerequisite_id not in states
             or dependent_id not in new_state_ids
             or dependent_id not in states
             or prerequisite_id == dependent_id
@@ -721,7 +1245,7 @@ def _parse_discovered_candidates(
             or not reason
             or not evidence_span
         ):
-            continue
+            raise ValueError('candidate discovery item failed endpoint/schema validation')
         prerequisite = states[prerequisite_id]
         dependent = states[dependent_id]
         output.append(
@@ -1062,6 +1586,7 @@ def _relation_type(value: Any) -> RelationType | None:
 
 __all__ = [
     'AutomaticDependencyDiscovery',
+    'CANDIDATE_DISCOVERY_OUTPUT_SCHEMA',
     'CounterfactualDependencyVerifier',
     'DependencyAssessment',
     'DependencyCandidate',

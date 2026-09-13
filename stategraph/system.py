@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ from stategraph.state import (
     StateRelation,
     StateStatus,
 )
+from stategraph.evaluation.profiling import StageProfiler
 from stategraph.storage import InMemoryStateRepository, StateRepository
 
 
@@ -82,6 +84,7 @@ class StateGraph:
         conflict_detector: ConflictDetector | None = None,
         revision_trace_path: str | Path | None = None,
         stop_after: str | None = None,
+        profiler: StageProfiler | None = None,
     ) -> None:
         if stop_after not in {None, 'relation_typing', 'dependency_verification'}:
             raise ValueError(
@@ -102,6 +105,7 @@ class StateGraph:
         self._next_observation_index: dict[str, int] = {}
         self._revision_trace_path = revision_trace_path
         self._stop_after = stop_after
+        self._profiler = profiler
 
     @classmethod
     def from_graphiti(
@@ -113,11 +117,15 @@ class StateGraph:
         linker: StateLinker | None = None,
         conflict_detector: ConflictDetector | None = None,
         revision_trace_path: str | Path | None = None,
+        profiler: StageProfiler | None = None,
     ) -> StateGraph:
-        adapter = GraphitiAdapter(graphiti)
+        adapter = GraphitiAdapter(
+            graphiti, trace_path=extraction_trace_path, profiler=profiler
+        )
         effective_extractor = extractor or GraphitiLLMStateExtractor(
             graphiti.llm_client,
             trace_path=extraction_trace_path,
+            profiler=profiler,
         )
         return cls(
             GraphitiStateRepository(graphiti),
@@ -126,6 +134,7 @@ class StateGraph:
             linker=linker,
             conflict_detector=conflict_detector,
             revision_trace_path=revision_trace_path,
+            profiler=profiler,
         )
 
     async def ingest(
@@ -135,6 +144,23 @@ class StateGraph:
         candidates: Sequence[StateCandidate] | None = None,
     ) -> IngestResult:
         """Ingest one observation sequentially and complete all lifecycle effects."""
+
+        if self._profiler is None:
+            return await self._ingest_unprofiled(observation, candidates=candidates)
+        if self._profiler.in_observation:
+            return await self._ingest_unprofiled(observation, candidates=candidates)
+        with self._profiler.observation(
+            observation.observation_id, observation.observation_index
+        ):
+            return await self._ingest_unprofiled(observation, candidates=candidates)
+
+    async def _ingest_unprofiled(
+        self,
+        observation: Observation,
+        *,
+        candidates: Sequence[StateCandidate] | None = None,
+    ) -> IngestResult:
+        """Implementation kept separate so profiling adds no semantic branch."""
 
         async with self._ingest_lock:
             if self.graphiti_adapter is not None:
@@ -188,6 +214,7 @@ class StateGraph:
             # This preserves the observation-level contract: no candidate can
             # become a competing CURRENT target merely because an earlier
             # candidate in the same observation was already revised.
+            linking_started = time.perf_counter()
             existing_before_observation = await self.repository.list_states(
                 observation.group_id, {StateStatus.CURRENT, StateStatus.UNCERTAIN}
             )
@@ -286,9 +313,17 @@ class StateGraph:
                     )
                 )
 
+            if self._profiler is not None:
+                self._profiler.add_stage_time(
+                    'LINKING',
+                    time.perf_counter() - linking_started,
+                    observation_id=observation.observation_id,
+                )
+
             # Classify and persist all direct revisions only after every state in
             # this observation has been linked.  Cascade remains below the
             # dependency-graph persistence boundary.
+            revision_started = time.perf_counter()
             for state, existing, candidate_pool, chosen_target, links in linked_candidates:
                 revision = await self.revision.revise(state, links)
                 self._write_revision_trace(
@@ -302,6 +337,12 @@ class StateGraph:
                 )
                 revisions.append(revision)
                 direct_invalidation_seeds.extend(revision.invalidated_state_ids)
+            if self._profiler is not None:
+                self._profiler.add_stage_time(
+                    'DIRECT_REVISION',
+                    time.perf_counter() - revision_started,
+                    observation_id=observation.observation_id,
+                )
 
             # Observation-level invariant: finish every direct revision, build and
             # persist the verified graph, then propagate all seeds exactly once.
@@ -437,6 +478,7 @@ class StateGraph:
                         )
                         continue
                     typing_inputs.append(replace(candidate, proposed_relation=None))
+                typing_started = time.perf_counter()
                 typing_results = type_relation_candidates(
                     tuple(typing_inputs),
                     all_by_id,
@@ -459,6 +501,12 @@ class StateGraph:
                         )
                 typed_dependency_candidates = _dedupe_typed_candidates(accepted)
                 rejected_dependency_candidates = tuple(rejected)
+                if self._profiler is not None:
+                    self._profiler.add_stage_time(
+                        'RELATION_TYPING',
+                        time.perf_counter() - typing_started,
+                        observation_id=observation.observation_id,
+                    )
                 if self._stop_after == 'relation_typing':
                     return IngestResult(
                         observation_id=observation.observation_id,
@@ -536,10 +584,17 @@ class StateGraph:
             await self.dependencies.persist_verified(
                 dependency_relations, group_id=observation.group_id
             )
+            propagation_started = time.perf_counter()
             propagation = await self.invalidation.propagate(
                 tuple(dict.fromkeys(direct_invalidation_seeds)),
                 group_id=observation.group_id,
             )
+            if self._profiler is not None:
+                self._profiler.add_stage_time(
+                    'PROPAGATION',
+                    time.perf_counter() - propagation_started,
+                    observation_id=observation.observation_id,
+                )
 
             return IngestResult(
                 observation_id=observation.observation_id,

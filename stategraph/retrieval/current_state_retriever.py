@@ -46,6 +46,31 @@ _GENERIC_QUERY_WORDS = frozenset(
     {'can', 'current', 'do', 'does', 'is', 'live', 'lives', 'located', 'status', 'what',
      'where', 'which', 'who', 'should', 'still'}
 )
+_QUERY_SYNTAX_STOPWORDS = _FIELD_STOPWORDS | _GENERIC_QUERY_WORDS | frozenset(
+    {
+        'based', 'conversation', 'history', 'still', 'remain', 'remains',
+        'continue', 'continues', 'yet', 'anymore', 'on', 'as', 'about',
+        'after', 'before', 'during', 'into', 'over', 'than', 'through',
+        'under', 'while', 'user', 'person', 'people', 'someone', 'somebody',
+        'they', 'them', 'their', 'since', 'has', 'have', 'had', 'been',
+        'being', 'last', 'few', 'years', 'can', 'could', 'would', 'should',
+        'recommend', 'sign', 'up', 'right', 'now', 'specific',
+    }
+)
+# Query words that describe the question syntax or its generic subject, rather
+# than the requested field.  Keep semantic field words such as ``status`` and
+# ``current`` available to the structural matcher.
+_FIELD_QUERY_STOPWORDS = _FIELD_STOPWORDS | frozenset(
+    {
+        'based', 'conversation', 'history', 'still', 'remain', 'remains',
+        'continue', 'continues', 'yet', 'anymore', 'user', 'person', 'people',
+        'someone', 'somebody', 'they', 'them', 'their', 'live', 'on', 'at',
+        'by', 'in', 'into', 'onto', 'upon', 'since', 'has', 'have', 'had',
+        'been', 'being', 'last', 'few', 'years', 'can', 'could', 'would',
+        'should', 'recommend', 'sign', 'up', 'right', 'now', 'specific',
+        'this', 'tasks', 'task', 'week', 'today',
+    }
+)
 _META_RELATION_MARKERS = frozenset({'independent', 'irrelevant', 'unrelated'})
 
 
@@ -360,7 +385,11 @@ class CurrentStateRetriever:
         graphiti_fact_ids: set[str],
     ) -> dict[str, float]:
         graph_score = 0.5 if graphiti_fact_ids.intersection(state.graphiti_fact_ids) else 0.0
-        query_tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
+        raw_query_tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
+        query_tokens = {
+            token for token in re.findall(r'\w+', query.casefold(), flags=re.UNICODE)
+            if token not in _QUERY_SYNTAX_STOPWORDS
+        }
         entity_tokens = set(re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE))
         query_text = ' '.join(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
         entity_text = ' '.join(re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE))
@@ -376,7 +405,10 @@ class CurrentStateRetriever:
                 *(f'{key} {value}' for key, value in state.condition_scope.conditions),
             )
         )
-        state_tokens = set(re.findall(r'\w+', state_text.casefold(), flags=re.UNICODE))
+        state_tokens = {
+            token for token in re.findall(r'\w+', state_text.casefold(), flags=re.UNICODE)
+            if token not in _QUERY_SYNTAX_STOPWORDS
+        }
         if direct_subject:
             state_tokens -= entity_tokens
         lexical = len(content_query_tokens & state_tokens) / max(
@@ -388,16 +420,26 @@ class CurrentStateRetriever:
         # normalized attribute does not.  This never creates a StateNode and
         # remains subject to the same status/premise/fixed-top-k selection.
         evidence_text = str(state.metadata.get('evidence_span', ''))
-        evidence_tokens = set(re.findall(r'\w+', evidence_text.casefold(), flags=re.UNICODE))
+        evidence_tokens = {
+            token for token in re.findall(r'\w+', evidence_text.casefold(), flags=re.UNICODE)
+            if token not in _QUERY_SYNTAX_STOPWORDS
+        }
         if direct_subject:
             evidence_tokens -= entity_tokens
         evidence_score = len(content_query_tokens & evidence_tokens) / max(
             1, len(content_query_tokens | evidence_tokens)
         )
         continuity_query = bool(
-            query_tokens
+            raw_query_tokens
             & {'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'}
         )
+        explicit_subject_query = bool(
+            raw_query_tokens & {'user', 'person', 'people', 'someone', 'somebody'}
+        )
+        if continuity_query and explicit_subject_query and not direct_subject:
+            # Do not turn a shared location word in an assistant/entity
+            # evidence span into a user-state match for continuity questions.
+            evidence_score = 0.0
         subject_tokens = tuple(
             token for token in re.findall(
                 r'\w+', (state.canonical_subject_id or state.entity).casefold()
@@ -409,6 +451,7 @@ class CurrentStateRetriever:
             continuity_query
             and subject_tokens
             and tuple(evidence_all_tokens[:len(subject_tokens)]) == subject_tokens
+            and bool(content_query_tokens & (state_tokens | evidence_tokens))
         ) else 0.0
         field_match = max(
             (
@@ -419,7 +462,7 @@ class CurrentStateRetriever:
         )
         query_has_specific_term = bool(content_query_tokens - _GENERIC_QUERY_WORDS)
         entity_anchor = 2.0 if direct_subject and (
-            lexical or evidence_score or field_match or not query_has_specific_term
+            lexical or field_match or not query_has_specific_term
         ) else 0.0
         return {
             'graph_score': graph_score,
@@ -520,6 +563,128 @@ class CurrentStateRetriever:
             for state in ranked
             if cls._score(query, state, graphiti_fact_ids) > 0 or not query.strip()
         ]
+        # A continuity query can match a meta-relation's wording (for example
+        # ``unrelated to the schedule``) while missing the co-occurring direct
+        # assertion.  Prefer that grounded assertion without making all
+        # same-subject states eligible: only the same-observation sibling is
+        # promoted, and only when the meta relation actually matched.
+        if set(cls._field_tokens(query)) & {
+            'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'
+        }:
+            direct_by_observation: dict[str, list[StateNode]] = {}
+            for state in states:
+                evidence = str(state.metadata.get('evidence_span', ''))
+                subject = tuple(
+                    token for token in re.findall(
+                        r'\w+', (state.canonical_subject_id or state.entity).casefold()
+                    )
+                    if token not in {'a', 'an', 'the'}
+                )
+                evidence_tokens = re.findall(r'\w+', evidence.casefold())
+                text = ' '.join((evidence, state.attribute, str(state.value))).casefold()
+                if (
+                    subject
+                    and tuple(evidence_tokens[:len(subject)]) == subject
+                    and not set(re.findall(r'\w+', text)) & _META_RELATION_MARKERS
+                ):
+                    direct_by_observation.setdefault(state.observation_id, []).append(state)
+            meta_ids: set[str] = set()
+            promoted: list[StateNode] = []
+            for state in relevant:
+                text = ' '.join(
+                    (str(state.metadata.get('evidence_span', '')), state.attribute, str(state.value))
+                ).casefold()
+                if set(re.findall(r'\w+', text)) & _META_RELATION_MARKERS:
+                    siblings = direct_by_observation.get(state.observation_id, [])
+                    if siblings:
+                        meta_ids.add(state.state_id)
+                        promoted.extend(siblings)
+            if not relevant:
+                for state in states:
+                    text = ' '.join(
+                        (str(state.metadata.get('evidence_span', '')), state.attribute, str(state.value))
+                    ).casefold()
+                    if not (
+                        set(re.findall(r'\w+', text)) & _META_RELATION_MARKERS
+                        and cls._score(query, state, graphiti_fact_ids) > 0
+                    ):
+                        continue
+                    siblings = direct_by_observation.get(state.observation_id, [])
+                    if siblings:
+                        meta_ids.add(state.state_id)
+                        promoted.extend(siblings)
+            if meta_ids:
+                relevant = [state for state in relevant if state.state_id not in meta_ids]
+                relevant.extend(
+                    state for state in promoted
+                    if state.state_id not in {item.state_id for item in relevant}
+                )
+
+        # A high-scoring state is a bounded provenance anchor.  Sibling facts
+        # from the same observation (or facts sharing at least two grounded
+        # evidence tokens) are useful context for write/list queries even when
+        # their field labels do not repeat the query wording.  This is not a
+        # graph dump: only the fixed top-k budget is reserved for these related
+        # current candidates.
+        def provenance_rank(state: StateNode) -> tuple[float, float, float, bool, str]:
+            return (
+                -max(
+                    (cls._field_overlap(intent, state) for intent in intents),
+                    default=0.0,
+                ),
+                -cls._score(query, state, graphiti_fact_ids),
+                -max(intent_scores(state), default=0.0),
+                state.status != StateStatus.CURRENT,
+                state.state_id,
+            )
+
+        max_field_overlap = max(
+            (
+                max((cls._field_overlap(intent, state) for intent in intents), default=0.0)
+                for state in relevant
+            ),
+            default=0.0,
+        )
+        # A strong structured-field match is a safer anchor than a high lexical
+        # score; weak field overlap is too common in long conversational logs.
+        provenance_anchor = (
+            min(relevant, key=provenance_rank)
+            if relevant and max_field_overlap >= 0.4
+            else min(relevant, key=lambda state: (-cls._score(query, state, graphiti_fact_ids), state.state_id))
+            if relevant
+            else None
+        )
+        query_provenance_tokens = set(cls._field_tokens(query))
+
+        def provenance_tokens(state: StateNode) -> set[str]:
+            text = ' '.join(
+                (
+                    str(state.metadata.get('evidence_span', '')),
+                    state.attribute,
+                    str(state.value),
+                )
+            )
+            return set(cls._field_tokens(text))
+
+        def provenance_related(state: StateNode) -> bool:
+            if provenance_anchor is None or state.state_id == provenance_anchor.state_id:
+                return False
+            tokens = provenance_tokens(state)
+            anchor_tokens = provenance_tokens(provenance_anchor)
+            if state.observation_id == provenance_anchor.observation_id:
+                # Same-session provenance is useful only when it shares a
+                # field/evidence token with the query or anchor.  This keeps
+                # unrelated chatter in a long observation out of context.
+                return bool(tokens & (query_provenance_tokens | anchor_tokens))
+            return len(tokens & anchor_tokens) >= 2
+
+        provenance_anchors = [
+            state
+            for state in (
+                [provenance_anchor] if provenance_anchor is not None else []
+            )
+            + [state for state in sorted(relevant, key=rank_key) if provenance_related(state)]
+        ]
         candidate_trace = []
         relevant_ids = {state.state_id for state in relevant}
         for state in ranked:
@@ -550,6 +715,7 @@ class CurrentStateRetriever:
                     'coverage_assignment': None,
                     'relation_expansion_source': None,
                     'relation_contribution': None,
+                    'provenance_contribution': None,
                     'final_rank': None,
                 }
             )
@@ -577,31 +743,38 @@ class CurrentStateRetriever:
 
         coverage_anchors: list[StateNode] = []
         for intent_index, intent in enumerate(intents):
-            match = next(
-                (
-                    state
-                    for state in sorted(relevant, key=rank_key)
-                    if state.state_id not in coverage_assignments
-                    and cls._field_overlap(intent, state) > 0
-                ),
-                None,
+            matches = [
+                state
+                for state in sorted(relevant, key=rank_key)
+                if state.state_id not in coverage_assignments
+                and cls._field_overlap(intent, state) > 0
+            ]
+            best_overlap = max(
+                (cls._field_overlap(intent, state) for state in matches), default=0.0
             )
-            if match is not None:
+            for match in (
+                state for state in matches
+                if cls._field_overlap(intent, state) >= best_overlap
+            ):
                 coverage_anchors.append(match)
                 coverage_assignments[match.state_id] = intent_index
 
+        priority_ids = {state.state_id for state in coverage_anchors}
+        priority_ids.update(state.state_id for state in provenance_anchors)
         ordered_anchors = [
             *coverage_anchors,
-            *(state for state in relevant if state.state_id not in coverage_assignments),
+            *provenance_anchors,
+            *(state for state in relevant if state.state_id not in priority_ids),
         ]
 
         # Reserve coverage slots before any one intent's relation expansion can
         # consume the fixed top-k budget.
-        for anchor in coverage_anchors:
+        for anchor in (*coverage_anchors, *provenance_anchors):
             if len(selected) == limit:
                 break
-            selected.append(anchor)
-            selected_ids.add(anchor.state_id)
+            if anchor.state_id not in selected_ids:
+                selected.append(anchor)
+                selected_ids.add(anchor.state_id)
 
         def expand(anchor: StateNode) -> None:
             queue = [anchor]
@@ -642,6 +815,9 @@ class CurrentStateRetriever:
         for state_id, source_id in expansion_sources.items():
             trace_by_id[state_id]['relation_expansion_source'] = source_id
             trace_by_id[state_id]['relation_contribution'] = 'explicit_edge_expansion'
+        for state in provenance_anchors:
+            if state.state_id in trace_by_id:
+                trace_by_id[state.state_id]['provenance_contribution'] = 'observation_or_evidence_sibling'
         for rank, state in enumerate(selected, 1):
             trace_by_id[state.state_id]['final_rank'] = rank
         for item in candidate_trace:
@@ -687,16 +863,28 @@ class CurrentStateRetriever:
 
     @staticmethod
     def _field_tokens(text: str) -> tuple[str, ...]:
-        normalized = re.sub(r'[_\-\s]+', ' ', text.casefold())
-        return tuple(
-            token
-            for token in re.findall(r'\w+', normalized, flags=re.UNICODE)
-            if token not in _FIELD_STOPWORDS
-        )
+        # Keep compact forms of compound field labels (``to_do`` -> ``todo``)
+        # while retaining ordinary word matching.  Splitting compounds into
+        # standalone function words used to erase useful fields entirely.
+        tokens: list[str] = []
+        for raw in re.findall(r'\w+(?:[_-]\w+)*', text.casefold(), flags=re.UNICODE):
+            parts = re.split(r'[_-]+', raw)
+            if len(parts) > 1:
+                compact = ''.join(parts)
+                if (
+                    compact
+                    and compact not in _FIELD_STOPWORDS
+                    and any(part in _FIELD_STOPWORDS for part in parts)
+                ):
+                    tokens.append(compact)
+                tokens.extend(part for part in parts if part not in _FIELD_STOPWORDS)
+            elif raw not in _FIELD_STOPWORDS:
+                tokens.append(raw)
+        return tuple(dict.fromkeys(tokens))
 
     @classmethod
     def _field_overlap(cls, intent: str, state: StateNode) -> float:
-        query_tokens = set(cls._field_tokens(intent))
+        query_tokens = set(cls._field_tokens(intent)) - _FIELD_QUERY_STOPWORDS
         field_tokens = set(
             cls._field_tokens(state.canonical_field_id or state.attribute)
         )
@@ -818,20 +1006,17 @@ class CurrentStateRetriever:
                 'is', 'it', 'no', 'of', 'on', 'or', 'that', 'the', 'this',
                 'to', 'was', 'were', 'with', 'longer',
             }
+            provenance_stopwords.update(_FIELD_STOPWORDS)
             left_tokens -= provenance_stopwords
             right_tokens -= provenance_stopwords
-            if left_tokens & right_tokens:
+            # One shared conversational word (for example ``plan`` or
+            # ``today``) is not enough to prove that a stale claim shadows a
+            # current slot.  Require a grounded multi-token overlap unless
+            # the structured field itself is compatible; morphology alone is
+            # deliberately not a slot identity signal.
+            if len(left_tokens & right_tokens) >= 2:
                 return True
-            # A bounded morphological fallback catches grounded variants such
-            # as ``available``/``availability`` without making field labels an
-            # identity rule.  It is only used to hide an older live claim when
-            # a newer stale claim is already present.
-            return any(
-                min(len(left_token), len(right_token)) >= 6
-                and left_token[:6] == right_token[:6]
-                for left_token in left_tokens
-                for right_token in right_tokens
-            )
+            return False
 
         def direct_assertion(state: StateNode) -> bool:
             evidence = str(state.metadata.get('evidence_span', ''))
@@ -886,8 +1071,10 @@ class CurrentStateRetriever:
                     and direct_assertion(newer)
                     and not meta_relation(newer)
                 ):
-                    shadowed.add(live.state_id)
-                    break
+                    # Keep the meta record visible to the bounded selector;
+                    # it can then promote the direct sibling only when the
+                    # meta wording was the actual query match.
+                    continue
                 if (
                     live.observation_id == newer.observation_id
                     and direct_assertion(live)
@@ -907,13 +1094,15 @@ class CurrentStateRetriever:
                     == newer.metadata.get('evidence_span')
                 )
                 if same_observation and same_evidence and live.sequence_index > newer.sequence_index:
-                    shadowed.add(live.state_id)
-                    break
+                    if live.normalised_value == newer.normalised_value:
+                        shadowed.add(live.state_id)
+                        break
                 if same_observation and same_evidence:
                     continue
                 if same_observation and live.sequence_index < newer.sequence_index:
-                    shadowed.add(live.state_id)
-                    break
+                    if live.normalised_value == newer.normalised_value:
+                        shadowed.add(live.state_id)
+                        break
                 if not same_observation and newer.observed_at > live.observed_at:
                     shadowed.add(live.state_id)
                     break

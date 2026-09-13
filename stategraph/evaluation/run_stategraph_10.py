@@ -8,12 +8,22 @@ import hashlib
 import json
 import os
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from stategraph import Observation, StateGraph
+from stategraph.evaluation.checkpoint import (
+    CheckpointManager,
+    canonical_hash,
+    file_hash,
+    restore_repository_snapshot,
+    snapshot_repository,
+    source_digest,
+)
 from stategraph.evaluation.graphiti_runtime import create_graphiti, initialize_graphiti
+from stategraph.evaluation.profiling import StageProfiler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +46,65 @@ def _atomic_json(path: Path, value: Any) -> None:
 def _group_id(dataset: str, memory_id: str) -> str:
     digest = hashlib.sha256(f'{dataset}\0{memory_id}'.encode()).hexdigest()[:20]
     return f'sg_{digest}'
+
+
+def _checkpoint_identity(
+    *, dataset_key: str, dataset_dir: Path, prepared_path: Path, memory: dict[str, Any]
+) -> dict[str, str]:
+    source_files = [
+        Path(__file__),
+        Path(__file__).with_name('checkpoint.py'),
+        ROOT / 'stategraph' / 'system.py',
+        ROOT / 'stategraph' / 'graphiti_adapter' / 'adapter.py',
+        ROOT / 'stategraph' / 'graphiti_adapter' / 'repository.py',
+        ROOT / 'stategraph' / 'graphiti_adapter' / 'state_extraction.py',
+        ROOT / 'stategraph' / 'graphiti_adapter' / 'dependency_discovery.py',
+        ROOT / 'stategraph' / 'storage' / 'base.py',
+        ROOT / 'stategraph' / 'storage' / 'memory.py',
+    ]
+    module1 = ROOT / 'outputs/stategraph_provider_execution_resilience_gpt5nano_v1/FREEZE.json'
+    module4 = ROOT / 'outputs/stategraph_cross_dataset_structured_output_frozen_gpt5nano_v1/FREEZE.json'
+    config = {
+        key: os.environ.get(key)
+        for key in (
+            'STATEGRAPH_LLM_PROVIDER',
+            'STATEGRAPH_LLM_MODEL',
+            'STATEGRAPH_LLM_REASONING_EFFORT',
+            'STATEGRAPH_LLM_TIMEOUT',
+            'STATEGRAPH_LLM_MAX_RETRIES',
+            'STATEGRAPH_LLM_RETRY_BACKOFF_SECONDS',
+            'STATEGRAPH_LLM_TPM_LIMIT',
+            'STATEGRAPH_LLM_TPM_WINDOW_SECONDS',
+        )
+    }
+    return {
+        'run_id': f'{dataset_key}:{dataset_dir.name}',
+        'case_id': str(memory['memory_id']),
+        'model_provider': os.environ.get('STATEGRAPH_LLM_PROVIDER', 'openai'),
+        'model_name': os.environ.get('STATEGRAPH_LLM_MODEL', 'gpt-5-nano'),
+        'reasoning_effort': os.environ.get('STATEGRAPH_LLM_REASONING_EFFORT', 'minimal'),
+        'input_hash': str(memory['content_sha256']),
+        'case_manifest_hash': file_hash(prepared_path),
+        'config_hash': canonical_hash(config),
+        'code_version': source_digest(source_files),
+        'module1_freeze_digest': file_hash(module1),
+        'module4_freeze_digest': file_hash(module4),
+    }
+
+
+def _safe_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _provider_manifest(graphiti: Any) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    calls = [_safe_json(item) for item in getattr(graphiti.llm_client, 'calls', ())]
+    request_hashes = [str(item['request_hash']) for item in calls if item.get('request_hash')]
+    response_hashes = [
+        hashlib.sha256(str(item['raw_response']).encode('utf-8')).hexdigest()
+        for item in calls
+        if item.get('raw_response') is not None
+    ]
+    return calls, request_hashes, response_hashes
 
 
 async def _persist_graph_store(graphiti: Any) -> None:
@@ -68,33 +137,133 @@ async def _run(dataset_key: str) -> None:
         else []
     )
     new_store = not (store_dir / 'falkordb.db').exists()
-    graphiti = create_graphiti(store_dir)
+    profile_path = os.environ.get('STATEGRAPH_PROFILE_PATH')
+    profiler = (
+        StageProfiler(
+            profile_path,
+            metadata={
+                'dataset': dataset_key,
+                'provider': os.environ.get('STATEGRAPH_LLM_PROVIDER', 'openai'),
+                'model': os.environ.get('STATEGRAPH_LLM_MODEL', 'gpt-5-nano'),
+                'reasoning_effort': os.environ.get(
+                    'STATEGRAPH_LLM_REASONING_EFFORT', 'minimal'
+                ),
+                'profile_scope': 'ingestion',
+            },
+        )
+        if profile_path
+        else None
+    )
+    graphiti = create_graphiti(store_dir, profiler=profiler)
     await initialize_graphiti(graphiti, new_store=new_store)
     graph = StateGraph.from_graphiti(
         graphiti,
         extraction_trace_path=str(dataset_dir / 'extraction_trace.jsonl'),
+        profiler=profiler,
     )
     started = time.monotonic()
     try:
         for memory in payload['memory_groups']:
             memory_id = memory['memory_id']
             group_id = _group_id(dataset_key, memory_id)
-            completed = int(progress['completed_observations'].get(memory_id, 0))
+            checkpoint = CheckpointManager(
+                dataset_dir / 'checkpoints' / f'{memory_id}.json',
+                identity=_checkpoint_identity(
+                    dataset_key=dataset_key,
+                    dataset_dir=dataset_dir,
+                    prepared_path=prepared_path,
+                    memory=memory,
+                ),
+            )
+            if checkpoint.exists() and new_store:
+                raise RuntimeError(
+                    f'checkpoint exists but Graphiti store is missing for {memory_id}'
+                )
+            position = checkpoint.resume_position()
+            if position['status'] == 'IN_PROGRESS':
+                current_checkpoint = checkpoint.validate_resume()
+                await restore_repository_snapshot(
+                    graph.repository,
+                    current_checkpoint['state_snapshot'],
+                    replace=True,
+                    group_id=group_id,
+                )
+            completed = int(position['observation_index'])
             observations = memory['observations']
+            if completed > len(observations):
+                raise RuntimeError(
+                    f'checkpoint observation index {completed} exceeds input length '
+                    f'{len(observations)} for {memory_id}'
+                )
             for index, item in enumerate(observations[completed:], start=completed):
                 item_started = time.monotonic()
-                result = await graph.ingest(
-                    Observation(
-                        content=item['text'],
-                        occurred_at=datetime.fromisoformat(item['timestamp']),
-                        origin=memory['origin'],
-                        observation_id=f'{group_id}-observation-{index:05d}',
-                        name=f'{memory_id}-observation-{index:05d}',
-                        source_description=f'{payload["dataset"]} agent-memory history',
-                        group_id=group_id,
-                    )
+                call_offset = len(getattr(graphiti.llm_client, 'calls', ()))
+                observation = Observation(
+                    content=item['text'],
+                    occurred_at=datetime.fromisoformat(item['timestamp']),
+                    origin=memory['origin'],
+                    observation_id=f'{group_id}-observation-{index:05d}',
+                    name=f'{memory_id}-observation-{index:05d}',
+                    source_description=f'{payload["dataset"]} agent-memory history',
+                    group_id=group_id,
                 )
-                await _persist_graph_store(graphiti)
+                observation_scope = (
+                    profiler.observation(observation.observation_id, index)
+                    if profiler is not None
+                    else nullcontext()
+                )
+                with observation_scope:
+                    checkpoint.mark_in_progress(index, observation.observation_id)
+                    try:
+                        result = await graph.ingest(observation)
+                        persistence_scope = (
+                            profiler.stage(
+                                'GRAPH_PERSISTENCE',
+                                observation_id=observation.observation_id,
+                            )
+                            if profiler is not None
+                            else nullcontext()
+                        )
+                        with persistence_scope:
+                            await _persist_graph_store(graphiti)
+                        snapshot = await snapshot_repository(
+                            graph.repository,
+                            group_id,
+                            evidence_ids=(result.evidence.evidence_id,),
+                            extra={
+                                'last_observation_id': result.observation_id,
+                                'last_observation_index': index,
+                                'invalidated_state_ids': list(result.invalidated_state_ids),
+                                'propagation_steps': [
+                                    _safe_json(step)
+                                    for step in result.propagation_steps
+                                ],
+                            },
+                        )
+                        calls, request_hashes, response_hashes = _provider_manifest(graphiti)
+                        calls = calls[call_offset:]
+                        request_hashes = request_hashes[call_offset:]
+                        response_hashes = response_hashes[call_offset:]
+                        checkpoint_scope = (
+                            profiler.stage(
+                                'CHECKPOINT_WRITE',
+                                observation_id=observation.observation_id,
+                            )
+                            if profiler is not None
+                            else nullcontext()
+                        )
+                        with checkpoint_scope:
+                            checkpoint.commit_observation(
+                                index,
+                                observation.observation_id,
+                                state_snapshot=snapshot,
+                                provider_call_manifest=calls,
+                                request_hashes=request_hashes,
+                                accepted_response_hashes=response_hashes,
+                            )
+                    except Exception as exc:
+                        checkpoint.record_failure(exc)
+                        raise
                 progress['completed_observations'][memory_id] = index + 1
                 progress['last'] = {
                     'memory_id': memory_id,
@@ -208,7 +377,11 @@ async def _run(dataset_key: str) -> None:
         await _persist_graph_store(graphiti)
         _atomic_json(progress_path, progress)
     finally:
-        await graphiti.close()
+        try:
+            await graphiti.close()
+        finally:
+            if profiler is not None:
+                profiler.write()
 
 
 def main() -> None:
