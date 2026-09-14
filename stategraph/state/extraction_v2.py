@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any, Sequence
 
-from .extraction import StateExtractor
+from .contracts import StateExtractor
 from .schema import ConditionScope, Observation, StateCandidate, TimeScope, canonical_field_id
 
 

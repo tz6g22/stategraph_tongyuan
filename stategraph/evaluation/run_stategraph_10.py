@@ -24,6 +24,10 @@ from stategraph.evaluation.checkpoint import (
 )
 from stategraph.evaluation.graphiti_runtime import create_graphiti, initialize_graphiti
 from stategraph.evaluation.profiling import StageProfiler
+from stategraph.backend.graphiti import GraphitiBackend
+from stategraph.graphiti_adapter.state_extraction import GraphitiLLMStateExtractor
+from stategraph.state.snapshot import StateGraphSnapshotCodec
+from stategraph.storage import InMemoryStateRepository
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +58,8 @@ def _checkpoint_identity(
     source_files = [
         Path(__file__),
         Path(__file__).with_name('checkpoint.py'),
+        ROOT / 'stategraph' / 'state' / 'snapshot.py',
+        ROOT / 'stategraph' / 'compatibility' / 'legacy_checkpoint.py',
         ROOT / 'stategraph' / 'system.py',
         ROOT / 'stategraph' / 'graphiti_adapter' / 'adapter.py',
         ROOT / 'stategraph' / 'graphiti_adapter' / 'repository.py',
@@ -137,6 +143,36 @@ async def _run(dataset_key: str) -> None:
         else []
     )
     new_store = not (store_dir / 'falkordb.db').exists()
+    # Validate and restore semantic state before initializing the optional
+    # backend.  The shadow repository is intentionally local: after backend
+    # startup the same snapshot is restored into the configured repository.
+    pre_backend_snapshots: dict[str, dict[str, Any]] = {}
+    for memory in payload['memory_groups']:
+        memory_id = memory['memory_id']
+        checkpoint = CheckpointManager(
+            dataset_dir / 'checkpoints' / f'{memory_id}.json',
+            identity=_checkpoint_identity(
+                dataset_key=dataset_key,
+                dataset_dir=dataset_dir,
+                prepared_path=prepared_path,
+                memory=memory,
+            ),
+        )
+        if not checkpoint.exists():
+            continue
+        current = checkpoint.validate_resume()
+        if current['last_committed_observation_index'] < 0:
+            continue
+        group_id = _group_id(dataset_key, memory_id)
+        semantic_snapshot = StateGraphSnapshotCodec.deserialize(current['state_snapshot'])
+        shadow_repository = InMemoryStateRepository()
+        await restore_repository_snapshot(
+            shadow_repository,
+            semantic_snapshot,
+            replace=True,
+            group_id=group_id,
+        )
+        pre_backend_snapshots[memory_id] = current
     profile_path = os.environ.get('STATEGRAPH_PROFILE_PATH')
     profiler = (
         StageProfiler(
@@ -156,10 +192,18 @@ async def _run(dataset_key: str) -> None:
     )
     graphiti = create_graphiti(store_dir, profiler=profiler)
     await initialize_graphiti(graphiti, new_store=new_store)
-    graph = StateGraph.from_graphiti(
-        graphiti,
-        extraction_trace_path=str(dataset_dir / 'extraction_trace.jsonl'),
-        profiler=profiler,
+    graph = StateGraph.from_backend(
+        GraphitiBackend(
+            graphiti,
+            trace_path=str(dataset_dir / 'extraction_trace.jsonl'),
+            profiler=profiler,
+        ),
+        extractor=GraphitiLLMStateExtractor(
+            graphiti.llm_client,
+            trace_path=str(dataset_dir / 'extraction_trace.jsonl'),
+            profiler=profiler,
+            native_mode=True,
+        ),
     )
     started = time.monotonic()
     try:
@@ -175,13 +219,11 @@ async def _run(dataset_key: str) -> None:
                     memory=memory,
                 ),
             )
-            if checkpoint.exists() and new_store:
-                raise RuntimeError(
-                    f'checkpoint exists but Graphiti store is missing for {memory_id}'
-                )
             position = checkpoint.resume_position()
-            if position['status'] == 'IN_PROGRESS':
-                current_checkpoint = checkpoint.validate_resume()
+            if position['status'] in {'IN_PROGRESS', 'COMMITTED'}:
+                current_checkpoint = pre_backend_snapshots.get(memory_id)
+                if current_checkpoint is None:
+                    current_checkpoint = checkpoint.validate_resume()
                 await restore_repository_snapshot(
                     graph.repository,
                     current_checkpoint['state_snapshot'],
@@ -229,6 +271,9 @@ async def _run(dataset_key: str) -> None:
                         snapshot = await snapshot_repository(
                             graph.repository,
                             group_id,
+                            run_id=checkpoint.identity['run_id'],
+                            case_id=checkpoint.identity['case_id'],
+                            sequence_position=index,
                             evidence_ids=(result.evidence.evidence_id,),
                             extra={
                                 'last_observation_id': result.observation_id,
@@ -375,10 +420,11 @@ async def _run(dataset_key: str) -> None:
         progress['retrieval_complete'] = True
         progress['total_elapsed_seconds'] = round(time.monotonic() - started, 3)
         await _persist_graph_store(graphiti)
+        await graph.flush()
         _atomic_json(progress_path, progress)
     finally:
         try:
-            await graphiti.close()
+            await graph.close()
         finally:
             if profiler is not None:
                 profiler.write()

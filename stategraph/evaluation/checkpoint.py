@@ -16,6 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from stategraph.state.snapshot import (
+    BackendSnapshot,
+    StateGraphSnapshot,
+    StateGraphSnapshotCodec,
+)
+
 
 CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_STATUSES = frozenset({'INITIALIZED', 'IN_PROGRESS', 'COMMITTED'})
@@ -33,8 +39,12 @@ CHECKPOINT_IDENTITY_KEYS = (
     'module4_freeze_digest',
 )
 SNAPSHOT_KEYS = (
+    'snapshot_schema_version',
+    'run_id',
+    'case_id',
+    'sequence_position',
+    'evidence_records',
     'state_nodes',
-    'evidence_nodes',
     'lifecycle_state',
     'linking_metadata',
     'revision_metadata',
@@ -42,7 +52,9 @@ SNAPSHOT_KEYS = (
     'relation_typing_results',
     'verification_results',
     'propagation_state',
-    'graphiti_runtime_state',
+    'provenance',
+    'sequence_index',
+    'deterministic_metadata',
 )
 
 
@@ -86,11 +98,14 @@ def source_digest(paths: Sequence[str | Path]) -> str:
     return canonical_hash(entries)
 
 
-def empty_snapshot() -> dict[str, Any]:
-    return {
-        key: [] if key.endswith(('_nodes', '_edges', '_results', '_metadata')) else {}
-        for key in SNAPSHOT_KEYS
-    }
+def empty_snapshot(
+    *, run_id: str = '', case_id: str = '', sequence_position: int = -1
+) -> dict[str, Any]:
+    return StateGraphSnapshot(
+        run_id=run_id,
+        case_id=case_id,
+        sequence_position=sequence_position,
+    ).serialize()
 
 
 def _validate_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -106,6 +121,33 @@ def _payload_without_digest(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _snapshot_payload(
+    snapshot: Mapping[str, Any] | StateGraphSnapshot,
+    *,
+    run_id: str = '',
+    case_id: str = '',
+    sequence_position: int = -1,
+) -> dict[str, Any]:
+    """Normalize new snapshots and read old row-oriented snapshots via compatibility code."""
+
+    if isinstance(snapshot, StateGraphSnapshot):
+        return StateGraphSnapshotCodec.serialize(snapshot)
+    if not isinstance(snapshot, Mapping):
+        raise TypeError('state_snapshot must be a mapping or StateGraphSnapshot')
+    if 'snapshot_schema_version' in snapshot:
+        return StateGraphSnapshotCodec.serialize(StateGraphSnapshotCodec.deserialize(snapshot))
+    from stategraph.compatibility.legacy_checkpoint import stategraph_snapshot_from_legacy
+
+    return StateGraphSnapshotCodec.serialize(
+        stategraph_snapshot_from_legacy(
+            snapshot,
+            run_id=run_id,
+            case_id=case_id,
+            sequence_position=sequence_position,
+        )
+    )
 
 
 class CheckpointManager:
@@ -137,7 +179,11 @@ class CheckpointManager:
             'completed_observation_ids': [],
             'completed_batch_ids': [],
             'in_progress': None,
-            'state_snapshot': empty_snapshot(),
+            'state_snapshot': empty_snapshot(
+                run_id=self.identity['run_id'],
+                case_id=self.identity['case_id'],
+            ),
+            'backend_snapshot': None,
             'provider_call_manifest': [],
             'request_hashes': [],
             'accepted_response_hashes': [],
@@ -174,8 +220,22 @@ class CheckpointManager:
         if in_progress is not None and not isinstance(in_progress, dict):
             raise CheckpointCorrupt('in_progress must be an object or null')
         snapshot = payload.get('state_snapshot')
-        if not isinstance(snapshot, dict) or any(key not in snapshot for key in SNAPSHOT_KEYS):
-            raise CheckpointCorrupt('state_snapshot is missing required fields')
+        try:
+            normalized_snapshot = _snapshot_payload(
+                snapshot,
+                run_id=self.identity['run_id'],
+                case_id=self.identity['case_id'],
+                sequence_position=int(payload.get('last_committed_observation_index', -1)),
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise CheckpointCorrupt(f'invalid state snapshot: {exc}') from exc
+        payload['state_snapshot'] = normalized_snapshot
+        backend_snapshot = payload.get('backend_snapshot')
+        if backend_snapshot is not None:
+            try:
+                payload['backend_snapshot'] = BackendSnapshot.deserialize(backend_snapshot).serialize()
+            except (TypeError, ValueError, KeyError) as exc:
+                raise CheckpointCorrupt(f'invalid backend snapshot: {exc}') from exc
         return payload
 
     def _write(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -290,14 +350,13 @@ class CheckpointManager:
         observation_index: int,
         observation_id: str,
         *,
-        state_snapshot: Mapping[str, Any],
+        state_snapshot: Mapping[str, Any] | StateGraphSnapshot,
+        backend_snapshot: BackendSnapshot | Mapping[str, Any] | None = None,
         completed_batch_ids: Sequence[str] = (),
         provider_call_manifest: Sequence[Mapping[str, Any]] = (),
         request_hashes: Sequence[str] = (),
         accepted_response_hashes: Sequence[str] = (),
     ) -> dict[str, Any]:
-        if any(key not in state_snapshot for key in SNAPSHOT_KEYS):
-            raise ValueError(f'state_snapshot must contain {SNAPSHOT_KEYS}')
         current = self.create_or_load()
         if observation_index <= int(current['last_committed_observation_index']):
             expected_id = current['completed_observation_ids'][observation_index]
@@ -327,7 +386,17 @@ class CheckpointManager:
             )
         )
         current['in_progress'] = None
-        current['state_snapshot'] = dict(state_snapshot)
+        current['state_snapshot'] = _snapshot_payload(
+            state_snapshot,
+            run_id=self.identity['run_id'],
+            case_id=self.identity['case_id'],
+            sequence_position=observation_index,
+        )
+        if backend_snapshot is not None:
+            if isinstance(backend_snapshot, BackendSnapshot):
+                current['backend_snapshot'] = backend_snapshot.serialize()
+            else:
+                current['backend_snapshot'] = BackendSnapshot.deserialize(backend_snapshot).serialize()
         current['provider_call_manifest'] = [
             *current.get('provider_call_manifest', ()),
             *list(provider_call_manifest),
@@ -366,16 +435,13 @@ async def snapshot_repository(
     repository: Any,
     group_id: str,
     *,
+    run_id: str = '',
+    case_id: str = '',
+    sequence_position: int = -1,
     extra: Mapping[str, Any] | None = None,
     evidence_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Capture all StateGraph records needed to compare or restore a prefix."""
-
-    from stategraph.graphiti_adapter.repository import (
-        _evidence_to_row,
-        _relation_to_row,
-        _state_to_row,
-    )
 
     states = await repository.list_states(group_id)
     relations = await repository.list_relations(group_id)
@@ -394,97 +460,40 @@ async def snapshot_repository(
         )
     )
     evidence = await repository.get_evidence(all_evidence_ids)
-    state_rows = [_state_to_row(item) for item in states]
-    relation_rows = [_relation_to_row(item) for item in relations]
-    evidence_rows = [_evidence_to_row(item) for item in evidence]
-    return _json_safe({
-        'state_nodes': state_rows,
-        'evidence_nodes': evidence_rows,
-        'lifecycle_state': [
-            {'state_id': item.state_id, 'status': item.status.value}
-            for item in states
-        ],
-        'linking_metadata': [
-            {
-                'state_id': item.state_id,
-                'canonical_subject_id': item.canonical_subject_id,
-                'canonical_field_id': item.canonical_field_id,
-                'metadata': dict(item.metadata),
-            }
-            for item in states
-        ],
-        'revision_metadata': [
-            {
-                'state_id': item.state_id,
-                'conflicts': [
-                    {'entity': selector.entity, 'attribute': selector.attribute, 'value': selector.value}
-                    for selector in item.conflicts
-                ],
-            }
-            for item in states
-        ],
-        'dependency_edges': [
-            row for row in relation_rows
-            if row.get('relation_type') in {'depends-on', 'derived-from', 'affects-action'}
-        ],
-        'relation_typing_results': relation_rows,
-        'verification_results': [
-            {
-                'relation_id': item.relation_id,
-                'dependency_strength': item.dependency_strength.value
-                if item.dependency_strength is not None else None,
-                'verification_reason': item.verification_reason,
-                'verifier_confidence': item.verifier_confidence,
-                'supporting_evidence_ids': list(item.supporting_evidence_ids),
-            }
-            for item in relations
-        ],
-        'propagation_state': dict(extra or {}),
-        'graphiti_runtime_state': {
-            'group_id': group_id,
-            'graphiti_episode_ids': list(
-                dict.fromkeys(
-                    item.get('graphiti_episode_id')
-                    for item in evidence_rows
-                    if item.get('graphiti_episode_id')
-                )
-            ),
-        },
-    })
+    snapshot = StateGraphSnapshot.from_repository_records(
+        run_id=run_id,
+        case_id=case_id,
+        sequence_position=sequence_position,
+        evidence_records=tuple(evidence),
+        state_nodes=tuple(states),
+        relations=tuple(relations),
+        propagation_state=extra,
+        deterministic_metadata={'group_id': group_id},
+    )
+    return StateGraphSnapshotCodec.serialize(snapshot)
 
 
 async def restore_repository_snapshot(
     repository: Any,
-    snapshot: Mapping[str, Any],
+    snapshot: Mapping[str, Any] | StateGraphSnapshot,
     *,
     replace: bool = False,
     group_id: str | None = None,
 ) -> None:
     """Restore a snapshot, optionally replacing stale uncommitted records."""
-
-    from stategraph.graphiti_adapter.repository import (
-        _evidence_from_record,
-        _relation_from_record,
-        _state_from_record,
-    )
-
-    group_ids = {
-        str(item.get('group_id'))
-        for item in (*snapshot.get('state_nodes', ()), *snapshot.get('evidence_nodes', ()))
-        if item.get('group_id') is not None
-    }
+    snapshot_payload = _snapshot_payload(snapshot)
+    semantic_snapshot = StateGraphSnapshotCodec.deserialize(snapshot_payload)
+    group_ids = {item.group_id for item in semantic_snapshot.state_nodes}
+    group_ids.update(item.group_id for item in semantic_snapshot.evidence_records)
     if group_id:
         group_ids.add(group_id)
     clear_group = getattr(repository, 'clear_group', None)
     if replace and clear_group is not None:
         for group_id in sorted(group_ids):
             await clear_group(group_id)
-    evidence = [_evidence_from_record(item) for item in snapshot.get('evidence_nodes', ())]
-    states = [_state_from_record(item) for item in snapshot.get('state_nodes', ())]
-    relations = [_relation_from_record(item) for item in snapshot.get('relation_typing_results', ())]
-    for item in evidence:
+    for item in semantic_snapshot.evidence_records:
         await repository.save_evidence(item)
-    await repository.apply(states, relations)
+    await repository.apply(semantic_snapshot.state_nodes, semantic_snapshot.relation_typing_results)
 
 
 __all__ = [
@@ -494,6 +503,9 @@ __all__ = [
     'CheckpointError',
     'CheckpointManager',
     'ResumeRejected',
+    'BackendSnapshot',
+    'StateGraphSnapshot',
+    'StateGraphSnapshotCodec',
     'canonical_hash',
     'empty_snapshot',
     'file_hash',

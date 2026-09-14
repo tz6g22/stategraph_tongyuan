@@ -1,15 +1,12 @@
-"""Core, backend-independent StateGraph data contracts.
-
-The classes in this module deliberately do not import Graphiti.  Graphiti owns the
-temporal graph and extraction infrastructure; these records add the state semantics
-that a normal fact edge does not carry.
-"""
+"""Core, backend-independent StateGraph data contracts."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
+import json
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -26,8 +23,42 @@ def ensure_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _datetime_from_string(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    return ensure_utc(datetime.fromisoformat(str(value).replace('Z', '+00:00')))
+
+
 def _normalise(text: str) -> str:
     return ' '.join(text.casefold().split())
+
+
+def evidence_id_for(
+    observation_id: str,
+    source_span: str,
+    sequence_index: int = 0,
+    *,
+    span_start: int = 0,
+    span_end: int | None = None,
+) -> str:
+    """Return a reproducible StateGraph-owned identity for one source span.
+
+    The identity deliberately contains no provider- or backend-generated value.  The
+    source observation, grounded offsets/text, and stable sequence position are the
+    complete semantic inputs to the contract.
+    """
+
+    payload = {
+        'observation_id': str(observation_id),
+        'source_span': str(source_span),
+        'span_start': int(span_start),
+        'span_end': int(span_end) if span_end is not None else None,
+        'sequence_index': int(sequence_index),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return f"evidence:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
 def canonical_field_id(value: str) -> str:
@@ -214,7 +245,14 @@ class DependencyRelationSelector:
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceNode:
+class EvidenceRecord:
+    """Backend-neutral source evidence owned by StateGraph.
+
+    ``backend_metadata`` is opaque to semantic code.  A Graphiti adapter may keep
+    episode/fact identifiers there for persistence compatibility, but those values
+    never participate in StateGraph identity or decisions.
+    """
+
     evidence_id: str
     observation_id: str
     timestamp: datetime
@@ -222,19 +260,126 @@ class EvidenceNode:
     origin: str
     span_start: int = 0
     span_end: int | None = None
-    graphiti_episode_id: str | None = None
+    sequence_index: int = 0
+    time_scope: TimeScope = field(default_factory=TimeScope)
+    speaker: str | None = None
+    source: str | None = None
+    backend_metadata: Mapping[str, Any] = field(default_factory=dict)
     group_id: str = 'default'
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'timestamp', ensure_utc(self.timestamp))
+        object.__setattr__(self, 'time_scope', self.time_scope)
         end = len(self.original_text) if self.span_end is None else self.span_end
         if self.span_start < 0 or end < self.span_start or end > len(self.original_text):
             raise ValueError('evidence span must fall inside original_text')
+        if self.sequence_index < 0:
+            raise ValueError('evidence sequence_index must be non-negative')
         object.__setattr__(self, 'span_end', end)
+        object.__setattr__(self, 'backend_metadata', dict(self.backend_metadata))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        observation_id: str,
+        source_text: str,
+        origin: str,
+        span_start: int = 0,
+        span_end: int | None = None,
+        sequence_index: int = 0,
+        timestamp: datetime | None = None,
+        time_scope: TimeScope | None = None,
+        speaker: str | None = None,
+        source: str | None = None,
+        backend_metadata: Mapping[str, Any] | None = None,
+        group_id: str = 'default',
+    ) -> EvidenceRecord:
+        end = len(source_text) if span_end is None else span_end
+        span = source_text[span_start:end]
+        return cls(
+            evidence_id=evidence_id_for(
+                observation_id,
+                span,
+                sequence_index,
+                span_start=span_start,
+                span_end=end,
+            ),
+            observation_id=observation_id,
+            timestamp=timestamp or utc_now(),
+            original_text=source_text,
+            origin=origin,
+            span_start=span_start,
+            span_end=end,
+            sequence_index=sequence_index,
+            time_scope=time_scope or TimeScope(),
+            speaker=speaker,
+            source=source,
+            backend_metadata=backend_metadata or {},
+            group_id=group_id,
+        )
+
+    @property
+    def source_text(self) -> str:
+        return self.original_text
+
+    @property
+    def source_span(self) -> str:
+        return self.span
 
     @property
     def span(self) -> str:
         return self.original_text[self.span_start : self.span_end]
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            'evidence_id': self.evidence_id,
+            'observation_id': self.observation_id,
+            'timestamp': self.timestamp.isoformat(),
+            'source_text': self.source_text,
+            'source_span': self.source_span,
+            'origin': self.origin,
+            'span_start': self.span_start,
+            'span_end': self.span_end,
+            'sequence_index': self.sequence_index,
+            'time_scope': {
+                'start': self.time_scope.start.isoformat() if self.time_scope.start else None,
+                'end': self.time_scope.end.isoformat() if self.time_scope.end else None,
+            },
+            'speaker': self.speaker,
+            'source': self.source,
+            'backend_metadata': dict(self.backend_metadata),
+            'group_id': self.group_id,
+        }
+
+    @classmethod
+    def deserialize(cls, payload: Mapping[str, Any]) -> EvidenceRecord:
+        raw_scope = payload.get('time_scope') or {}
+        start = raw_scope.get('start')
+        end = raw_scope.get('end')
+        return cls(
+            evidence_id=str(payload['evidence_id']),
+            observation_id=str(payload['observation_id']),
+            timestamp=ensure_utc(datetime.fromisoformat(str(payload['timestamp']).replace('Z', '+00:00'))),
+            original_text=str(payload.get('source_text', payload.get('original_text', ''))),
+            origin=str(payload.get('origin', '')),
+            span_start=int(payload.get('span_start', 0)),
+            span_end=int(payload['span_end']) if payload.get('span_end') is not None else None,
+            sequence_index=int(payload.get('sequence_index', 0)),
+            time_scope=TimeScope(
+                ensure_utc(datetime.fromisoformat(str(start).replace('Z', '+00:00'))) if start else None,
+                ensure_utc(datetime.fromisoformat(str(end).replace('Z', '+00:00'))) if end else None,
+            ),
+            speaker=payload.get('speaker'),
+            source=payload.get('source'),
+            backend_metadata=payload.get('backend_metadata') or {},
+            group_id=str(payload.get('group_id', 'default')),
+        )
+
+
+# Compatibility name retained for existing repository and test callers.  Semantic
+# code uses EvidenceRecord; the alias carries no backend-specific fields.
+EvidenceNode = EvidenceRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +396,8 @@ class StateNode:
     status: StateStatus = StateStatus.CURRENT
     confidence: float = 1.0
     evidence_ids: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    # Deprecated compatibility metadata.  New semantic code must use evidence_refs.
     graphiti_fact_ids: tuple[str, ...] = ()
     effects: tuple[StateSelector, ...] = ()
     conflicts: tuple[StateSelector, ...] = ()
@@ -278,8 +425,11 @@ class StateNode:
             raise ValueError('observation_index must be non-negative')
         if self.sequence_index < 0:
             raise ValueError('sequence_index must be non-negative')
-        evidence_ids = tuple(dict.fromkeys((self.evidence_id, *self.evidence_ids)))
+        evidence_ids = tuple(
+            dict.fromkeys((self.evidence_id, *self.evidence_refs, *self.evidence_ids))
+        )
         object.__setattr__(self, 'evidence_ids', evidence_ids)
+        object.__setattr__(self, 'evidence_refs', evidence_ids)
         object.__setattr__(self, 'graphiti_fact_ids', tuple(dict.fromkeys(self.graphiti_fact_ids)))
 
     @classmethod
@@ -327,12 +477,13 @@ class StateNode:
 
     def with_evidence(self, *evidence_ids: str) -> StateNode:
         merged = tuple(dict.fromkeys((*self.evidence_ids, *evidence_ids)))
-        return replace(self, evidence_ids=merged)
+        return replace(self, evidence_ids=merged, evidence_refs=merged)
 
     def with_provenance(self, other: StateNode) -> StateNode:
         """Merge duplicate observations without creating another current state slot."""
 
         evidence_ids = tuple(dict.fromkeys((*self.evidence_ids, *other.evidence_ids)))
+        evidence_refs = tuple(dict.fromkeys((*self.evidence_refs, *other.evidence_refs)))
         fact_ids = tuple(dict.fromkeys((*self.graphiti_fact_ids, *other.graphiti_fact_ids)))
         dependency_relations = tuple(
             dict.fromkeys((*self.dependency_relations, *other.dependency_relations))
@@ -341,9 +492,116 @@ class StateNode:
         return replace(
             self,
             evidence_ids=evidence_ids,
+            evidence_refs=evidence_refs,
             graphiti_fact_ids=fact_ids,
             dependency_relations=dependency_relations,
             confidence=confidence,
+        )
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            'state_id': self.state_id,
+            'entity': self.entity,
+            'attribute': self.attribute,
+            'value': self.value,
+            'evidence_id': self.evidence_id,
+            'evidence_ids': list(self.evidence_ids),
+            'evidence_refs': list(self.evidence_refs),
+            'canonical_subject_id': self.canonical_subject_id,
+            'canonical_field_id': self.canonical_field_id,
+            'time_scope': {
+                'start': self.time_scope.start.isoformat() if self.time_scope.start else None,
+                'end': self.time_scope.end.isoformat() if self.time_scope.end else None,
+            },
+            'condition_scope': {
+                'conditions': dict(self.condition_scope.conditions),
+                'description': self.condition_scope.description,
+            },
+            'status': self.status.value,
+            'confidence': self.confidence,
+            'effects': [
+                {'entity': item.entity, 'attribute': item.attribute, 'value': item.value}
+                for item in self.effects
+            ],
+            'conflicts': [
+                {'entity': item.entity, 'attribute': item.attribute, 'value': item.value}
+                for item in self.conflicts
+            ],
+            'dependency_relations': [
+                {
+                    'relation_type': item.relation_type.value,
+                    'prerequisite': {
+                        'entity': item.prerequisite.entity,
+                        'attribute': item.prerequisite.attribute,
+                        'value': item.prerequisite.value,
+                    },
+                    'reason': item.reason,
+                    'evidence_id': item.evidence_id,
+                }
+                for item in self.dependency_relations
+            ],
+            'group_id': self.group_id,
+            'observation_id': self.observation_id,
+            'observation_index': self.observation_index,
+            'sequence_index': self.sequence_index,
+            'observed_at': self.observed_at.isoformat(),
+            'created_at': self.created_at.isoformat(),
+            'metadata': dict(self.metadata),
+            # Old IDs remain readable as opaque compatibility metadata only.
+            'backend_metadata': {'legacy_graphiti_fact_ids': list(self.graphiti_fact_ids)},
+        }
+
+    @classmethod
+    def deserialize(cls, payload: Mapping[str, Any]) -> StateNode:
+        raw_scope = payload.get('time_scope') or {}
+        condition = payload.get('condition_scope') or {}
+        effects = tuple(StateSelector(**item) for item in payload.get('effects', ()))
+        conflicts = tuple(StateSelector(**item) for item in payload.get('conflicts', ()))
+        relations = tuple(
+            DependencyRelationSelector(
+                relation_type=RelationType(item['relation_type']),
+                prerequisite=StateSelector(**item['prerequisite']),
+                reason=str(item['reason']),
+                evidence_id=item.get('evidence_id'),
+            )
+            for item in payload.get('dependency_relations', ())
+        )
+        backend = payload.get('backend_metadata') or {}
+        legacy_fact_ids = backend.get('legacy_graphiti_fact_ids')
+        if legacy_fact_ids is None:
+            # Read pre-Module-1 snapshots without promoting the field back into
+            # the semantic serialization contract.
+            legacy_fact_ids = payload.get('graphiti_fact_ids', ())
+        return cls(
+            state_id=str(payload['state_id']),
+            entity=str(payload['entity']),
+            attribute=str(payload['attribute']),
+            value=payload.get('value'),
+            evidence_id=str(payload['evidence_id']),
+            evidence_ids=tuple(payload.get('evidence_ids', ())),
+            evidence_refs=tuple(payload.get('evidence_refs', ())),
+            canonical_subject_id=payload.get('canonical_subject_id'),
+            canonical_field_id=payload.get('canonical_field_id'),
+            time_scope=TimeScope(
+                _datetime_from_string(raw_scope.get('start')),
+                _datetime_from_string(raw_scope.get('end')),
+            ),
+            condition_scope=ConditionScope.from_mapping(
+                condition.get('conditions', {}), condition.get('description')
+            ),
+            status=StateStatus(payload.get('status', StateStatus.CURRENT.value)),
+            confidence=float(payload.get('confidence', 1.0)),
+            effects=effects,
+            conflicts=conflicts,
+            dependency_relations=relations,
+            group_id=str(payload.get('group_id', 'default')),
+            observation_id=str(payload.get('observation_id', '')),
+            observation_index=payload.get('observation_index'),
+            sequence_index=int(payload.get('sequence_index', 0)),
+            observed_at=_datetime_from_string(payload.get('observed_at')) or utc_now(),
+            created_at=_datetime_from_string(payload.get('created_at')) or utc_now(),
+            metadata=payload.get('metadata') or {},
+            graphiti_fact_ids=tuple(legacy_fact_ids or ()),
         )
 
 
@@ -383,11 +641,103 @@ class StateCandidate:
     time_scope: TimeScope = field(default_factory=TimeScope)
     condition_scope: ConditionScope = field(default_factory=ConditionScope)
     confidence: float = 1.0
+    evidence_refs: tuple[str, ...] = ()
+    # Deprecated compatibility metadata.  New semantic code must use evidence_refs.
     graphiti_fact_ids: tuple[str, ...] = ()
     effects: tuple[StateSelector, ...] = ()
     conflicts: tuple[StateSelector, ...] = ()
     dependency_relations: tuple[DependencyRelationSelector, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'evidence_refs', tuple(dict.fromkeys(self.evidence_refs)))
+        object.__setattr__(self, 'graphiti_fact_ids', tuple(dict.fromkeys(self.graphiti_fact_ids)))
+
+    @property
+    def backend_ids(self) -> tuple[str, ...]:
+        """Opaque compatibility identifiers exposed only to a backend adapter."""
+
+        return self.graphiti_fact_ids
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            'entity': self.entity,
+            'attribute': self.attribute,
+            'value': self.value,
+            'canonical_subject_id': self.canonical_subject_id,
+            'canonical_field_id': self.canonical_field_id,
+            'confidence': self.confidence,
+            'evidence_refs': list(self.evidence_refs),
+            'time_scope': {
+                'start': self.time_scope.start.isoformat() if self.time_scope.start else None,
+                'end': self.time_scope.end.isoformat() if self.time_scope.end else None,
+            },
+            'condition_scope': {
+                'conditions': dict(self.condition_scope.conditions),
+                'description': self.condition_scope.description,
+            },
+            'effects': [
+                {'entity': item.entity, 'attribute': item.attribute, 'value': item.value}
+                for item in self.effects
+            ],
+            'conflicts': [
+                {'entity': item.entity, 'attribute': item.attribute, 'value': item.value}
+                for item in self.conflicts
+            ],
+            'dependency_relations': [
+                {
+                    'relation_type': item.relation_type.value,
+                    'prerequisite': {
+                        'entity': item.prerequisite.entity,
+                        'attribute': item.prerequisite.attribute,
+                        'value': item.prerequisite.value,
+                    },
+                    'reason': item.reason,
+                    'evidence_id': item.evidence_id,
+                }
+                for item in self.dependency_relations
+            ],
+            'metadata': dict(self.metadata),
+            'backend_metadata': {'legacy_graphiti_fact_ids': list(self.graphiti_fact_ids)},
+        }
+
+    @classmethod
+    def deserialize(cls, payload: Mapping[str, Any]) -> StateCandidate:
+        raw_scope = payload.get('time_scope') or {}
+        condition = payload.get('condition_scope') or {}
+        backend = payload.get('backend_metadata') or {}
+        legacy_fact_ids = backend.get('legacy_graphiti_fact_ids')
+        if legacy_fact_ids is None:
+            legacy_fact_ids = payload.get('graphiti_fact_ids', ())
+        return cls(
+            entity=str(payload['entity']),
+            attribute=str(payload['attribute']),
+            value=payload.get('value'),
+            canonical_subject_id=payload.get('canonical_subject_id'),
+            canonical_field_id=payload.get('canonical_field_id'),
+            confidence=float(payload.get('confidence', 1.0)),
+            evidence_refs=tuple(payload.get('evidence_refs', ())),
+            graphiti_fact_ids=tuple(legacy_fact_ids or ()),
+            time_scope=TimeScope(
+                _datetime_from_string(raw_scope.get('start')),
+                _datetime_from_string(raw_scope.get('end')),
+            ),
+            condition_scope=ConditionScope.from_mapping(
+                condition.get('conditions', {}), condition.get('description')
+            ),
+            effects=tuple(StateSelector(**item) for item in payload.get('effects', ())),
+            conflicts=tuple(StateSelector(**item) for item in payload.get('conflicts', ())),
+            dependency_relations=tuple(
+                DependencyRelationSelector(
+                    relation_type=RelationType(item['relation_type']),
+                    prerequisite=StateSelector(**item['prerequisite']),
+                    reason=str(item['reason']),
+                    evidence_id=item.get('evidence_id'),
+                )
+                for item in payload.get('dependency_relations', ())
+            ),
+            metadata=payload.get('metadata') or {},
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,13 +755,136 @@ class Observation:
         object.__setattr__(self, 'occurred_at', ensure_utc(self.occurred_at))
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationRecord:
+    """Backend-neutral observation consumed by the native StateGraph extractor.
+
+    ``raw_text`` is the only semantic source.  Backend identifiers may be carried
+    in ``backend_metadata`` for persistence compatibility, but are never required
+    to extract or identify a state.
+    """
+
+    observation_id: str
+    raw_text: str
+    sequence_index: int
+    timestamp: datetime
+    origin: str = 'StateGraph observation'
+    speaker: str | None = None
+    source: str | None = None
+    session_metadata: Mapping[str, Any] = field(default_factory=dict)
+    backend_metadata: Mapping[str, Any] = field(default_factory=dict)
+    group_id: str = 'default'
+    name: str = 'observation'
+    source_description: str = 'StateGraph observation'
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'timestamp', ensure_utc(self.timestamp))
+        if self.sequence_index < 0:
+            raise ValueError('observation sequence_index must be non-negative')
+        object.__setattr__(self, 'session_metadata', dict(self.session_metadata))
+        object.__setattr__(self, 'backend_metadata', dict(self.backend_metadata))
+
+    @property
+    def content(self) -> str:
+        """Compatibility view used by StateGraph's observation-local code."""
+
+        return self.raw_text
+
+    @property
+    def occurred_at(self) -> datetime:
+        return self.timestamp
+
+    @property
+    def observation_index(self) -> int:
+        return self.sequence_index
+
+    @classmethod
+    def from_observation(
+        cls,
+        observation: Observation,
+        *,
+        sequence_index: int | None = None,
+        speaker: str | None = None,
+        source: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+        backend_metadata: Mapping[str, Any] | None = None,
+    ) -> ObservationRecord:
+        return cls(
+            observation_id=observation.observation_id,
+            raw_text=observation.content,
+            sequence_index=(
+                observation.observation_index
+                if sequence_index is None and observation.observation_index is not None
+                else sequence_index if sequence_index is not None else 0
+            ),
+            timestamp=observation.occurred_at,
+            origin=observation.origin,
+            session_metadata=session_metadata or {},
+            backend_metadata=backend_metadata or {},
+            group_id=observation.group_id,
+            name=observation.name,
+            source_description=observation.source_description,
+            speaker=speaker,
+            source=source,
+        )
+
+    def to_observation(self) -> Observation:
+        return Observation(
+            content=self.raw_text,
+            occurred_at=self.timestamp,
+            origin=self.origin,
+            observation_id=self.observation_id,
+            name=self.name,
+            source_description=self.source_description,
+            group_id=self.group_id,
+            observation_index=self.sequence_index,
+        )
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            'observation_id': self.observation_id,
+            'raw_text': self.raw_text,
+            'sequence_index': self.sequence_index,
+            'timestamp': self.timestamp.isoformat(),
+            'origin': self.origin,
+            'speaker': self.speaker,
+            'source': self.source,
+            'session_metadata': dict(self.session_metadata),
+            'backend_metadata': dict(self.backend_metadata),
+            'group_id': self.group_id,
+            'name': self.name,
+            'source_description': self.source_description,
+        }
+
+    @classmethod
+    def deserialize(cls, payload: Mapping[str, Any]) -> ObservationRecord:
+        return cls(
+            observation_id=str(payload['observation_id']),
+            raw_text=str(payload.get('raw_text', payload.get('content', ''))),
+            sequence_index=int(payload.get('sequence_index', 0)),
+            timestamp=_datetime_from_string(payload.get('timestamp')) or utc_now(),
+            origin=str(payload.get('origin', 'StateGraph observation')),
+            speaker=payload.get('speaker'),
+            source=payload.get('source'),
+            session_metadata=payload.get('session_metadata') or {},
+            backend_metadata=payload.get('backend_metadata') or {},
+            group_id=str(payload.get('group_id', 'default')),
+            name=str(payload.get('name', 'observation')),
+            source_description=str(
+                payload.get('source_description', 'StateGraph observation')
+            ),
+        )
+
+
 __all__ = [
     'ConditionScope',
     'DependencyStrength',
     'DependencyRelationSelector',
     'EvidenceNode',
+    'EvidenceRecord',
     'Evidence',
     'Observation',
+    'ObservationRecord',
     'RelationType',
     'StateCandidate',
     'State',
@@ -424,6 +897,7 @@ __all__ = [
     'utc_now',
     'attribute_tokens',
     'attributes_compatible',
+    'evidence_id_for',
 ]
 
 # Concise aliases for callers that use the conceptual names from the specification.

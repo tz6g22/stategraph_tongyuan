@@ -10,14 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from stategraph.state.extraction import GraphitiFact
-from stategraph.state.schema import Observation
+from stategraph.state.schema import EvidenceRecord, Observation
 from stategraph.evaluation.profiling import StageProfiler
+
+from .evidence import evidence_from_graphiti_fact
 
 
 @dataclass(frozen=True, slots=True)
 class GraphitiIngestResult:
     episode_id: str
     facts: tuple[GraphitiFact, ...]
+    evidence_records: tuple[EvidenceRecord, ...] = ()
 
 
 class GraphitiAdapter:
@@ -47,6 +50,7 @@ class GraphitiAdapter:
             if trace_path is not None else None
         )
         self._profiler = profiler
+        self._fact_to_evidence: dict[str, str] = {}
 
     def activate_group(self, group_id: str) -> None:
         """Select Graphiti's graph partition before StateGraph repository access."""
@@ -154,7 +158,27 @@ class GraphitiAdapter:
             if len(episode_ids) == 1
             else json.dumps(episode_ids, separators=(',', ':'))
         )
-        return GraphitiIngestResult(stored_episode_id, tuple(unique.values()))
+        unique_facts = tuple(unique.values())
+        evidence_records = tuple(
+            evidence_from_graphiti_fact(
+                fact,
+                observation,
+                index,
+                episode_id=stored_episode_id,
+            )
+            for index, fact in enumerate(unique_facts)
+        )
+        self._fact_to_evidence.update(
+            {
+                fact.fact_id: evidence.evidence_id
+                for fact, evidence in zip(unique_facts, evidence_records, strict=True)
+            }
+        )
+        return GraphitiIngestResult(
+            stored_episode_id,
+            unique_facts,
+            evidence_records,
+        )
 
     def _write_episode_trace(
         self,
@@ -208,6 +232,72 @@ class GraphitiAdapter:
         unique = {fact.fact_id: fact for fact in facts}
         return GraphitiIngestResult(episode_id, tuple(unique.values()))
 
+    def evidence_records_for(
+        self,
+        observation: Observation,
+        result: GraphitiIngestResult,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Project backend facts into deterministic StateGraph evidence records."""
+
+        if result.evidence_records:
+            records = result.evidence_records
+        else:
+            records = tuple(
+                evidence_from_graphiti_fact(
+                    fact,
+                    observation,
+                    index,
+                    episode_id=result.episode_id,
+                )
+                for index, fact in enumerate(result.facts)
+            )
+        self._fact_to_evidence.update(
+            {
+                fact.fact_id: evidence.evidence_id
+                for fact, evidence in zip(result.facts, records, strict=True)
+            }
+        )
+        return records
+
+    def backend_metadata_for(self, result: GraphitiIngestResult) -> dict[str, str]:
+        """Return opaque backend metadata for the generic backend boundary."""
+
+        return {'graphiti_episode_id': result.episode_id}
+
+    def evidence_aliases_for(
+        self,
+        result: GraphitiIngestResult,
+        records: tuple[EvidenceRecord, ...],
+    ) -> dict[str, str]:
+        return {
+            str(fact.fact_id): record.evidence_id
+            for fact, record in zip(result.facts, records, strict=True)
+        }
+
+    def candidate_backend_ids(self, candidate: Any) -> tuple[str, ...]:
+        """Expose legacy IDs only to the optional backend compatibility layer."""
+
+        return tuple(
+            str(value)
+            for value in getattr(candidate, 'graphiti_fact_ids', ())
+            if str(value).strip()
+        )
+
+    def candidate_evidence_aliases(
+        self, candidate: Any, evidence_id: str
+    ) -> dict[str, str]:
+        return {value: evidence_id for value in self.candidate_backend_ids(candidate)}
+
+    async def load_from_evidence(
+        self, observation: Observation, evidence: EvidenceRecord
+    ) -> GraphitiIngestResult | None:
+        """Load an existing episode when a semantic observation is resumed."""
+
+        episode_id = evidence.backend_metadata.get('graphiti_episode_id')
+        if not episode_id:
+            return None
+        return await self.load_observation(str(episode_id))
+
     @staticmethod
     def _convert_result(episode_id: str, nodes: Any, edges: Any) -> GraphitiIngestResult:
         node_names = {node.uuid: node.name for node in nodes}
@@ -246,6 +336,12 @@ class GraphitiAdapter:
             num_results=limit,
         )
         return [str(edge.uuid) for edge in edges]
+
+    async def search_evidence_ids(self, query: str, *, group_id: str, limit: int) -> list[str]:
+        """Return StateGraph evidence IDs while keeping backend IDs at this boundary."""
+
+        fact_ids = await self.search_fact_ids(query, group_id=group_id, limit=limit)
+        return [self._fact_to_evidence[item] for item in fact_ids if item in self._fact_to_evidence]
 
 
 def _decode_episode_ids(value: str) -> list[str]:

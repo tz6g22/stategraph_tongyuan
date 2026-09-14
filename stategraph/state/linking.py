@@ -17,7 +17,7 @@ from .schema import (
     attribute_tokens,
     attributes_compatible,
 )
-from .extraction import ExplicitDependencyIntent
+from .contracts import ExplicitDependencyIntent
 
 
 SemanticSimilarity = Callable[[StateNode, StateNode], float]

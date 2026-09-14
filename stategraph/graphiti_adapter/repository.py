@@ -16,6 +16,7 @@ from stategraph.state.extraction import parse_dependency_relation_selectors
 from stategraph.state.schema import (
     ConditionScope,
     DependencyStrength,
+    EvidenceRecord,
     EvidenceNode,
     RelationType,
     StateNode,
@@ -56,6 +57,7 @@ RETURN s.state_id AS state_id,
        s.status AS status,
        s.confidence AS confidence,
        s.evidence_ids_json AS evidence_ids_json,
+       s.evidence_refs_json AS evidence_refs_json,
        s.graphiti_fact_ids_json AS graphiti_fact_ids_json,
        s.effects_json AS effects_json,
        s.conflicts_json AS conflicts_json,
@@ -77,6 +79,12 @@ RETURN e.evidence_id AS evidence_id,
        e.origin AS origin,
        e.span_start AS span_start,
        e.span_end AS span_end,
+       e.sequence_index AS sequence_index,
+       e.time_scope_start AS time_scope_start,
+       e.time_scope_end AS time_scope_end,
+       e.speaker AS speaker,
+       e.source AS source,
+       e.backend_metadata_json AS backend_metadata_json,
        e.graphiti_episode_id AS graphiti_episode_id,
        e.group_id AS group_id
 """
@@ -249,6 +257,9 @@ def _state_to_row(state: StateNode) -> dict[str, Any]:
         'status': state.status.value,
         'confidence': state.confidence,
         'evidence_ids_json': _json_dump(state.evidence_ids),
+        'evidence_refs_json': _json_dump(state.evidence_refs),
+        # Read/write this column only for old artifact compatibility.  Semantic
+        # code uses evidence_refs above.
         'graphiti_fact_ids_json': _json_dump(state.graphiti_fact_ids),
         'effects_json': _json_dump(
             [
@@ -320,6 +331,12 @@ def _state_from_record(record: Mapping[str, Any]) -> StateNode:
         status=StateStatus(record['status']),
         confidence=float(record.get('confidence', 1.0)),
         evidence_ids=tuple(_json_load(record.get('evidence_ids_json'), [])),
+        evidence_refs=tuple(
+            _json_load(
+                record.get('evidence_refs_json'),
+                _json_load(record.get('evidence_ids_json'), []),
+            )
+        ),
         graphiti_fact_ids=tuple(_json_load(record.get('graphiti_fact_ids_json'), [])),
         effects=effects,
         conflicts=conflicts,
@@ -339,6 +356,7 @@ def _state_from_record(record: Mapping[str, Any]) -> StateNode:
 
 
 def _evidence_to_row(evidence: EvidenceNode) -> dict[str, Any]:
+    backend_metadata = dict(evidence.backend_metadata)
     return {
         'evidence_id': evidence.evidence_id,
         'observation_id': evidence.observation_id,
@@ -347,13 +365,23 @@ def _evidence_to_row(evidence: EvidenceNode) -> dict[str, Any]:
         'origin': evidence.origin,
         'span_start': evidence.span_start,
         'span_end': evidence.span_end,
-        'graphiti_episode_id': evidence.graphiti_episode_id,
+        'sequence_index': evidence.sequence_index,
+        'time_scope_start': _datetime_dump(evidence.time_scope.start),
+        'time_scope_end': _datetime_dump(evidence.time_scope.end),
+        'speaker': evidence.speaker,
+        'source': evidence.source,
+        'backend_metadata_json': _json_dump(backend_metadata),
+        # Preserve the legacy column for old readers; it is not a semantic field.
+        'graphiti_episode_id': backend_metadata.get('graphiti_episode_id'),
         'group_id': evidence.group_id,
     }
 
 
 def _evidence_from_record(record: Mapping[str, Any]) -> EvidenceNode:
-    return EvidenceNode(
+    backend_metadata = _json_load(record.get('backend_metadata_json'), {})
+    if not backend_metadata and record.get('graphiti_episode_id'):
+        backend_metadata = {'graphiti_episode_id': record.get('graphiti_episode_id')}
+    return EvidenceRecord(
         evidence_id=str(record['evidence_id']),
         observation_id=str(record['observation_id']),
         timestamp=_datetime_load(record.get('timestamp')),
@@ -361,7 +389,14 @@ def _evidence_from_record(record: Mapping[str, Any]) -> EvidenceNode:
         origin=str(record['origin']),
         span_start=int(record.get('span_start', 0)),
         span_end=int(record['span_end']) if record.get('span_end') is not None else None,
-        graphiti_episode_id=record.get('graphiti_episode_id'),
+        sequence_index=int(record.get('sequence_index') or 0),
+        time_scope=TimeScope(
+            _datetime_load(record.get('time_scope_start')),
+            _datetime_load(record.get('time_scope_end')),
+        ),
+        speaker=record.get('speaker'),
+        source=record.get('source'),
+        backend_metadata=backend_metadata,
         group_id=str(record.get('group_id', 'default')),
     )
 

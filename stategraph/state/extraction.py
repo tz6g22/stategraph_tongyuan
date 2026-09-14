@@ -1,20 +1,33 @@
-"""Translate Graphiti facts (or structured extractor output) into state candidates."""
+"""Legacy Graphiti-shaped extraction compatibility.
+
+The native semantic contract lives in :mod:`stategraph.state.contracts` and
+:mod:`stategraph.state.native_extraction`.  This module remains only for old
+callers and artifact readers that still provide Graphiti-shaped facts.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Sequence
 
 from .schema import (
     ConditionScope,
-    DependencyRelationSelector,
     Observation,
-    RelationType,
     StateCandidate,
     StateSelector,
     TimeScope,
+    EvidenceRecord,
+    evidence_id_for,
     ensure_utc,
+)
+from .contracts import (
+    ExplicitDependencyIntent,
+    ExtractionResult,
+    NativeStateExtractor,
+    StateExtractor,
+    extract_explicit_dependency_intents,
+    parse_dependency_relation_selectors,
 )
 
 
@@ -43,77 +56,6 @@ class GraphitiFact:
             object.__setattr__(self, 'invalid_at', ensure_utc(self.invalid_at))
 
 
-class StateExtractor(Protocol):
-    def extract(
-        self, observation: Observation, graphiti_facts: Sequence[GraphitiFact]
-    ) -> list[StateCandidate] | Awaitable[list[StateCandidate]]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ExplicitDependencyIntent:
-    """Evidence-grounded relation selectors before endpoint ID resolution."""
-
-    relation_type: RelationType
-    downstream: StateSelector
-    prerequisite: StateSelector
-    reason: str
-
-
-def extract_explicit_dependency_intents(
-    content: str, states: Sequence[Any]
-) -> tuple[ExplicitDependencyIntent, ...]:
-    """Extract unambiguous dependency statements from source evidence.
-
-    A typed phrase must be explicit, and each side must mention exactly one
-    existing state value.  This never links one state's value to another state's
-    entity and never reads a query, answer, or ontology.
-    """
-
-    import re
-
-    def normalise(value: Any) -> str:
-        return ' '.join(re.findall(r'\w+', str(value).casefold(), flags=re.UNICODE))
-
-    def selector(fragment: str) -> StateSelector | None:
-        folded = normalise(fragment)
-        matches = {
-            state.state_id: state
-            for state in states
-            if normalise(state.value) and normalise(state.value) in folded
-        }
-        if len(matches) != 1:
-            return None
-        state = next(iter(matches.values()))
-        return StateSelector(
-            entity=state.entity,
-            attribute=state.attribute,
-            value=str(state.value),
-        )
-
-    intents: list[ExplicitDependencyIntent] = []
-    for sentence in re.findall(r'[^.!?]+(?:[.!?]+|$)', content):
-        match = re.match(
-            r'^\s*(?P<downstream>.+?)\s+depends\s+on\s+(?P<prerequisite>.+?)\s*[.!?]*$',
-            sentence,
-            re.IGNORECASE,
-        )
-        if match is None:
-            continue
-        downstream = selector(match.group('downstream'))
-        prerequisite = selector(match.group('prerequisite'))
-        if downstream is None or prerequisite is None or downstream == prerequisite:
-            continue
-        intents.append(
-            ExplicitDependencyIntent(
-                relation_type=RelationType.DEPENDS_ON,
-                downstream=downstream,
-                prerequisite=prerequisite,
-                reason=sentence.strip(),
-            )
-        )
-    return tuple(intents)
-
-
 class GraphitiFactStateExtractor:
     """Generic extraction from Graphiti's entity/relation/entity fact shape.
 
@@ -124,9 +66,11 @@ class GraphitiFactStateExtractor:
     def extract(
         self, observation: Observation, graphiti_facts: Sequence[GraphitiFact]
     ) -> list[StateCandidate]:
-        return [self._to_candidate(fact) for fact in graphiti_facts]
+        return [self._to_candidate(fact, observation, index) for index, fact in enumerate(graphiti_facts)]
 
-    def _to_candidate(self, fact: GraphitiFact) -> StateCandidate:
+    def _to_candidate(
+        self, fact: GraphitiFact, observation: Observation, sequence_index: int = 0
+    ) -> StateCandidate:
         attributes = dict(fact.attributes)
         entity = str(attributes.get('state_entity') or fact.source_entity)
         attribute = str(attributes.get('state_attribute') or fact.relation)
@@ -183,6 +127,15 @@ class GraphitiFactStateExtractor:
         except (TypeError, ValueError):
             confidence = fact.confidence
 
+        fact_start = observation.content.find(fact.fact)
+        if fact_start < 0:
+            fact_start = observation.content.casefold().find(fact.fact.casefold())
+        fact_end = fact_start + len(fact.fact) if fact_start >= 0 else len(observation.content)
+        fact_span = (
+            observation.content[fact_start:fact_end]
+            if fact_start >= 0
+            else observation.content
+        )
         return StateCandidate(
             entity=entity,
             attribute=attribute,
@@ -193,6 +146,15 @@ class GraphitiFactStateExtractor:
                 conditions, _optional_string(attributes.get('condition_description'))
             ),
             confidence=max(0.0, min(1.0, confidence)),
+            evidence_refs=(
+                evidence_id_for(
+                    observation.observation_id,
+                    fact_span,
+                    sequence_index,
+                    span_start=max(0, fact_start),
+                    span_end=fact_end,
+                ),
+            ),
             graphiti_fact_ids=(fact.fact_id,),
             effects=tuple(effects),
             conflicts=tuple(conflicts),
@@ -209,56 +171,12 @@ def _optional_string(value: Any) -> str | None:
     return None if value is None else str(value)
 
 
-def parse_dependency_relation_selectors(
-    raw_relations: Any,
-) -> tuple[DependencyRelationSelector, ...]:
-    """Parse semantic prerequisites without accepting state identifiers.
-
-    A relation is candidate-relative: the candidate is the downstream state and
-    ``prerequisite`` identifies the state on which it depends.  Both entity and
-    attribute are required so an entity-name match alone can never create an edge.
-    """
-
-    if isinstance(raw_relations, Mapping):
-        raw_relations = (raw_relations,)
-    if not isinstance(raw_relations, Sequence) or isinstance(raw_relations, str | bytes):
-        return ()
-
-    parsed: list[DependencyRelationSelector] = []
-    for raw in raw_relations:
-        if not isinstance(raw, Mapping):
-            continue
-        raw_type = str(raw.get('type') or raw.get('relation_type') or '').strip()
-        try:
-            relation_type = RelationType(raw_type.casefold().replace('_', '-'))
-        except ValueError:
-            continue
-        raw_prerequisite = raw.get('prerequisite', raw.get('target'))
-        if not isinstance(raw_prerequisite, Mapping):
-            continue
-        reason = str(raw.get('reason') or '').strip()
-        try:
-            parsed.append(
-                DependencyRelationSelector(
-                    relation_type=relation_type,
-                    prerequisite=StateSelector(
-                        entity=_optional_string(raw_prerequisite.get('entity')),
-                        attribute=_optional_string(raw_prerequisite.get('attribute')),
-                        value=_optional_string(raw_prerequisite.get('value')),
-                    ),
-                    reason=reason,
-                    evidence_id=_optional_string(raw.get('evidence_id')),
-                )
-            )
-        except ValueError:
-            continue
-    return tuple(parsed)
-
-
 __all__ = [
     'ExplicitDependencyIntent',
+    'ExtractionResult',
     'GraphitiFact',
     'GraphitiFactStateExtractor',
+    'NativeStateExtractor',
     'StateExtractor',
     'extract_explicit_dependency_intents',
     'parse_dependency_relation_selectors',

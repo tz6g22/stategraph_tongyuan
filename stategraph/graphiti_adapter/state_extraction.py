@@ -14,17 +14,22 @@ from stategraph.state.extraction import GraphitiFact
 from stategraph.state.schema import (
     ConditionScope,
     Observation,
+    ObservationRecord,
     StateCandidate,
     StateSelector,
     TimeScope,
     attributes_compatible,
     canonical_field_id,
+    evidence_id_for,
     ensure_utc,
 )
+from stategraph.state.contracts import ExtractionResult
 from stategraph.state.provenance import attach_canonical_slot_provenance
 from stategraph.evaluation.profiling import StageProfiler
+from stategraph.state.native_extraction import StateGraphNativeStateExtractor
 
 from .dependency_discovery import AutomaticDependencyDiscovery
+from .evidence import evidence_from_graphiti_fact
 
 
 logger = logging.getLogger(__name__)
@@ -61,12 +66,11 @@ _ROLE_LABEL_ENTITIES = frozenset({'speaker', 'user_agent', 'ai_agent', 'assistan
 
 
 class GraphitiLLMStateExtractor:
-    """Extract state semantics without dataset labels or benchmark-specific rules.
+    """Compatibility facade for the StateGraph native extractor.
 
-    Entity names and fact identifiers are supplied from Graphiti. The state call
-    identifies state slots, scopes, confidence, and invalidation effects. Dependency
-    discovery runs after direct revision so it can inspect both new and relevant
-    persisted states.
+    Production ``native_mode`` routes raw ObservationRecord values through
+    :class:`StateGraphNativeStateExtractor`; the two-argument GraphitiFact path is
+    retained only for old callers and artifact compatibility.
     """
 
     def __init__(
@@ -79,6 +83,7 @@ class GraphitiLLMStateExtractor:
         max_llm_characters: int = 1800,
         trace_path: str | Path | None = None,
         profiler: StageProfiler | None = None,
+        native_mode: bool = False,
     ) -> None:
         if not hasattr(llm_client, 'generate_response'):
             raise TypeError('llm_client must provide generate_response()')
@@ -96,6 +101,21 @@ class GraphitiLLMStateExtractor:
         self._dependency_discovery = AutomaticDependencyDiscovery(
             llm_client, trace_path=dependency_trace_path, profiler=profiler
         )
+        # Compatibility facade: production receives an ObservationRecord and is
+        # routed to the backend-neutral extractor.  The two-argument method below
+        # remains only for old callers/artifacts that still provide Graphiti facts.
+        self.native_observation_only = native_mode
+        self._native_extractor = StateGraphNativeStateExtractor(
+            llm_client,
+            max_output_tokens=8192,
+            trace_path=trace_path,
+            dependency_discovery=self._dependency_discovery,
+            profiler=profiler,
+        )
+
+    @property
+    def native_extractor(self) -> StateGraphNativeStateExtractor:
+        return self._native_extractor
 
     async def discover_and_verify_dependencies(
         self,
@@ -149,12 +169,17 @@ class GraphitiLLMStateExtractor:
     async def extract(
         self,
         observation: Observation,
-        graphiti_facts: Sequence[GraphitiFact],
+        graphiti_facts: Sequence[GraphitiFact] | None = None,
         *,
         _chunk_index: int = 0,
         _chunk_count: int = 1,
         _chunk_start: int = 0,
-    ) -> list[StateCandidate]:
+    ) -> list[StateCandidate] | ExtractionResult:
+        if graphiti_facts is None or isinstance(observation, ObservationRecord):
+            return await self._native_extractor.extract(
+                observation if isinstance(observation, ObservationRecord)
+                else ObservationRecord.from_observation(observation)
+            )
         if self._profiler is None:
             return await self._extract_unprofiled(
                 observation,
@@ -400,6 +425,7 @@ class GraphitiLLMStateExtractor:
             raise ValueError('state extraction response must contain a states array')
         allowed_fact_ids = {fact.fact_id for fact in graphiti_facts}
         facts_by_id = {fact.fact_id: fact for fact in graphiti_facts}
+        fact_indices = {fact.fact_id: index for index, fact in enumerate(graphiti_facts)}
         candidates: list[StateCandidate] = []
         rejected: list[dict[str, Any]] = []
         for index, raw in enumerate(raw_states):
@@ -576,6 +602,22 @@ class GraphitiLLMStateExtractor:
                     raw_conditions, _optional_string(raw.get('condition_description'))
                 ),
                 confidence=max(0.0, min(1.0, confidence)),
+                evidence_refs=tuple(
+                    evidence_from_graphiti_fact(
+                        fact,
+                        observation,
+                        fact_indices[fact.fact_id],
+                    ).evidence_id
+                    for fact in backing_facts
+                ) or (
+                    evidence_id_for(
+                        observation.observation_id,
+                        evidence_span,
+                        index,
+                        span_start=evidence_start,
+                        span_end=evidence_start + len(evidence_span),
+                    ),
+                ),
                 graphiti_fact_ids=fact_ids,
                 effects=effects,
                 conflicts=conflicts,
@@ -1106,7 +1148,7 @@ def _validate_value_polarity(
         same_source_sentence = sentence_start <= value_position <= sentence_end
     if (
         raw_value_span
-        and not candidate.graphiti_fact_ids
+        and not metadata.get('supporting_fact_count')
         and folded_value not in folded_evidence
         and value_tokens
         and not grounded_token_overlap

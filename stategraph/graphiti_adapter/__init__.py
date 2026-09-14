@@ -8,6 +8,7 @@ from .dependency_discovery import (
 )
 from .repository import GraphitiStateRepository
 from .state_extraction import GraphitiLLMStateExtractor
+from .evidence import evidence_from_graphiti_fact
 
 __all__ = [
     'GraphitiAdapter',
@@ -18,5 +19,6 @@ __all__ = [
     'GraphitiIngestResult',
     'GraphitiLLMStateExtractor',
     'GraphitiStateRepository',
+    'evidence_from_graphiti_fact',
     'generate_dependency_candidates',
 ]

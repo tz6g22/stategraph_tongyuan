@@ -17,6 +17,7 @@ from stategraph.state.schema import (
     StateNode,
     StateStatus,
 )
+from stategraph.state.dependency import DependencyAssessment, DependencyCandidate
 from stategraph.evaluation.provider_resilience import (
     SEMANTIC_CONTRACT_FAILURE,
     ContractViolation,
@@ -162,29 +163,6 @@ DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class DependencyCandidate:
-    prerequisite_state_id: str
-    dependent_state_id: str
-    proposed_relation: RelationType | None
-    candidate_evidence: tuple[str, ...]
-    provenance: Mapping[str, Any]
-    candidate_reason: str
-    signals: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class DependencyAssessment:
-    candidate: DependencyCandidate
-    strength: DependencyStrength
-    relation_type: RelationType | None
-    verification_reason: str
-    verifier_confidence: float
-    supporting_evidence_ids: tuple[str, ...] = ()
-    evidence_span: str | None = None
-    evidence_spans: tuple[str, ...] = ()
-
-
 def generate_dependency_candidates(
     observation: Observation,
     *,
@@ -239,8 +217,8 @@ def generate_dependency_candidates(
             'observation_id': observation.observation_id,
             'prerequisite_evidence_ids': list(prerequisite.evidence_ids),
             'dependent_evidence_ids': list(dependent.evidence_ids),
-            'shared_graphiti_fact_ids': sorted(
-                set(prerequisite.graphiti_fact_ids) & set(dependent.graphiti_fact_ids)
+            'shared_evidence_ids': sorted(
+                set(prerequisite.evidence_refs) & set(dependent.evidence_refs)
             ),
         }
         previous = by_key.get(key)
@@ -1192,10 +1170,10 @@ def _relevant_states(
         if state.status not in {StateStatus.CURRENT, StateStatus.UNCERTAIN} and state.state_id not in seed_ids:
             continue
         subject = (state.canonical_subject_id or state.entity).strip().casefold()
-        shared_graphiti = any(
-            set(state.graphiti_fact_ids) & set(new.graphiti_fact_ids) for new in new_states
+        shared_evidence = any(
+            set(state.evidence_refs) & set(new.evidence_refs) for new in new_states
         )
-        if state.state_id in seed_ids or shared_graphiti or (subject and subject in folded):
+        if state.state_id in seed_ids or shared_evidence or (subject and subject in folded):
             selected[state.state_id] = state
     return tuple(selected[state_id] for state_id in sorted(selected))
 
@@ -1500,7 +1478,7 @@ def _shares_provenance(left: StateNode, right: StateNode) -> bool:
     left_execution = str(left.metadata.get('execution_provenance_id') or '').strip()
     right_execution = str(right.metadata.get('execution_provenance_id') or '').strip()
     return bool(
-        set(left.graphiti_fact_ids) & set(right.graphiti_fact_ids)
+        set(left.evidence_refs) & set(right.evidence_refs)
         or (left_execution and left_execution == right_execution)
     )
 

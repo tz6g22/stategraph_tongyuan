@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from stategraph.graphiti_adapter.dependency_discovery import DependencyCandidate
+from stategraph.state.dependency import DependencyCandidate
 from stategraph.state.schema import RelationType, StateNode
 
 

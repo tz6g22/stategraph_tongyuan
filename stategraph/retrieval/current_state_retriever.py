@@ -6,7 +6,7 @@ import re
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from stategraph.state.schema import (
     EvidenceNode,
@@ -22,8 +22,17 @@ from stategraph.storage.base import StateRepository
 from .premise_checker import Premise, PremiseCheckResult, PremiseChecker
 
 
-class GraphFactSearch(Protocol):
-    async def search_fact_ids(self, query: str, *, group_id: str, limit: int) -> list[str]: ...
+class EvidenceSearch(Protocol):
+    async def search_evidence_ids(self, query: str, *, group_id: str, limit: int) -> list[str]: ...
+
+
+GraphFactSearch = EvidenceSearch
+
+
+class StateCandidateSource(Protocol):
+    async def list_candidates(
+        self, *, group_id: str, statuses: set[StateStatus]
+    ) -> list[StateNode]: ...
 
 
 class EvidenceGroundingError(RuntimeError):
@@ -203,12 +212,22 @@ class CurrentStateRetriever:
     def __init__(
         self,
         repository: StateRepository,
-        graph_search: GraphFactSearch | None = None,
+        graph_search: EvidenceSearch | None = None,
         premise_checker: PremiseChecker | None = None,
+        candidate_source: StateCandidateSource | None = None,
     ) -> None:
         self._repository = repository
         self._graph_search = graph_search
         self._premise_checker = premise_checker or PremiseChecker()
+        self._candidate_source = candidate_source
+        self._backend_evidence_aliases: dict[str, str] = {}
+
+    def register_evidence_aliases(self, aliases: Mapping[str, str]) -> None:
+        """Register opaque backend-result aliases at the adapter boundary."""
+
+        self._backend_evidence_aliases.update(
+            {str(key): str(value) for key, value in aliases.items()}
+        )
 
     async def retrieve(
         self,
@@ -226,12 +245,22 @@ class CurrentStateRetriever:
             tuple(premises) if premises is not None else self._premise_checker.extract(query)
         )
 
-        available = await self._repository.list_states(
-            group_id, {StateStatus.CURRENT, StateStatus.UNCERTAIN}
-        )
-        stale_history = await self._repository.list_states(
-            group_id, {StateStatus.STALE, StateStatus.HISTORICAL}
-        )
+        if self._candidate_source is None:
+            available = await self._repository.list_states(
+                group_id, {StateStatus.CURRENT, StateStatus.UNCERTAIN}
+            )
+            stale_history = await self._repository.list_states(
+                group_id, {StateStatus.STALE, StateStatus.HISTORICAL}
+            )
+        else:
+            available = await self._candidate_source.list_candidates(
+                group_id=group_id,
+                statuses={StateStatus.CURRENT, StateStatus.UNCERTAIN},
+            )
+            stale_history = await self._candidate_source.list_candidates(
+                group_id=group_id,
+                statuses={StateStatus.STALE, StateStatus.HISTORICAL},
+            )
         current = [state for state in available if state.is_effective(at)]
         current = self._resolve_temporary_exceptions(query, current)
         conflict_candidates = [
@@ -242,11 +271,23 @@ class CurrentStateRetriever:
             and state.time_scope.is_effective(at)
         ]
 
-        graphiti_fact_ids: set[str] = set()
+        evidence_ids: set[str] = set()
         if self._graph_search is not None:
-            graphiti_fact_ids = set(
-                await self._graph_search.search_fact_ids(query, group_id=group_id, limit=limit)
-            )
+            search = getattr(self._graph_search, 'search_evidence_ids', None)
+            if search is not None:
+                evidence_ids = set(
+                    await search(query, group_id=group_id, limit=limit)
+                )
+            else:
+                legacy_search = getattr(self._graph_search, 'search_fact_ids', None)
+                if legacy_search is not None:
+                    backend_ids = await legacy_search(
+                        query, group_id=group_id, limit=limit
+                    )
+                    evidence_ids = {
+                        self._backend_evidence_aliases.get(str(item), str(item))
+                        for item in backend_ids
+                    }
 
         dependency_types = {
             RelationType.DEPENDS_ON,
@@ -258,9 +299,9 @@ class CurrentStateRetriever:
             state for state in stale_history
             if state.status == StateStatus.STALE
             and state.time_scope.is_effective(at)
-            and self._score(query, state, graphiti_fact_ids) > 0
+            and self._score(query, state, evidence_ids) > 0
         ]
-        shadowed = self._shadowed_current_states(query, current, stale_for_query, graphiti_fact_ids)
+        shadowed = self._shadowed_current_states(query, current, stale_for_query, evidence_ids)
         current = [state for state in current if state.state_id not in shadowed]
         historical = [
             state for state in stale_history
@@ -270,7 +311,7 @@ class CurrentStateRetriever:
         ]
         selectable = [*current, *conflict_candidates, *historical]
         canonical_subject_ids = self._resolve_canonical_subjects(
-            query, selectable, graphiti_fact_ids
+            query, selectable, evidence_ids
         )
         selection_pool = selectable
         subject_scoped = False
@@ -286,14 +327,14 @@ class CurrentStateRetriever:
                 selection_pool = [
                     state for state in selectable
                     if state.state_id in scoped_ids
-                    or self._score(query, state, graphiti_fact_ids) > 0
+                    or self._score(query, state, evidence_ids) > 0
                 ]
                 subject_scoped = True
         selected, coverage_assignments, expansion_sources, candidate_trace = (
             self._select_dependency_states(
                 query,
                 selection_pool,
-                graphiti_fact_ids,
+                evidence_ids,
                 dependencies,
                 limit,
             )
@@ -320,7 +361,7 @@ class CurrentStateRetriever:
                     f'state {state.state_id} references missing evidence: {missing}'
                 )
             item = GroundedState(
-                state, tuple(evidence), self._score(query, state, graphiti_fact_ids)
+                state, tuple(evidence), self._score(query, state, evidence_ids)
             )
             if state.status == StateStatus.CURRENT:
                 grounded.append(item)
@@ -348,7 +389,7 @@ class CurrentStateRetriever:
                 'normalized_query_tokens': list(self._field_tokens(query)),
                 'canonical_subject_ids': list(canonical_subject_ids),
                 'subject_scoped': subject_scoped,
-                'graphiti_fact_ids': sorted(graphiti_fact_ids),
+                'evidence_ids': sorted(evidence_ids),
                 'candidates': candidate_trace,
                 'coverage_assignments': coverage_assignments,
                 'relation_expansion_sources': expansion_sources,
@@ -371,9 +412,9 @@ class CurrentStateRetriever:
         )
 
     @staticmethod
-    def _score(query: str, state: StateNode, graphiti_fact_ids: set[str]) -> float:
+    def _score(query: str, state: StateNode, evidence_ids: set[str]) -> float:
         components = CurrentStateRetriever._score_components(
-            query, state, graphiti_fact_ids
+            query, state, evidence_ids
         )
         return components['final_score']
 
@@ -382,9 +423,9 @@ class CurrentStateRetriever:
         cls,
         query: str,
         state: StateNode,
-        graphiti_fact_ids: set[str],
+        evidence_ids: set[str],
     ) -> dict[str, float]:
-        graph_score = 0.5 if graphiti_fact_ids.intersection(state.graphiti_fact_ids) else 0.0
+        graph_score = 0.5 if evidence_ids.intersection(state.evidence_refs) else 0.0
         raw_query_tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
         query_tokens = {
             token for token in re.findall(r'\w+', query.casefold(), flags=re.UNICODE)
@@ -481,7 +522,7 @@ class CurrentStateRetriever:
     def _resolve_canonical_subjects(
         query: str,
         states: Sequence[StateNode],
-        graphiti_fact_ids: set[str],
+        evidence_ids: set[str],
     ) -> tuple[str, ...]:
         """Resolve subjects only from direct query identity or anchored provenance."""
 
@@ -494,7 +535,7 @@ class CurrentStateRetriever:
             subject_text = ' '.join(re.findall(r'\w+', subject.casefold(), flags=re.UNICODE))
             direct_match = bool(subject_text and subject_text in query_text)
             provenance_match = bool(
-                graphiti_fact_ids.intersection(state.graphiti_fact_ids)
+                evidence_ids.intersection(state.evidence_refs)
             )
             if direct_match or provenance_match:
                 subjects.add(subject)
@@ -536,7 +577,7 @@ class CurrentStateRetriever:
         cls,
         query: str,
         states: list[StateNode],
-        graphiti_fact_ids: set[str],
+        evidence_ids: set[str],
         dependencies: Sequence[StateRelation],
         limit: int,
     ) -> tuple[list[StateNode], dict[str, int], dict[str, str], list[dict[str, Any]]]:
@@ -550,7 +591,7 @@ class CurrentStateRetriever:
         def rank_key(state: StateNode) -> tuple[float, float, bool, float, float, str]:
             return (
                 -max(intent_scores(state), default=0.0),
-                -cls._score(query, state, graphiti_fact_ids),
+                -cls._score(query, state, evidence_ids),
                 state.status != StateStatus.CURRENT,
                 -state.confidence,
                 -state.observed_at.timestamp(),
@@ -561,7 +602,7 @@ class CurrentStateRetriever:
         relevant = [
             state
             for state in ranked
-            if cls._score(query, state, graphiti_fact_ids) > 0 or not query.strip()
+            if cls._score(query, state, evidence_ids) > 0 or not query.strip()
         ]
         # A continuity query can match a meta-relation's wording (for example
         # ``unrelated to the schedule``) while missing the co-occurring direct
@@ -606,7 +647,7 @@ class CurrentStateRetriever:
                     ).casefold()
                     if not (
                         set(re.findall(r'\w+', text)) & _META_RELATION_MARKERS
-                        and cls._score(query, state, graphiti_fact_ids) > 0
+                        and cls._score(query, state, evidence_ids) > 0
                     ):
                         continue
                     siblings = direct_by_observation.get(state.observation_id, [])
@@ -632,7 +673,7 @@ class CurrentStateRetriever:
                     (cls._field_overlap(intent, state) for intent in intents),
                     default=0.0,
                 ),
-                -cls._score(query, state, graphiti_fact_ids),
+                -cls._score(query, state, evidence_ids),
                 -max(intent_scores(state), default=0.0),
                 state.status != StateStatus.CURRENT,
                 state.state_id,
@@ -650,7 +691,7 @@ class CurrentStateRetriever:
         provenance_anchor = (
             min(relevant, key=provenance_rank)
             if relevant and max_field_overlap >= 0.4
-            else min(relevant, key=lambda state: (-cls._score(query, state, graphiti_fact_ids), state.state_id))
+            else min(relevant, key=lambda state: (-cls._score(query, state, evidence_ids), state.state_id))
             if relevant
             else None
         )
@@ -688,7 +729,7 @@ class CurrentStateRetriever:
         candidate_trace = []
         relevant_ids = {state.state_id for state in relevant}
         for state in ranked:
-            components = cls._score_components(query, state, graphiti_fact_ids)
+            components = cls._score_components(query, state, evidence_ids)
             per_intent = [
                 {
                     'intent_index': index,
@@ -962,7 +1003,7 @@ class CurrentStateRetriever:
         query: str,
         current: Sequence[StateNode],
         stale: Sequence[StateNode],
-        graphiti_fact_ids: set[str],
+        evidence_ids: set[str],
     ) -> set[str]:
         """Hide older same-subject claims when a newer stale claim shadows them.
 
@@ -1115,4 +1156,5 @@ __all__ = [
     'EvidenceGroundingError',
     'GraphFactSearch',
     'GroundedState',
+    'StateCandidateSource',
 ]

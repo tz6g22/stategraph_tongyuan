@@ -1,4 +1,4 @@
-"""End-to-end StateGraph orchestration over an unchanged Graphiti instance."""
+"""End-to-end StateGraph semantic orchestration over a pluggable backend."""
 
 from __future__ import annotations
 
@@ -12,34 +12,37 @@ from pathlib import Path
 from typing import Any, Sequence
 from uuid import NAMESPACE_URL, uuid5
 
-from stategraph.graphiti_adapter import (
-    DependencyAssessment,
-    DependencyCandidate,
-    GraphitiAdapter,
-    GraphitiLLMStateExtractor,
-    GraphitiStateRepository,
-)
+from stategraph.backend import NativeStateGraphBackend, StateGraphBackend
+from stategraph.backend.base import AdapterBackend, BackendObservationResult
 from stategraph.propagation import (
     DependencyGraph,
     InvalidationPropagation,
     PropagationStep,
 )
-from stategraph.retrieval import CurrentStateRetrieval, CurrentStateRetriever, Premise
+from stategraph.retrieval import (
+    CurrentStateRetrieval,
+    Premise,
+    StateGraphNativeRetriever,
+)
 from stategraph.revision import ConflictDetector, RevisionResult, StateRevision
 from stategraph.relation_typing import type_relation_candidates
 from stategraph.state import (
     DependencyRelationSelector,
     DependencyStrength,
+    EvidenceRecord,
     EvidenceNode,
     Observation,
+    ObservationRecord,
     RelationType,
     StateCandidate,
-    StateExtractor,
     StateLinker,
     StateNode,
     StateRelation,
     StateStatus,
+    evidence_id_for,
 )
+from stategraph.state.contracts import StateExtractor
+from stategraph.state.dependency import DependencyAssessment, DependencyCandidate
 from stategraph.evaluation.profiling import StageProfiler
 from stategraph.storage import InMemoryStateRepository, StateRepository
 
@@ -68,17 +71,18 @@ class IngestResult:
 
 
 class StateGraph:
-    """State lifecycle layer that delegates graph memory to Graphiti.
+    """State lifecycle layer over a StateGraph-owned backend contract.
 
-    Use :meth:`from_graphiti` in production.  The default in-memory repository exists
-    only for deterministic local execution and method-level tests.
+    ``graphiti_adapter`` remains a compatibility-only constructor argument for old
+    callers.  New production code should pass ``backend=``.
     """
 
     def __init__(
         self,
         repository: StateRepository | None = None,
         *,
-        graphiti_adapter: GraphitiAdapter | None = None,
+        backend: StateGraphBackend | None = None,
+        graphiti_adapter: Any | None = None,
         extractor: StateExtractor | None = None,
         linker: StateLinker | None = None,
         conflict_detector: ConflictDetector | None = None,
@@ -90,22 +94,54 @@ class StateGraph:
             raise ValueError(
                 "stop_after must be None, 'relation_typing', or 'dependency_verification'"
             )
-        self.repository = repository or InMemoryStateRepository()
-        self.graphiti_adapter = graphiti_adapter
+        if backend is not None and graphiti_adapter is not None:
+            raise ValueError('pass backend or graphiti_adapter, not both')
+        if backend is None:
+            if graphiti_adapter is not None:
+                backend = AdapterBackend(
+                    graphiti_adapter,
+                    repository or InMemoryStateRepository(),
+                )
+            else:
+                backend = NativeStateGraphBackend(repository)
+        self.backend = backend
+        self.repository = repository or backend.repository
         self.extractor = extractor
         self.linker = linker or StateLinker()
         self.revision = StateRevision(self.repository, conflict_detector)
         self.dependencies = DependencyGraph(self.repository)
         self.invalidation = InvalidationPropagation(self.repository)
-        self.retriever = CurrentStateRetriever(
-            self.repository,
-            graph_search=self.graphiti_adapter,
-        )
+        # Production StateGraph retrieval is repository-native.  A backend's
+        # optional search adapter remains available only to explicit compatibility
+        # callers; it is never a fallback here.
+        self.retriever = StateGraphNativeRetriever(self.repository)
         self._ingest_lock = asyncio.Lock()
         self._next_observation_index: dict[str, int] = {}
         self._revision_trace_path = revision_trace_path
         self._stop_after = stop_after
         self._profiler = profiler
+
+    @classmethod
+    def from_backend(
+        cls,
+        backend: StateGraphBackend,
+        *,
+        extractor: StateExtractor | None = None,
+        linker: StateLinker | None = None,
+        conflict_detector: ConflictDetector | None = None,
+        revision_trace_path: str | Path | None = None,
+        profiler: StageProfiler | None = None,
+    ) -> StateGraph:
+        """Construct StateGraph from a backend without naming its implementation."""
+
+        return cls(
+            backend=backend,
+            extractor=extractor,
+            linker=linker,
+            conflict_detector=conflict_detector,
+            revision_trace_path=revision_trace_path,
+            profiler=profiler,
+        )
 
     @classmethod
     def from_graphiti(
@@ -119,18 +155,15 @@ class StateGraph:
         revision_trace_path: str | Path | None = None,
         profiler: StageProfiler | None = None,
     ) -> StateGraph:
-        adapter = GraphitiAdapter(
-            graphiti, trace_path=extraction_trace_path, profiler=profiler
-        )
-        effective_extractor = extractor or GraphitiLLMStateExtractor(
-            graphiti.llm_client,
-            trace_path=extraction_trace_path,
-            profiler=profiler,
-        )
-        return cls(
-            GraphitiStateRepository(graphiti),
-            graphiti_adapter=adapter,
-            extractor=effective_extractor,
+        # Compatibility factory.  Graphiti construction is kept in the optional
+        # backend module; the StateGraph constructor itself accepts only a backend.
+        from stategraph.compatibility.graphiti_factory import from_graphiti
+
+        return from_graphiti(
+            cls,
+            graphiti,
+            extractor=extractor,
+            extraction_trace_path=extraction_trace_path,
             linker=linker,
             conflict_detector=conflict_detector,
             revision_trace_path=revision_trace_path,
@@ -163,52 +196,97 @@ class StateGraph:
         """Implementation kept separate so profiling adds no semantic branch."""
 
         async with self._ingest_lock:
-            if self.graphiti_adapter is not None:
-                await self.graphiti_adapter.ensure_group(observation.group_id)
+            await self.backend.ensure_group(observation.group_id)
             observation_index = await self._observation_index(observation)
-            evidence_id = f'evidence:{observation.observation_id}'
+            evidence_id = evidence_id_for(
+                observation.observation_id,
+                observation.content,
+                0,
+                span_start=0,
+                span_end=len(observation.content),
+            )
             existing_evidence = await self.repository.get_evidence((evidence_id,))
-            graphiti_result = None
-            if self.graphiti_adapter is not None:
-                if existing_evidence and existing_evidence[0].graphiti_episode_id:
-                    graphiti_result = await self.graphiti_adapter.load_observation(
-                        existing_evidence[0].graphiti_episode_id
+            if not existing_evidence:
+                # Compatibility read for pre-Module-1 snapshots.  New writes use
+                # the deterministic evidence_id_for contract above.
+                existing_evidence = await self.repository.get_evidence(
+                    (f'evidence:{observation.observation_id}',)
+                )
+            backend_result: BackendObservationResult | None = None
+            native_extraction = False
+            native_evidence_records: tuple[EvidenceRecord, ...] = ()
+            if candidates is None and getattr(self.extractor, 'native_observation_only', False):
+                # The semantic extractor owns the raw observation boundary.  Any
+                # Graphiti persistence happens below, after candidates exist.
+                native_observation = ObservationRecord.from_observation(
+                    observation, sequence_index=observation_index
+                )
+                extraction = self.extractor.extract(native_observation)
+                native_result = (
+                    await extraction if inspect.isawaitable(extraction) else extraction
+                )
+                if not hasattr(native_result, 'state_candidates'):
+                    raise TypeError(
+                        'native extractor must return ExtractionResult'
                     )
-                else:
-                    graphiti_result = await self.graphiti_adapter.ingest_observation(observation)
+                extracted = list(native_result.state_candidates)
+                native_evidence_records = tuple(native_result.evidence_records)
+                native_extraction = True
+            backend_result = await self.backend.persist_observation(
+                observation,
+                existing_evidence[0] if existing_evidence else None,
+            )
 
             evidence = (
                 existing_evidence[0]
                 if existing_evidence
-                else EvidenceNode(
-                    evidence_id=evidence_id,
+                else EvidenceRecord.create(
                     observation_id=observation.observation_id,
-                    timestamp=observation.occurred_at,
-                    original_text=observation.content,
+                    source_text=observation.content,
                     origin=observation.origin,
-                    graphiti_episode_id=(
-                        graphiti_result.episode_id if graphiti_result is not None else None
+                    span_start=0,
+                    span_end=len(observation.content),
+                    sequence_index=0,
+                    timestamp=observation.occurred_at,
+                    backend_metadata=(
+                        dict(backend_result.backend_metadata)
+                        if backend_result is not None
+                        else {}
                     ),
                     group_id=observation.group_id,
                 )
             )
             await self.repository.save_evidence(evidence)
 
-            facts = graphiti_result.facts if graphiti_result is not None else ()
+            backend_records = (
+                backend_result.legacy_inputs if backend_result is not None else ()
+            )
+            evidence_records = (
+                native_evidence_records
+                if native_extraction
+                else (
+                    backend_result.evidence_records
+                    if backend_result is not None
+                    else ()
+                )
+            )
+            evidence_by_ref = {item.evidence_id: item for item in evidence_records}
+            self.retriever.register_evidence_aliases(
+                backend_result.evidence_aliases if backend_result is not None else {}
+            )
             if candidates is not None:
                 extracted = list(candidates)
-            else:
+            elif not native_extraction:
                 if self.extractor is None:
                     raise RuntimeError(
                         'StateGraph ingestion requires an explicit extractor or candidates'
                     )
-                extraction = self.extractor.extract(observation, facts)
+                extraction = self.extractor.extract(observation, backend_records)
                 extracted = (
                     list(await extraction) if inspect.isawaitable(extraction) else extraction
                 )
             revisions: list[RevisionResult] = []
             direct_invalidation_seeds: list[str] = []
-            facts_by_id = {fact.fact_id: fact for fact in facts}
 
             # Link the complete observation against one pre-revision snapshot.
             # This preserves the observation-level contract: no candidate can
@@ -224,11 +302,18 @@ class StateGraph:
                     observation,
                     evidence,
                     candidate,
-                    facts_by_id,
+                    evidence_by_ref,
                     sequence_index,
                 )
                 for item in candidate_evidence:
                     await self.repository.save_evidence(item)
+                backend_ids = self.backend.candidate_backend_ids(candidate)
+                if backend_ids:
+                    self.retriever.register_evidence_aliases(
+                        self.backend.candidate_evidence_aliases(
+                            candidate, candidate_evidence[0].evidence_id
+                        )
+                    )
                 state = StateNode.create(
                     entity=candidate.entity,
                     attribute=candidate.attribute,
@@ -240,7 +325,8 @@ class StateGraph:
                     time_scope=candidate.time_scope,
                     condition_scope=candidate.condition_scope,
                     confidence=candidate.confidence,
-                    graphiti_fact_ids=candidate.graphiti_fact_ids,
+                    evidence_refs=tuple(item.evidence_id for item in candidate_evidence),
+                    graphiti_fact_ids=backend_ids,
                     effects=candidate.effects,
                     conflicts=candidate.conflicts,
                     dependency_relations=tuple(
@@ -511,12 +597,16 @@ class StateGraph:
                     return IngestResult(
                         observation_id=observation.observation_id,
                         graphiti_episode_id=(
-                            graphiti_result.episode_id if graphiti_result is not None else None
+                            backend_result.backend_observation_id
+                            if backend_result is not None else None
                         ),
                         evidence=evidence,
                         revisions=tuple(revisions),
                         invalidated_state_ids=tuple(dict.fromkeys(direct_invalidation_seeds)),
-                        graphiti_fact_count=len(facts),
+                        graphiti_fact_count=(
+                            backend_result.backend_record_count
+                            if backend_result is not None else 0
+                        ),
                         extracted_state_count=len(extracted),
                         dependency_candidates=dependency_candidates,
                         typed_dependency_candidates=typed_dependency_candidates,
@@ -559,12 +649,16 @@ class StateGraph:
                 return IngestResult(
                     observation_id=observation.observation_id,
                     graphiti_episode_id=(
-                        graphiti_result.episode_id if graphiti_result is not None else None
+                        backend_result.backend_observation_id
+                        if backend_result is not None else None
                     ),
                     evidence=evidence,
                     revisions=tuple(revisions),
                     invalidated_state_ids=tuple(dict.fromkeys(direct_invalidation_seeds)),
-                    graphiti_fact_count=len(facts),
+                    graphiti_fact_count=(
+                        backend_result.backend_record_count
+                        if backend_result is not None else 0
+                    ),
                     extracted_state_count=len(extracted),
                     dependency_candidates=dependency_candidates,
                     typed_dependency_candidates=typed_dependency_candidates,
@@ -599,12 +693,16 @@ class StateGraph:
             return IngestResult(
                 observation_id=observation.observation_id,
                 graphiti_episode_id=(
-                    graphiti_result.episode_id if graphiti_result is not None else None
+                    backend_result.backend_observation_id
+                    if backend_result is not None else None
                 ),
                 evidence=evidence,
                 revisions=tuple(revisions),
                 invalidated_state_ids=propagation.invalidated_state_ids,
-                graphiti_fact_count=len(facts),
+                graphiti_fact_count=(
+                    backend_result.backend_record_count
+                    if backend_result is not None else 0
+                ),
                 extracted_state_count=len(extracted),
                 dependency_relations=dependency_relations,
                 unresolved_dependency_relations=tuple(unresolved_dependency_relations),
@@ -710,8 +808,7 @@ class StateGraph:
         limit: int = 10,
         premises: Sequence[Premise] | None = None,
     ) -> CurrentStateRetrieval:
-        if self.graphiti_adapter is not None:
-            await self.graphiti_adapter.ensure_group(group_id)
+        await self.backend.ensure_group(group_id)
         return await self.retriever.retrieve(
             query, group_id=group_id, at=at, limit=limit, premises=premises
         )
@@ -721,8 +818,7 @@ class StateGraph:
     ) -> tuple[str, ...]:
         """Move elapsed current states to historical without deleting them."""
 
-        if self.graphiti_adapter is not None:
-            await self.graphiti_adapter.ensure_group(group_id)
+        await self.backend.ensure_group(group_id)
         current = await self.repository.list_states(group_id, {StateStatus.CURRENT})
         elapsed = [
             state.with_status(StateStatus.HISTORICAL)
@@ -734,6 +830,16 @@ class StateGraph:
             (state.state_id for state in elapsed), group_id=group_id
         )
         return propagation.invalidated_state_ids
+
+    async def flush(self) -> None:
+        """Flush optional backend state without exposing backend implementation."""
+
+        await self.backend.flush()
+
+    async def close(self) -> None:
+        """Close the configured backend through the generic boundary."""
+
+        await self.backend.close()
 
 
 def _relation_from_assessment(
@@ -818,55 +924,48 @@ def _candidate_evidence_nodes(
     observation: Observation,
     observation_evidence: EvidenceNode,
     candidate: StateCandidate,
-    facts_by_id: dict[str, Any],
+    evidence_by_ref: dict[str, EvidenceRecord],
     sequence_index: int,
 ) -> tuple[EvidenceNode, ...]:
-    """Ground candidate facts to exact source spans when Graphiti preserves wording."""
+    """Ground candidate provenance through generic StateGraph evidence records."""
 
-    grounded: list[EvidenceNode] = []
-    for fact_id in candidate.graphiti_fact_ids:
-        fact = facts_by_id.get(fact_id)
-        fact_text = str(getattr(fact, 'fact', '') or '').strip()
-        if not fact_text:
-            continue
-        start = observation.content.find(fact_text)
-        if start < 0:
-            start = observation.content.casefold().find(fact_text.casefold())
-        if start < 0:
-            continue
-        end = start + len(fact_text)
-        while end < len(observation.content) and observation.content[end] in '.!?。！？':
-            end += 1
-        grounded.append(
-            EvidenceNode(
-                evidence_id=f'{observation_evidence.evidence_id}:fact:{fact_id}',
-                observation_id=observation.observation_id,
-                timestamp=observation.occurred_at,
-                original_text=observation.content,
-                origin=observation.origin,
-                span_start=start,
-                span_end=end,
-                graphiti_episode_id=observation_evidence.graphiti_episode_id,
-                group_id=observation.group_id,
-            )
-        )
+    grounded = [evidence_by_ref[item] for item in candidate.evidence_refs if item in evidence_by_ref]
     if grounded:
         return tuple(grounded)
 
     candidate_span = _find_candidate_span(observation.content, candidate)
     if candidate_span is None:
-        return (observation_evidence,)
+        return (
+            EvidenceRecord.create(
+                observation_id=observation.observation_id,
+                source_text=observation.content,
+                origin=observation.origin,
+                span_start=0,
+                span_end=len(observation.content),
+                sequence_index=sequence_index,
+                timestamp=observation.occurred_at,
+                backend_metadata=dict(observation_evidence.backend_metadata),
+                group_id=observation.group_id,
+            ),
+        )
     start, end = candidate_span
     return (
-        EvidenceNode(
-            evidence_id=f'{observation_evidence.evidence_id}:candidate:{sequence_index}',
+        EvidenceRecord(
+            evidence_id=evidence_id_for(
+                observation.observation_id,
+                observation.content[start:end],
+                sequence_index,
+                span_start=start,
+                span_end=end,
+            ),
             observation_id=observation.observation_id,
             timestamp=observation.occurred_at,
             original_text=observation.content,
             origin=observation.origin,
             span_start=start,
             span_end=end,
-            graphiti_episode_id=observation_evidence.graphiti_episode_id,
+            sequence_index=sequence_index,
+            backend_metadata=dict(observation_evidence.backend_metadata),
             group_id=observation.group_id,
         ),
     )
