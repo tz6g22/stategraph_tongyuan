@@ -20,6 +20,10 @@ __pycache__/
 .venv/
 venv/
 
+# Local Codex/agent settings
+.claude/
+.agents/
+.codex/
+
 # Documentation and generated reports are intentionally not published here
 *.md
-

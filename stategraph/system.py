@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -39,9 +40,18 @@ from stategraph.state import (
     StateNode,
     StateRelation,
     StateStatus,
+    TimeScope,
+    canonical_semantic_scope,
     evidence_id_for,
 )
-from stategraph.state.contracts import StateExtractor
+from stategraph.state.factual_relations import normalize_state_candidate
+from stategraph.state.native_extraction import consolidate_observation_candidates
+from stategraph.state.provenance import bridge_candidate_evidence
+from stategraph.state.contracts import (
+    CandidateGroundingError,
+    FailureSeverity,
+    StateExtractor,
+)
 from stategraph.state.dependency import DependencyAssessment, DependencyCandidate
 from stategraph.evaluation.profiling import StageProfiler
 from stategraph.storage import InMemoryStateRepository, StateRepository
@@ -64,6 +74,7 @@ class IngestResult:
     dependency_assessments: tuple[DependencyAssessment, ...] = ()
     direct_invalidation_seed_ids: tuple[str, ...] = ()
     propagation_steps: tuple[PropagationStep, ...] = ()
+    grounding_rejections: tuple[dict[str, Any], ...] = ()
 
     @property
     def states(self) -> tuple[StateNode, ...]:
@@ -86,9 +97,14 @@ class StateGraph:
         extractor: StateExtractor | None = None,
         linker: StateLinker | None = None,
         conflict_detector: ConflictDetector | None = None,
+        revision_resolver: Any | None = None,
+        preserve_candidate_extensions: bool = False,
         revision_trace_path: str | Path | None = None,
         stop_after: str | None = None,
         profiler: StageProfiler | None = None,
+        retrieval_graph_depth: int = 2,
+        retrieval_graph_beam_width: int = 4,
+        retrieval_relation_max_hops: int = 3,
     ) -> None:
         if stop_after not in {None, 'relation_typing', 'dependency_verification'}:
             raise ValueError(
@@ -108,13 +124,21 @@ class StateGraph:
         self.repository = repository or backend.repository
         self.extractor = extractor
         self.linker = linker or StateLinker()
-        self.revision = StateRevision(self.repository, conflict_detector)
+        # Optional write authority is an orchestration seam for isolated runtime
+        # integrations. The native lifecycle resolver remains the default.
+        self.revision = revision_resolver or StateRevision(self.repository, conflict_detector)
+        self._preserve_candidate_extensions = preserve_candidate_extensions
         self.dependencies = DependencyGraph(self.repository)
         self.invalidation = InvalidationPropagation(self.repository)
         # Production StateGraph retrieval is repository-native.  A backend's
         # optional search adapter remains available only to explicit compatibility
         # callers; it is never a fallback here.
-        self.retriever = StateGraphNativeRetriever(self.repository)
+        self.retriever = StateGraphNativeRetriever(
+            self.repository,
+            graph_depth=retrieval_graph_depth,
+            graph_beam_width=retrieval_graph_beam_width,
+            relational_max_hops=retrieval_relation_max_hops,
+        )
         self._ingest_lock = asyncio.Lock()
         self._next_observation_index: dict[str, int] = {}
         self._revision_trace_path = revision_trace_path
@@ -178,14 +202,30 @@ class StateGraph:
     ) -> IngestResult:
         """Ingest one observation sequentially and complete all lifecycle effects."""
 
-        if self._profiler is None:
-            return await self._ingest_unprofiled(observation, candidates=candidates)
-        if self._profiler.in_observation:
-            return await self._ingest_unprofiled(observation, candidates=candidates)
-        with self._profiler.observation(
-            observation.observation_id, observation.observation_index
-        ):
-            return await self._ingest_unprofiled(observation, candidates=candidates)
+        async def run() -> IngestResult:
+            if self._profiler is None or self._profiler.in_observation:
+                return await self._ingest_unprofiled(observation, candidates=candidates)
+            with self._profiler.observation(
+                observation.observation_id, observation.observation_index
+            ):
+                return await self._ingest_unprofiled(observation, candidates=candidates)
+
+        transaction_factory = getattr(self.repository, 'observation_transaction', None)
+        previous_index = self._next_observation_index.get(observation.group_id)
+        evidence_aliases = self.retriever._backend_evidence_aliases.copy()
+        try:
+            if transaction_factory is None:
+                return await run()
+            async with transaction_factory(observation.group_id):
+                return await run()
+        except BaseException:
+            if previous_index is None:
+                self._next_observation_index.pop(observation.group_id, None)
+            else:
+                self._next_observation_index[observation.group_id] = previous_index
+            self.retriever._backend_evidence_aliases.clear()
+            self.retriever._backend_evidence_aliases.update(evidence_aliases)
+            raise
 
     async def _ingest_unprofiled(
         self,
@@ -196,22 +236,32 @@ class StateGraph:
         """Implementation kept separate so profiling adds no semantic branch."""
 
         async with self._ingest_lock:
-            await self.backend.ensure_group(observation.group_id)
-            observation_index = await self._observation_index(observation)
-            evidence_id = evidence_id_for(
-                observation.observation_id,
-                observation.content,
-                0,
-                span_start=0,
-                span_end=len(observation.content),
-            )
-            existing_evidence = await self.repository.get_evidence((evidence_id,))
-            if not existing_evidence:
-                # Compatibility read for pre-Module-1 snapshots.  New writes use
-                # the deterministic evidence_id_for contract above.
-                existing_evidence = await self.repository.get_evidence(
-                    (f'evidence:{observation.observation_id}',)
+            setup_scope = (
+                self._profiler.stage(
+                    'LOCAL_DETERMINISTIC_PROCESSING',
+                    observation_id=observation.observation_id,
+                    operation='observation_setup',
                 )
+                if self._profiler is not None
+                else nullcontext()
+            )
+            with setup_scope:
+                await self.backend.ensure_group(observation.group_id)
+                observation_index = await self._observation_index(observation)
+                evidence_id = evidence_id_for(
+                    observation.observation_id,
+                    observation.content,
+                    0,
+                    span_start=0,
+                    span_end=len(observation.content),
+                )
+                existing_evidence = await self.repository.get_evidence((evidence_id,))
+                if not existing_evidence:
+                    # Compatibility read for pre-Module-1 snapshots.  New writes use
+                    # the deterministic evidence_id_for contract above.
+                    existing_evidence = await self.repository.get_evidence(
+                        (f'evidence:{observation.observation_id}',)
+                    )
             backend_result: BackendObservationResult | None = None
             native_extraction = False
             native_evidence_records: tuple[EvidenceRecord, ...] = ()
@@ -232,10 +282,21 @@ class StateGraph:
                 extracted = list(native_result.state_candidates)
                 native_evidence_records = tuple(native_result.evidence_records)
                 native_extraction = True
-            backend_result = await self.backend.persist_observation(
-                observation,
-                existing_evidence[0] if existing_evidence else None,
-            )
+            if self._profiler is None:
+                backend_result = await self.backend.persist_observation(
+                    observation,
+                    existing_evidence[0] if existing_evidence else None,
+                )
+            else:
+                with self._profiler.stage(
+                    'PERSISTENCE',
+                    observation_id=observation.observation_id,
+                    operation='backend_persist_observation',
+                ):
+                    backend_result = await self.backend.persist_observation(
+                        observation,
+                        existing_evidence[0] if existing_evidence else None,
+                    )
 
             evidence = (
                 existing_evidence[0]
@@ -256,7 +317,15 @@ class StateGraph:
                     group_id=observation.group_id,
                 )
             )
-            await self.repository.save_evidence(evidence)
+            if self._profiler is None:
+                await self.repository.save_evidence(evidence)
+            else:
+                with self._profiler.stage(
+                    'PERSISTENCE',
+                    observation_id=observation.observation_id,
+                    operation='save_observation_evidence',
+                ):
+                    await self.repository.save_evidence(evidence)
 
             backend_records = (
                 backend_result.legacy_inputs if backend_result is not None else ()
@@ -285,8 +354,14 @@ class StateGraph:
                 extracted = (
                     list(await extraction) if inspect.isawaitable(extraction) else extraction
                 )
+            extracted = [normalize_state_candidate(item) for item in extracted]
+            if native_extraction:
+                extracted = consolidate_observation_candidates(
+                    extracted, observation.occurred_at
+                )
             revisions: list[RevisionResult] = []
             direct_invalidation_seeds: list[str] = []
+            grounding_rejections: list[dict[str, Any]] = []
 
             # Link the complete observation against one pre-revision snapshot.
             # This preserves the observation-level contract: no candidate can
@@ -304,42 +379,95 @@ class StateGraph:
                     candidate,
                     evidence_by_ref,
                     sequence_index,
+                    observation_index,
                 )
+                backend_ids = self.backend.candidate_backend_ids(candidate)
+                state_kwargs = {
+                    'entity': candidate.entity,
+                    'attribute': candidate.attribute,
+                    'value': candidate.value,
+                    'evidence_id': candidate_evidence[0].evidence_id,
+                    'canonical_subject_id': candidate.canonical_subject_id,
+                    'canonical_field_id': candidate.canonical_field_id,
+                    'evidence_ids': tuple(item.evidence_id for item in candidate_evidence),
+                    'time_scope': candidate.time_scope,
+                    'condition_scope': candidate.condition_scope,
+                    'confidence': candidate.confidence,
+                    'evidence_refs': tuple(item.evidence_id for item in candidate_evidence),
+                    'graphiti_fact_ids': backend_ids,
+                    'effects': candidate.effects,
+                    'conflicts': candidate.conflicts,
+                    'dependency_relations': tuple(
+                        replace(item, evidence_id=candidate_evidence[0].evidence_id)
+                        for item in candidate.dependency_relations
+                    ),
+                    'group_id': observation.group_id,
+                    'observation_id': observation.observation_id,
+                    'observation_index': observation_index,
+                    'sequence_index': sequence_index,
+                    'observed_at': observation.occurred_at,
+                    'metadata': candidate.metadata,
+                    'subject_provenance': candidate.subject_provenance,
+                }
+                if self._preserve_candidate_extensions:
+                    # The alternate write authority owns interpretation. This only
+                    # carries already-extracted fields across the construction seam.
+                    state_kwargs.update(
+                        cardinality=candidate.cardinality,
+                        member_key=candidate.member_key,
+                        polarity=candidate.polarity,
+                        assertion_mode=candidate.assertion_mode,
+                    )
+                state = StateNode.create(
+                    **state_kwargs,
+                )
+                validate_grounding = getattr(self.revision, 'validate_grounding', None)
+                if validate_grounding is not None:
+                    try:
+                        subject_provenance = validate_grounding(
+                            state, candidate_evidence
+                        )
+                    except CandidateGroundingError as exc:
+                        candidate_id = candidate.metadata.get('candidate_id')
+                        if not isinstance(candidate_id, str) or not candidate_id:
+                            candidate_id = (
+                                f'{observation.observation_id}:candidate:{sequence_index}'
+                            )
+                        grounding_rejections.append(
+                            {
+                                'CASE_ID': (
+                                    candidate.metadata.get('case_id')
+                                    or observation.group_id
+                                ),
+                                'OBSERVATION_INDEX': observation_index,
+                                'CANDIDATE_ID': candidate_id,
+                                'REJECTION_STAGE': exc.rejection_stage,
+                                'REJECTION_CLASS': 'SOURCE_GROUNDING_VALIDATION',
+                                'FAILURE_SEVERITY': FailureSeverity(
+                                    exc.failure_severity
+                                ).value,
+                                'SUBJECT_PROVENANCE_STATUS': (
+                                    exc.subject_provenance_status
+                                ),
+                                'VALUE_PROVENANCE_STATUS': (
+                                    exc.value_provenance_status
+                                ),
+                                'EVIDENCE_ID': candidate_evidence[0].evidence_id,
+                                'ERROR': str(exc),
+                            }
+                        )
+                        continue
+                    state = replace(state, subject_provenance=subject_provenance)
+                # Stage candidate evidence only after strict grounding succeeds.
+                # A rejected candidate therefore leaves no candidate-local writes.
                 for item in candidate_evidence:
                     await self.repository.save_evidence(item)
-                backend_ids = self.backend.candidate_backend_ids(candidate)
                 if backend_ids:
                     self.retriever.register_evidence_aliases(
                         self.backend.candidate_evidence_aliases(
                             candidate, candidate_evidence[0].evidence_id
                         )
                     )
-                state = StateNode.create(
-                    entity=candidate.entity,
-                    attribute=candidate.attribute,
-                    value=candidate.value,
-                    evidence_id=candidate_evidence[0].evidence_id,
-                    canonical_subject_id=candidate.canonical_subject_id,
-                    canonical_field_id=candidate.canonical_field_id,
-                    evidence_ids=tuple(item.evidence_id for item in candidate_evidence),
-                    time_scope=candidate.time_scope,
-                    condition_scope=candidate.condition_scope,
-                    confidence=candidate.confidence,
-                    evidence_refs=tuple(item.evidence_id for item in candidate_evidence),
-                    graphiti_fact_ids=backend_ids,
-                    effects=candidate.effects,
-                    conflicts=candidate.conflicts,
-                    dependency_relations=tuple(
-                        replace(item, evidence_id=candidate_evidence[0].evidence_id)
-                        for item in candidate.dependency_relations
-                    ),
-                    group_id=observation.group_id,
-                    observation_id=observation.observation_id,
-                    observation_index=observation_index,
-                    sequence_index=sequence_index,
-                    observed_at=observation.occurred_at,
-                    metadata=candidate.metadata,
-                )
                 # The frozen identity/linking module owns candidate ranking and
                 # revision-target selection.  Do not run the legacy LLM slot
                 # grounding hook here: it was a hard gate that could rewrite a
@@ -368,7 +496,20 @@ class StateGraph:
                         ),
                         revision_chosen_target_id=chosen_target.state.state_id,
                     )
-                    links = [chosen_target]
+                    # A decisive target selects the slot. Revise every active
+                    # state version alias in that exact slot so one equivalent
+                    # node cannot remain CURRENT beside its invalidated peer.
+                    slot_id = chosen_target.state.canonical_slot_id
+                    links = [
+                        linked
+                        for linked in self.linker.link(state, linking_existing)
+                        if linked.state.canonical_slot_id == slot_id
+                    ]
+                    if not any(
+                        linked.state.state_id == chosen_target.state.state_id
+                        for linked in links
+                    ):
+                        links.append(chosen_target)
                 else:
                     # Explicit extractor effects/conflicts remain the safe
                     # fallback when no candidate is decisive.
@@ -432,28 +573,40 @@ class StateGraph:
 
             # Observation-level invariant: finish every direct revision, build and
             # persist the verified graph, then propagate all seeds exactly once.
-            all_states = await self.repository.list_states(observation.group_id)
-            all_by_id = {state.state_id: state for state in all_states}
-            new_states = tuple(
-                all_by_id[state_id]
-                for state_id in dict.fromkeys(revision.state.state_id for revision in revisions)
-                if state_id in all_by_id
+            discovery_setup_scope = (
+                self._profiler.stage(
+                    'LOCAL_DETERMINISTIC_PROCESSING',
+                    observation_id=observation.observation_id,
+                    operation='dependency_discovery_setup',
+                )
+                if self._profiler is not None
+                else nullcontext()
             )
+            with discovery_setup_scope:
+                all_states = await self.repository.list_states(observation.group_id)
+                all_by_id = {state.state_id: state for state in all_states}
+                new_states = tuple(
+                    all_by_id[state_id]
+                    for state_id in dict.fromkeys(
+                        revision.state.state_id for revision in revisions
+                    )
+                    if state_id in all_by_id
+                )
+                current_states = tuple(
+                    state for state in all_states if state.status == StateStatus.CURRENT
+                )
+                unresolved_dependency_relations: list[DependencyRelationSelector] = []
+                for downstream in new_states:
+                    if not downstream.dependency_relations:
+                        continue
+                    linked = self.linker.resolve_dependency_relations(
+                        downstream, current_states
+                    )
+                    unresolved_dependency_relations.extend(linked.unresolved)
             dependency_candidates: tuple[DependencyCandidate, ...] = ()
             typed_dependency_candidates: tuple[DependencyCandidate, ...] = ()
             rejected_dependency_candidates: tuple[DependencyCandidate, ...] = ()
             dependency_assessments: tuple[DependencyAssessment, ...] = ()
-            unresolved_dependency_relations: list[DependencyRelationSelector] = []
-            current_states = tuple(
-                state for state in all_states if state.status == StateStatus.CURRENT
-            )
-            for downstream in new_states:
-                if not downstream.dependency_relations:
-                    continue
-                linked = self.linker.resolve_dependency_relations(
-                    downstream, current_states
-                )
-                unresolved_dependency_relations.extend(linked.unresolved)
             discover_candidates = getattr(self.extractor, 'discover_dependency_candidates', None)
             verify_typed = getattr(self.extractor, 'verify_typed_dependency_candidates', None)
             if discover_candidates is not None and new_states:
@@ -471,94 +624,19 @@ class StateGraph:
                 # The production relation source of truth is deterministic Module 5.
                 # Ignore any upstream proposed label while typing; it is discovery data,
                 # not a verifier/persistence contract.
-                dependent_has_cross_observation_source = {
-                    candidate.dependent_state_id
-                    for candidate in dependency_candidates
-                    if (
-                        all_by_id.get(candidate.prerequisite_state_id) is not None
-                        and all_by_id.get(candidate.dependent_state_id) is not None
-                        and all_by_id[candidate.prerequisite_state_id].observation_id
-                        != all_by_id[candidate.dependent_state_id].observation_id
-                    )
-                }
                 typing_inputs = []
                 pre_rejected: list[DependencyCandidate] = []
-                latest_source_by_dependent_subject: dict[tuple[str, str], tuple[int, str]] = {}
                 for candidate in dependency_candidates:
                     prerequisite = all_by_id.get(candidate.prerequisite_state_id)
                     dependent = all_by_id.get(candidate.dependent_state_id)
                     if prerequisite is None or dependent is None:
-                        continue
-                    subject = (
-                        prerequisite.canonical_subject_id or prerequisite.entity
-                    ).casefold()
-                    dependent_key = (dependent.state_id, subject)
-                    if (
-                        dependent.state_id in dependent_has_cross_observation_source
-                        and prerequisite.observation_id == dependent.observation_id
-                    ):
-                        continue
-                    order = (
-                        prerequisite.observation_index
-                        if prerequisite.observation_index is not None
-                        else -1
-                    )
-                    previous = latest_source_by_dependent_subject.get(dependent_key)
-                    if previous is None or order > previous[0]:
-                        latest_source_by_dependent_subject[dependent_key] = (
-                            order,
-                            prerequisite.state_id,
-                        )
-                for candidate in dependency_candidates:
-                    prerequisite = all_by_id.get(candidate.prerequisite_state_id)
-                    dependent = all_by_id.get(candidate.dependent_state_id)
-                    if (
-                        prerequisite is not None
-                        and dependent is not None
-                        and dependent.state_id in dependent_has_cross_observation_source
-                        and prerequisite.observation_id == dependent.observation_id
-                    ):
                         pre_rejected.append(
                             replace(
                                 candidate,
                                 proposed_relation=None,
                                 provenance={
                                     **candidate.provenance,
-                                    'typing_rejection': (
-                                        'same-observation alternative superseded by '
-                                        'cross-observation provenance'
-                                    ),
-                                },
-                            )
-                        )
-                        continue
-                    subject = (
-                        prerequisite.canonical_subject_id or prerequisite.entity
-                    ).casefold() if prerequisite is not None else ''
-                    latest_source = latest_source_by_dependent_subject.get(
-                        (dependent.state_id, subject) if dependent is not None else ('', '')
-                    )
-                    if (
-                        prerequisite is not None
-                        and dependent is not None
-                        and latest_source is not None
-                        and latest_source[1] != prerequisite.state_id
-                        and latest_source[0] > (
-                            prerequisite.observation_index
-                            if prerequisite.observation_index is not None
-                            else -1
-                        )
-                    ):
-                        pre_rejected.append(
-                            replace(
-                                candidate,
-                                proposed_relation=None,
-                                provenance={
-                                    **candidate.provenance,
-                                    'typing_rejection': (
-                                        'older same-subject source superseded by '
-                                        'newer evidence-grounded source'
-                                    ),
+                                    'typing_rejection': 'state endpoint missing',
                                 },
                             )
                         )
@@ -594,6 +672,10 @@ class StateGraph:
                         observation_id=observation.observation_id,
                     )
                 if self._stop_after == 'relation_typing':
+                    if native_extraction:
+                        await self._assert_no_active_canonical_duplicates(
+                            observation.group_id
+                        )
                     return IngestResult(
                         observation_id=observation.observation_id,
                         graphiti_episode_id=(
@@ -614,6 +696,7 @@ class StateGraph:
                         direct_invalidation_seed_ids=tuple(
                             dict.fromkeys(direct_invalidation_seeds)
                         ),
+                        grounding_rejections=tuple(grounding_rejections),
                     )
                 if verify_typed is not None and typed_dependency_candidates:
                     verified = verify_typed(
@@ -646,6 +729,10 @@ class StateGraph:
                         if candidate.proposed_relation is not None
                     )
             if self._stop_after == 'dependency_verification':
+                if native_extraction:
+                    await self._assert_no_active_canonical_duplicates(
+                        observation.group_id
+                    )
                 return IngestResult(
                     observation_id=observation.observation_id,
                     graphiti_episode_id=(
@@ -667,6 +754,7 @@ class StateGraph:
                     direct_invalidation_seed_ids=tuple(
                         dict.fromkeys(direct_invalidation_seeds)
                     ),
+                    grounding_rejections=tuple(grounding_rejections),
                 )
             dependency_relations = tuple(
                 _relation_from_assessment(assessment, observation)
@@ -675,19 +763,42 @@ class StateGraph:
                 in {DependencyStrength.STRICT, DependencyStrength.WEAK}
                 and assessment.relation_type is not None
             )
-            await self.dependencies.persist_verified(
-                dependency_relations, group_id=observation.group_id
-            )
+            if self._profiler is None:
+                await self.dependencies.persist_verified(
+                    dependency_relations, group_id=observation.group_id
+                )
+            else:
+                with self._profiler.stage(
+                    'PERSISTENCE',
+                    observation_id=observation.observation_id,
+                    operation='persist_verified_relations',
+                ):
+                    await self.dependencies.persist_verified(
+                        dependency_relations, group_id=observation.group_id
+                    )
             propagation_started = time.perf_counter()
+            protected_replacement_state_ids = tuple(
+                dict.fromkeys(
+                    revision.state.state_id
+                    for revision in revisions
+                    if revision.invalidated_state_ids
+                )
+            )
             propagation = await self.invalidation.propagate(
                 tuple(dict.fromkeys(direct_invalidation_seeds)),
                 group_id=observation.group_id,
+                protected_replacement_state_ids=protected_replacement_state_ids,
             )
             if self._profiler is not None:
                 self._profiler.add_stage_time(
                     'PROPAGATION',
                     time.perf_counter() - propagation_started,
                     observation_id=observation.observation_id,
+                )
+
+            if native_extraction:
+                await self._assert_no_active_canonical_duplicates(
+                    observation.group_id
                 )
 
             return IngestResult(
@@ -714,6 +825,32 @@ class StateGraph:
                     dict.fromkeys(direct_invalidation_seeds)
                 ),
                 propagation_steps=propagation.propagation_steps,
+                grounding_rejections=tuple(grounding_rejections),
+            )
+
+    async def _assert_no_active_canonical_duplicates(self, group_id: str) -> None:
+        active = await self.repository.list_states(
+            group_id, {StateStatus.CURRENT, StateStatus.UNCERTAIN}
+        )
+        buckets: dict[tuple[Any, ...], list[StateNode]] = {}
+        duplicate_ids: list[str] = []
+        for state in active:
+            key = (*state.canonical_slot_key[:3], state.canonical_value_key)
+            candidates = buckets.setdefault(key, [])
+            scope = _normalized_state_time_scope(state)
+            for previous in candidates:
+                if (
+                    scope.overlaps(_normalized_state_time_scope(previous))
+                    and state.condition_scope.overlaps(previous.condition_scope)
+                ):
+                    duplicate_ids.extend((previous.state_id, state.state_id))
+                    break
+            else:
+                candidates.append(state)
+        if duplicate_ids:
+            raise RuntimeError(
+                'ACTIVE_CANONICAL_DUPLICATE_INVARIANT: '
+                + ','.join(dict.fromkeys(duplicate_ids))
             )
 
     def _write_revision_trace(
@@ -808,10 +945,18 @@ class StateGraph:
         limit: int = 10,
         premises: Sequence[Premise] | None = None,
     ) -> CurrentStateRetrieval:
-        await self.backend.ensure_group(group_id)
-        return await self.retriever.retrieve(
-            query, group_id=group_id, at=at, limit=limit, premises=premises
-        )
+        if self._profiler is None:
+            await self.backend.ensure_group(group_id)
+            return await self.retriever.retrieve(
+                query, group_id=group_id, at=at, limit=limit, premises=premises
+            )
+        with self._profiler.stage(
+            'RETRIEVAL', group_id=group_id, query_characters=len(query)
+        ):
+            await self.backend.ensure_group(group_id)
+            return await self.retriever.retrieve(
+                query, group_id=group_id, at=at, limit=limit, premises=premises
+            )
 
     async def refresh_lifecycle(
         self, at: datetime, *, group_id: str = 'default'
@@ -888,8 +1033,47 @@ def _relation_from_assessment(
             'candidate_reason': candidate.candidate_reason,
             'candidate_evidence': list(candidate.candidate_evidence),
             'candidate_provenance': dict(candidate.provenance),
+            'dependency_strength': assessment.strength.value,
+            'direction_supported': assessment.direction_supported,
+            'counterfactual_supported': assessment.counterfactual_supported,
+            'evidence_supported': assessment.evidence_supported,
             'verification_evidence_span': assessment.evidence_span,
             'verification_evidence_spans': list(assessment.evidence_spans),
+            'supporting_evidence_refs': list(assessment.supporting_evidence_refs),
+            'source_grounded': assessment.source_grounded,
+            'target_grounded': assessment.target_grounded,
+            'relation_evidence_supported': assessment.relation_evidence_supported,
+            **(
+                {
+                    'structural_direction_valid': assessment.structural_direction_valid,
+                    'dependency_semantics_valid': assessment.dependency_semantics_valid,
+                }
+                if any((
+                    assessment.direction_supported,
+                    assessment.counterfactual_supported,
+                    assessment.evidence_supported,
+                    assessment.source_grounded,
+                    assessment.target_grounded,
+                    assessment.relation_evidence_supported,
+                ))
+                else {}
+            ),
+            **(
+                {
+                    'source_role': assessment.source_role,
+                    'target_role': assessment.target_role,
+                    'structural_direction_reason': assessment.structural_direction_reason,
+                }
+                if any((
+                    assessment.direction_supported,
+                    assessment.counterfactual_supported,
+                    assessment.evidence_supported,
+                    assessment.source_grounded,
+                    assessment.target_grounded,
+                    assessment.relation_evidence_supported,
+                ))
+                else {}
+            ),
         },
     )
 
@@ -926,12 +1110,22 @@ def _candidate_evidence_nodes(
     candidate: StateCandidate,
     evidence_by_ref: dict[str, EvidenceRecord],
     sequence_index: int,
+    observation_index: int,
 ) -> tuple[EvidenceNode, ...]:
     """Ground candidate provenance through generic StateGraph evidence records."""
 
     grounded = [evidence_by_ref[item] for item in candidate.evidence_refs if item in evidence_by_ref]
     if grounded:
-        return tuple(grounded)
+        return tuple(
+            bridge_candidate_evidence(
+                observation=observation,
+                observation_evidence=observation_evidence,
+                candidate=candidate,
+                candidate_evidence=item,
+                observation_index=observation_index,
+            )
+            for item in grounded
+        )
 
     candidate_span = _find_candidate_span(observation.content, candidate)
     if candidate_span is None:
@@ -1014,8 +1208,15 @@ def _trace_state(state: StateNode) -> dict[str, object]:
         'status': state.status.value,
         'evidence_id': state.evidence_id,
         'observation_id': state.observation_id,
+        'subject_provenance': (
+            state.subject_provenance.serialize() if state.subject_provenance else None
+        ),
         'metadata': dict(state.metadata),
     }
+
+
+def _normalized_state_time_scope(state: StateNode) -> TimeScope:
+    return canonical_semantic_scope(state.time_scope, observed_at=state.observed_at)
 
 
 __all__ = ['IngestResult', 'StateGraph']

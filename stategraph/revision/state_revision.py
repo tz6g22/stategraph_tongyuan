@@ -76,11 +76,21 @@ class StateRevision:
                     old.state_id,
                 ),
             )
-            merged = duplicate.with_provenance(new_state)
+            merged = duplicate
+            for old in duplicates:
+                if old.state_id != duplicate.state_id:
+                    merged = merged.with_provenance(old)
+            merged = merged.with_provenance(new_state)
             consolidated = [merged]
             for other in duplicates:
                 if other.state_id != duplicate.state_id:
-                    consolidated.append(other.with_status(StateStatus.HISTORICAL))
+                    consolidated.append(
+                        other.with_metadata(
+                            canonical_state_id=duplicate.state_id,
+                            resolved_canonical_slot_id=duplicate.canonical_slot_id,
+                            resolved_canonical_version_id=duplicate.canonical_version_id,
+                        ).with_status(StateStatus.HISTORICAL)
+                    )
             await self._repository.apply(tuple(consolidated))
             return RevisionResult(
                 state=merged,

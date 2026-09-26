@@ -72,6 +72,18 @@ class SplitProductionExtractor:
                       for evidence_id in state.evidence_ids),
                 candidate.candidate_evidence[0],
                 candidate.candidate_evidence,
+                direction_supported=True,
+                counterfactual_supported=True,
+                evidence_supported=True,
+                source_grounded=True,
+                target_grounded=True,
+                relation_evidence_supported=True,
+                supporting_evidence_refs=candidate.candidate_evidence,
+                structural_direction_valid=True,
+                source_role='ORDINARY_FACT',
+                target_role='ACTION_OR_PLAN',
+                structural_direction_reason='explicit bridge fixture',
+                dependency_semantics_valid=True,
             )
             for candidate in candidates
         )

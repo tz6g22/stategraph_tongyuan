@@ -41,13 +41,32 @@ class Gpt5Client:
         self.usage = []
         self.last_raw_response_text = None
 
-    async def generate_response(self, messages, **_kwargs):
+    async def generate_response(self, messages, **kwargs):
+        from stategraph.graphiti_adapter.dependency_discovery import (
+            CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
+            DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
+        )
+        from stategraph.state.native_extraction import STATE_EXTRACTION_OUTPUT_SCHEMA
+
+        prompt_name = kwargs.get('prompt_name')
+        schemas = {
+            'stategraph.state_extraction.v2': STATE_EXTRACTION_OUTPUT_SCHEMA,
+            'stategraph.dependency_candidate_discovery.v1': kwargs.get(
+                'candidate_schema', CANDIDATE_DISCOVERY_OUTPUT_SCHEMA
+            ),
+            'stategraph.dependency_verification.v1': DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
+        }
+        schema = schemas.get(prompt_name)
+        response_format = (
+            {'type': 'json_schema', 'name': 'stategraph_structured', 'schema': schema, 'strict': True}
+            if schema is not None else {'type': 'json_object'}
+        )
         response = self.client.responses.create(
             model='gpt-5-nano',
             input=[{'role': m.role, 'content': m.content} for m in messages],
-            max_output_tokens=STRUCTURED_OUTPUT_TOKENS,
+            max_output_tokens=int(kwargs.get('max_tokens', STRUCTURED_OUTPUT_TOKENS)),
             reasoning={'effort': 'minimal'},
-            text={'format': {'type': 'json_object'}},
+            text={'format': response_format},
         )
         self.calls += 1
         if response.usage is not None:
@@ -72,7 +91,7 @@ async def run_stategraph() -> None:
         client = Gpt5Client()
         trace_path = OUT / 'predictions' / f"stategraph_{case['case_id']}_extraction_trace.jsonl"
         graph = StateGraph(
-            extractor=GraphitiLLMStateExtractor(client, trace_path=trace_path),
+            extractor=GraphitiLLMStateExtractor(client, trace_path=trace_path, native_mode=True),
             revision_trace_path=OUT / 'predictions' / f"stategraph_{case['case_id']}_revision_trace.jsonl",
         )
         group_id = f"stagegraph-{case['case_id']}"

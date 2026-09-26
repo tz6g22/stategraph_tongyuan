@@ -267,7 +267,8 @@ async def run() -> None:
         start_index = int(position['observation_index'])
         client = StaleGpt5Client()
         extractor = GraphitiLLMStateExtractor(
-            client, max_llm_characters=MAX_LLM_CHARACTERS, trace_path=trace_path
+            client, max_llm_characters=MAX_LLM_CHARACTERS, trace_path=trace_path,
+            native_mode=True,
         )
         started = time.perf_counter()
         session_summaries: list[dict[str, Any]] = []
@@ -291,7 +292,6 @@ async def run() -> None:
                         name=f'STALE session {index + 1}',
                         source_description='Official STALE haystack session',
                     ),
-                    (),
                 )
                 trace = _validate_trace_rows(
                     _latest_trace_rows(trace_path, observation_id), content, observation_id

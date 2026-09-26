@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from stategraph.state.schema import Observation, StateNode, StateStatus
+from stategraph.state.native_extraction import PromptMessage
 
 
 def _subject(state):
@@ -68,11 +69,10 @@ async def ground_existing_slot(llm, observation: Observation, state: StateNode,
     decision = 'NEW_SLOT' if not pool else 'AMBIGUOUS'
     ids, equivalents = [], []
     if pool:
-        from graphiti_core.prompts.models import Message
         try:
             raw = await llm.generate_response(
-                [Message(role='system', content=system),
-                 Message(role='user', content=json.dumps(payload, default=str))],
+                [PromptMessage(role='system', content=system),
+                 PromptMessage(role='user', content=json.dumps(payload, default=str))],
                 prompt_name='stategraph.existing_slot_grounding.v1',
             )
             if not isinstance(raw, dict):

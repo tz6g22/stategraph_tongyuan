@@ -36,6 +36,7 @@ async def run() -> None:
             extractor=GraphitiLLMStateExtractor(
                 client,
                 trace_path=case_dir / "extraction_trace.jsonl",
+                native_mode=True,
             ),
             revision_trace_path=case_dir / "revision_trace.jsonl",
         )

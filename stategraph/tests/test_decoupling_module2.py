@@ -68,7 +68,8 @@ class NativeExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.state_candidates, ())
         self.assertEqual(result.evidence_records, ())
-        self.assertEqual(result.extraction_metadata['rejected_count'], 1)
+        self.assertEqual(result.extraction_metadata['rejected_count'], 2)
+        self.assertEqual(result.extraction_metadata['recovery_passes'], 1)
 
     def test_observation_record_round_trip(self) -> None:
         original = self.observation('A fact.')

@@ -59,8 +59,8 @@ async def run() -> None:
     client = StaleGpt5Client()
     extractor = GraphitiLLMStateExtractor(
         client,
-        max_llm_characters=1800,
         trace_path=trace_path,
+        native_mode=True,
     )
     started = time.perf_counter()
     with trace_path.open("w", encoding="utf-8"):
@@ -82,7 +82,7 @@ async def run() -> None:
             "source_characters": len(observation.content),
         }
         try:
-            candidates = await extractor.extract(observation, ())
+            candidates = await extractor.extract(observation)
             row.update({
                 "status": "ready",
                 "accepted_candidates": [dump(candidate) for candidate in candidates],

@@ -7,12 +7,14 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
 from stategraph.evaluation.graphiti_runtime import create_llm
+from stategraph.evaluation.profiling import StageProfiler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,8 +59,24 @@ async def _generate(dataset: str) -> None:
         json.loads(partial_path.read_text(encoding='utf-8')) if partial_path.exists() else []
     )
     completed_ids = {item['case_id'] for item in predictions}
-    llm, _ = create_llm()
-    for record in records:
+    profile_path = os.environ.get('STATEGRAPH_PROFILE_PATH')
+    profiler = None
+    if profile_path:
+        requested = Path(profile_path)
+        profiler = StageProfiler(
+            requested.with_name(f'{requested.stem}-{dataset}{requested.suffix}'),
+            metadata={
+                'dataset': dataset,
+                'profile_scope': 'answer_generation',
+                'provider': os.environ.get('STATEGRAPH_LLM_PROVIDER', 'openai'),
+                'model': os.environ.get('STATEGRAPH_LLM_MODEL', 'gpt-5-nano'),
+                'reasoning_effort': os.environ.get(
+                    'STATEGRAPH_LLM_REASONING_EFFORT', 'minimal'
+                ),
+            },
+        )
+    llm, _ = create_llm(profiler=profiler)
+    for record_index, record in enumerate(records):
         if record['case_id'] in completed_ids:
             continue
         prompt = {
@@ -67,23 +85,37 @@ async def _generate(dataset: str) -> None:
             'current_states': record.get('current_states', []),
             'grounding_evidence': record['retrieved_evidence'],
         }
-        response = await llm.generate_response(
-            [
-                Message(
-                    role='system',
-                    content=(
-                        'Answer the question using only the supplied effective CURRENT states and '
-                        'their grounding evidence. Do not use stale states or hidden knowledge. '
-                        'Respect any premise correction. If the evidence is insufficient, answer '
-                        '"unknown". Give only a concise answer in the answer field.'
-                    ),
-                ),
-                Message(role='user', content=json.dumps(prompt, ensure_ascii=False)),
-            ],
-            response_model=AnswerResponse,
-            max_tokens=512,
-            prompt_name='stategraph.answer_generation.v1',
+        observation_scope = (
+            profiler.observation(str(record['case_id']), record_index)
+            if profiler is not None else nullcontext()
         )
+        with observation_scope:
+            answer_scope = (
+                profiler.stage(
+                    'ANSWER_GENERATION',
+                    prompt_name='stategraph.answer_generation.v1',
+                    record_index=record_index,
+                )
+                if profiler is not None else nullcontext()
+            )
+            with answer_scope:
+                response = await llm.generate_response(
+                    [
+                        Message(
+                            role='system',
+                            content=(
+                                'Answer the question using only the supplied effective CURRENT states and '
+                                'their grounding evidence. Do not use stale states or hidden knowledge. '
+                                'Respect any premise correction. If the evidence is insufficient, answer '
+                                '"unknown". Give only a concise answer in the answer field.'
+                            ),
+                        ),
+                        Message(role='user', content=json.dumps(prompt, ensure_ascii=False)),
+                    ],
+                    response_model=AnswerResponse,
+                    max_tokens=512,
+                    prompt_name='stategraph.answer_generation.v1',
+                )
         answer = AnswerResponse(**response).answer.strip()
         predictions.append(
             {
@@ -126,6 +158,8 @@ async def _generate(dataset: str) -> None:
             'model': llm.model,
         },
     )
+    if profiler is not None:
+        profiler.write()
 
 
 def main() -> None:

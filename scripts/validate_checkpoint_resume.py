@@ -259,7 +259,8 @@ async def _real_graph(client: Any, repo: InMemoryStateRepository, trace_dir: Pat
     return StateGraph(
         repository=repo,
         extractor=GraphitiLLMStateExtractor(
-            client, max_llm_characters=1800, trace_path=trace_dir / 'extraction_trace.jsonl'
+            client, trace_path=trace_dir / 'extraction_trace.jsonl',
+            native_mode=True,
         ),
         revision_trace_path=trace_dir / 'revision_trace.jsonl',
     )

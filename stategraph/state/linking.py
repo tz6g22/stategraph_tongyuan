@@ -16,6 +16,7 @@ from .schema import (
     StateStatus,
     attribute_tokens,
     attributes_compatible,
+    canonical_attribute_id,
 )
 from .contracts import ExplicitDependencyIntent
 
@@ -62,7 +63,7 @@ class StateLinker:
 
     @staticmethod
     def identity_decision(new_state: StateNode, old_state: StateNode) -> SlotIdentityDecision:
-        """Resolve slot identity conservatively without semantic alias tables."""
+        """Resolve the canonical entity/field/scope slot, not evidence identity."""
 
         if 'slot_grounding_decision' in new_state.metadata:
             if old_state.state_id in new_state.metadata.get('slot_grounding_target_ids', ()):
@@ -72,24 +73,44 @@ class StateLinker:
                 SlotIdentity.POSSIBLE_SAME_SLOT if uncertain else SlotIdentity.DIFFERENT_SLOT,
                 0.0, ('existing_slot_grounding_not_matched',))
 
-        if new_state.has_canonical_slot and old_state.has_canonical_slot:
-            if new_state.identity_key == old_state.identity_key:
-                return SlotIdentityDecision(
-                    SlotIdentity.SAME_SLOT, 1.0,
-                    ('canonical_subject_match', 'canonical_field_match'),
-                )
-            if (
-                new_state.identity_key[0] == old_state.identity_key[0]
-                and _canonical_fields_compatible(new_state, old_state)
-            ):
-                return SlotIdentityDecision(
-                    SlotIdentity.SAME_SLOT, 0.9,
-                    ('canonical_subject_match', 'canonical_field_format_match'),
-                )
-            return SlotIdentityDecision(SlotIdentity.DIFFERENT_SLOT, 0.0, ('canonical_slot_mismatch',))
-        if new_state.identity_key[0] != old_state.identity_key[0]:
+        if new_state.canonical_slot_key == old_state.canonical_slot_key:
+            return SlotIdentityDecision(
+                SlotIdentity.SAME_SLOT,
+                1.0,
+                ('canonical_subject_match', 'canonical_field_and_scope_match'),
+            )
+
+        same_subject = (
+            new_state.group_id == old_state.group_id
+            and new_state.identity_key[0] == old_state.identity_key[0]
+        )
+        same_scope = new_state.slot_scope_key == old_state.slot_scope_key
+        same_field = (
+            _canonical_fields_compatible(new_state, old_state)
+            if new_state.has_canonical_slot and old_state.has_canonical_slot
+            else attributes_compatible(new_state.attribute, old_state.attribute)
+        )
+        if same_subject and same_field and same_scope:
+            return SlotIdentityDecision(
+                SlotIdentity.SAME_SLOT,
+                1.0 if new_state.canonical_slot_key == old_state.canonical_slot_key else 0.9,
+                ('canonical_subject_match', 'canonical_field_and_scope_match'),
+            )
+        if not same_subject:
             return SlotIdentityDecision(SlotIdentity.DIFFERENT_SLOT, 0.0, ('entity_mismatch',))
+        if same_field:
+            return SlotIdentityDecision(
+                SlotIdentity.DIFFERENT_SLOT,
+                0.0,
+                ('canonical_scope_mismatch',),
+            )
         if attributes_compatible(new_state.attribute, old_state.attribute):
+            if not same_scope:
+                return SlotIdentityDecision(
+                    SlotIdentity.DIFFERENT_SLOT,
+                    0.0,
+                    ('canonical_scope_mismatch',),
+                )
             return SlotIdentityDecision(
                 SlotIdentity.SAME_SLOT, 0.8, ('same_entity', 'attribute_compatible')
             )
@@ -304,7 +325,7 @@ class StateLinker:
             same_canonical_slot = (
                 new_state.has_canonical_slot
                 and old_state.has_canonical_slot
-                and new_state.identity_key == old_state.identity_key
+                and new_state.canonical_slot_key == old_state.canonical_slot_key
             )
             attribute_match = same_canonical_slot or attributes_compatible(
                 new_state.attribute, old_state.attribute
@@ -387,10 +408,10 @@ class StateLinker:
         edge_keys: set[tuple[str, str, str]] = set()
         for selector in selectors:
             matches = [state for state in available if selector.prerequisite.matches(state)]
-            if len(matches) != 1:
+            prerequisite = _canonical_representative(matches)
+            if prerequisite is None:
                 unresolved.append(selector)
                 continue
-            prerequisite = matches[0]
             edge_key = (
                 prerequisite.state_id,
                 downstream_state.state_id,
@@ -420,6 +441,12 @@ class StateLinker:
                     reason=selector.reason,
                     evidence_id=evidence_id,
                     group_id=downstream_state.group_id,
+                    metadata={
+                        'canonical_source_slot_id': prerequisite.canonical_slot_id,
+                        'canonical_source_version_id': prerequisite.canonical_version_id,
+                        'canonical_target_slot_id': downstream_state.canonical_slot_id,
+                        'canonical_target_version_id': downstream_state.canonical_version_id,
+                    },
                 )
             )
         return DependencyLinkResult(tuple(relations), tuple(unresolved))
@@ -442,9 +469,10 @@ class StateLinker:
         )
         downstream = [state for state in available if intent.downstream.matches(state)]
         prerequisite = [state for state in available if intent.prerequisite.matches(state)]
-        if len(downstream) != 1 or len(prerequisite) != 1:
+        target = _canonical_representative(downstream)
+        source = _canonical_representative(prerequisite)
+        if target is None or source is None:
             return None
-        target, source = downstream[0], prerequisite[0]
         if source.state_id == target.state_id:
             return None
         identity = '|'.join(
@@ -462,6 +490,12 @@ class StateLinker:
             reason=intent.reason,
             evidence_id=evidence_id,
             group_id=group_id,
+            metadata={
+                'canonical_source_slot_id': source.canonical_slot_id,
+                'canonical_source_version_id': source.canonical_version_id,
+                'canonical_target_slot_id': target.canonical_slot_id,
+                'canonical_target_version_id': target.canonical_version_id,
+            },
         )
 
 _LINK_STOPWORDS = frozenset(
@@ -560,7 +594,12 @@ __all__ = [
 
 
 def _canonical_fields_compatible(new_state: StateNode, old_state: StateNode) -> bool:
-    """Match formatting variants of an explicit field without semantic aliases."""
+    """Match explicit fields after generic slot normalization."""
+
+    if canonical_attribute_id(new_state.canonical_field_id or '') == canonical_attribute_id(
+        old_state.canonical_field_id or ''
+    ):
+        return True
 
     def tokens(state: StateNode) -> frozenset[str]:
         field = attribute_tokens(state.canonical_field_id or '')
@@ -570,3 +609,18 @@ def _canonical_fields_compatible(new_state: StateNode, old_state: StateNode) -> 
 
     left, right = tokens(new_state), tokens(old_state)
     return bool(left) and left == right
+
+
+def _canonical_representative(states: list[StateNode]) -> StateNode | None:
+    if not states:
+        return None
+    if len({state.canonical_version_id for state in states}) != 1:
+        return None
+    return min(
+        states,
+        key=lambda state: (
+            state.observation_index if state.observation_index is not None else 2**63 - 1,
+            state.sequence_index,
+            state.state_id,
+        ),
+    )

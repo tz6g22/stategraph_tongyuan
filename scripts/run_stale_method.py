@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,13 @@ CASE_INPUT = Path(os.environ.get(
 METHODS = {"mem0", "amem", "graphiti", "stategraph"}
 
 
+def _structured_retry_taxonomies(prompt_name: str | None) -> set[str]:
+    taxonomies = {FINISH_REASON_INCOMPLETE, MALFORMED_STRUCTURED_OUTPUT}
+    if prompt_name == 'stategraph.state_extraction.v2':
+        taxonomies.discard(FINISH_REASON_INCOMPLETE)
+    return taxonomies
+
+
 def dump(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return dump(value.model_dump())
@@ -68,7 +76,7 @@ class StaleGpt5Client:
     explicit provider option via ``STATEGRAPH_LLM_PROVIDER=deepseek``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, profiler: Any | None = None) -> None:
         from openai import OpenAI
         from stategraph.graphiti_adapter.dependency_discovery import (
             CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
@@ -120,6 +128,9 @@ class StaleGpt5Client:
         self.error_trace: list[dict[str, Any]] = []
         self.last_raw_response_text: str | None = None
         self.last_response_metadata: dict[str, Any] | None = None
+        self.profiler = profiler
+        self._active_prompt_name: str | None = None
+        self._request_snapshots: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _retryable_provider_error(exc: Exception) -> bool:
@@ -130,6 +141,20 @@ class StaleGpt5Client:
         }
 
     def _record_attempt(self, details: dict[str, Any]) -> None:
+        if self._active_prompt_name is not None:
+            details.setdefault('prompt_name', self._active_prompt_name)
+        response_metadata = details.get('response_metadata')
+        if not isinstance(response_metadata, dict):
+            response_metadata = self.last_response_metadata or {}
+        usage = response_metadata.get('usage')
+        if isinstance(usage, dict):
+            for field, aliases in (
+                ('input_tokens', ('input_tokens', 'prompt_tokens')),
+                ('output_tokens', ('output_tokens', 'completion_tokens')),
+            ):
+                value = next((usage.get(name) for name in aliases if usage.get(name) is not None), None)
+                if value is not None:
+                    details.setdefault(field, int(value))
         if details.get('taxonomy') == 'VALID_RESPONSE':
             metadata = self.last_response_metadata or {}
             details.setdefault('finish_reason', metadata.get('finish_reason'))
@@ -149,6 +174,12 @@ class StaleGpt5Client:
         if details.get('taxonomy') != 'VALID_RESPONSE':
             self.last_error_trace.append(details)
             self.error_trace.append(details)
+        if self.profiler is not None:
+            request_hash = str(details.get('request_hash') or '')
+            self.profiler.record_provider_attempt(
+                details,
+                request_snapshot=self._request_snapshots.get(request_hash),
+            )
 
     async def _responses_create(self, **request: Any) -> tuple[Any, int]:
         """Retry only provider transport/rate/timeout failures, with a finite bound."""
@@ -184,7 +215,9 @@ class StaleGpt5Client:
             response_format = {
                 'type': 'json_schema',
                 'name': 'stategraph_state_extraction',
-                'schema': self.state_schema,
+                # NativeStateExtractor supplies its StateGraph-owned schema;
+                # keep the legacy facade schema only for old fact-shaped calls.
+                'schema': kwargs.get('candidate_schema', self.state_schema),
                 'strict': True,
             }
         elif prompt_name == 'stategraph.dependency_verification.v1':
@@ -207,11 +240,9 @@ class StaleGpt5Client:
             {'role': item.role, 'content': item.content} for item in messages
         ]
         configured_tokens = os.environ.get('STATEGRAPH_STALE_STRUCTURED_MAX_OUTPUT_TOKENS')
-        # Extraction has a deliberately explicit capacity contract.  The source
-        # is already losslessly bounded to 1,800 characters per request; keeping
-        # the default at 8,192 output tokens prevents dense factual chunks from
-        # being cut mid-JSON while leaving dependency/answer callers' explicit
-        # budgets unchanged.
+        # Keep the extraction output contract fixed. Native extraction bounds
+        # source chunks and subdivides deterministically if structured output is
+        # truncated; increasing this budget would only hide oversized work.
         default_tokens = 8192 if prompt_name == 'stategraph.state_extraction.v2' else 4096
         max_tokens = int(configured_tokens or kwargs.get('max_tokens') or default_tokens)
         request = {
@@ -221,6 +252,8 @@ class StaleGpt5Client:
             'reasoning': {'effort': 'minimal'},
             'text': {'format': response_format},
         }
+        self._active_prompt_name = prompt_name
+        self._request_snapshots[request_sha256(request)] = request
         provider_retry_count = 0
 
         async def one_attempt() -> dict[str, Any]:
@@ -290,7 +323,7 @@ class StaleGpt5Client:
             model=self.model,
             policy=self.retry_policy,
             record=self._record_attempt,
-            allowed_taxonomies={FINISH_REASON_INCOMPLETE, MALFORMED_STRUCTURED_OUTPUT},
+            allowed_taxonomies=_structured_retry_taxonomies(prompt_name),
         )
 
     def generate_answer(self, prompt: str) -> str:
@@ -301,8 +334,14 @@ class StaleGpt5Client:
             'max_output_tokens': 512,
             'reasoning': {'effort': 'minimal'},
         }
+        self._active_prompt_name = 'stategraph.answer_generation.v1'
+        request_hash = request_sha256(request)
+        self._request_snapshots[request_hash] = request
+        attempt_start = len(self.attempt_trace)
 
         def operation() -> str:
+            self.last_response_metadata = None
+            self.last_raw_response_text = None
             if self.provider == 'deepseek':
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -318,32 +357,76 @@ class StaleGpt5Client:
                 if self.provider == 'deepseek'
                 else getattr(response, 'status', None)
             )
+            usage = dump(getattr(response, 'usage', None))
+            if not isinstance(usage, dict):
+                usage = {}
+            input_tokens = usage.get('input_tokens', usage.get('prompt_tokens'))
+            output_tokens = usage.get('output_tokens', usage.get('completion_tokens'))
+            self.last_raw_response_text = text or ''
+            self.last_response_metadata = {
+                'finish_reason': finish_reason,
+                'model': self.model,
+                'max_output_tokens': 512,
+                'usage': usage,
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'request_hash': request_hash,
+            }
             if finish_reason in {'length', 'incomplete'}:
                 raise FinishReasonIncomplete(
                     f'answer response incomplete: finish_reason={finish_reason}',
                     raw_text=text or '',
-                    metadata={'finish_reason': finish_reason},
+                    metadata=self.last_response_metadata,
                 )
             if not text:
-                raise MalformedStructuredOutput('empty answer response', raw_text='')
+                raise MalformedStructuredOutput(
+                    'empty answer response', raw_text='',
+                    metadata=self.last_response_metadata,
+                )
             return text
 
-        return bounded_sync_call(
-            operation,
-            request_snapshot=request,
-            provider=self.provider,
-            model=self.model,
-            policy=self.retry_policy,
-            pacer=self.token_pacer,
-            record=self._record_attempt,
-            allowed_taxonomies={
-                TRANSPORT_FAILURE,
-                TPM_RATE_LIMIT,
-                TIMEOUT,
-                FINISH_REASON_INCOMPLETE,
-                MALFORMED_STRUCTURED_OUTPUT,
-            },
+        scope = (
+            self.profiler.stage(
+                'ANSWER_GENERATION', prompt_name='stategraph.answer_generation.v1'
+            )
+            if self.profiler is not None else nullcontext()
         )
+        with scope:
+            text = bounded_sync_call(
+                operation,
+                request_snapshot=request,
+                provider=self.provider,
+                model=self.model,
+                policy=self.retry_policy,
+                pacer=self.token_pacer,
+                record=self._record_attempt,
+                allowed_taxonomies={
+                    TRANSPORT_FAILURE,
+                    TPM_RATE_LIMIT,
+                    TIMEOUT,
+                    FINISH_REASON_INCOMPLETE,
+                    MALFORMED_STRUCTURED_OUTPUT,
+                },
+            )
+        attempts = [
+            item for item in self.attempt_trace[attempt_start:]
+            if item.get('request_hash') == request_hash
+        ]
+        metadata = self.last_response_metadata or {}
+        self.calls.append({
+            'prompt_name': 'stategraph.answer_generation.v1',
+            'provider': self.provider,
+            'model': self.model,
+            'finish_reason': metadata.get('finish_reason'),
+            'max_output_tokens': 512,
+            'usage': metadata.get('usage'),
+            'input_tokens': metadata.get('input_tokens'),
+            'output_tokens': metadata.get('output_tokens'),
+            'request_hash': request_hash,
+            'attempt_count': len(attempts),
+            'response_chars': len(text),
+        })
+        return text
 
 
 def session_text(session: list[dict[str, Any]], index: int) -> str:
@@ -360,7 +443,11 @@ def checkpoint_identity(case: dict[str, Any], case_dir: Path, method: str) -> di
     source_files = [
         Path(__file__),
         ROOT / 'stategraph' / 'evaluation' / 'checkpoint.py',
+        ROOT / 'stategraph' / 'evaluation' / 'profiling.py',
         ROOT / 'stategraph' / 'system.py',
+        ROOT / 'stategraph' / 'state' / 'native_extraction.py',
+        ROOT / 'stategraph' / 'retrieval' / 'current_state_retriever.py',
+        ROOT / 'stategraph' / 'retrieval' / 'native.py',
         ROOT / 'stategraph' / 'graphiti_adapter' / 'state_extraction.py',
         ROOT / 'stategraph' / 'revision' / 'state_revision.py',
         ROOT / 'stategraph' / 'graphiti_adapter' / 'repository.py',
@@ -464,6 +551,7 @@ def run_baseline(method: str, cases: list[dict[str, Any]]) -> list[dict[str, Any
 async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     from run_stategraph_e2e_integration import _dump
     from stategraph.graphiti_adapter.state_extraction import GraphitiLLMStateExtractor
+    from stategraph.evaluation.profiling import StageProfiler
     from stategraph.state import Observation
     from stategraph.storage import InMemoryStateRepository
     from stategraph.system import StateGraph
@@ -474,7 +562,29 @@ async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         case_dir = OUT / "runtime" / "stategraph" / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
-        client = StaleGpt5Client()
+        requested_profile_path = os.environ.get('STATEGRAPH_PROFILE_PATH')
+        profiler = None
+        if requested_profile_path:
+            profile_path = Path(requested_profile_path)
+            if len(cases) > 1:
+                safe_case_id = str(case_id).replace('/', '_')
+                profile_path = profile_path.with_name(
+                    f'{profile_path.stem}-{safe_case_id}{profile_path.suffix}'
+                )
+            profiler = StageProfiler(
+                profile_path,
+                metadata={
+                    'dataset': 'STALE',
+                    'case_id': str(case_id),
+                    'profile_scope': 'ingestion_retrieval_checkpoint',
+                    'provider': os.environ.get('STATEGRAPH_LLM_PROVIDER', 'openai'),
+                    'model': os.environ.get('STATEGRAPH_LLM_MODEL', 'gpt-5-nano'),
+                    'reasoning_effort': os.environ.get(
+                        'STATEGRAPH_LLM_REASONING_EFFORT', 'minimal'
+                    ),
+                },
+            )
+        client = StaleGpt5Client(profiler=profiler)
         checkpoint = CheckpointManager(
             case_dir / 'checkpoint.json',
             identity=checkpoint_identity(case, case_dir, 'stategraph'),
@@ -484,27 +594,42 @@ async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
             graph = StateGraph(
                 repository=repository,
                 extractor=GraphitiLLMStateExtractor(
-                    client, max_llm_characters=1800,
-                    trace_path=case_dir / "extraction_trace.jsonl"
+                    client,
+                    trace_path=case_dir / "extraction_trace.jsonl",
+                    profiler=profiler,
+                    native_mode=True,
                 ),
                 revision_trace_path=case_dir / "revision_trace.jsonl",
+                profiler=profiler,
             )
             group_id = f"stale-minimal-{case_id}"
             base = datetime(2025, 1, 1, tzinfo=timezone.utc)
             ingests = []
-            position = checkpoint.resume_position()
-            completed = int(position['observation_index'])
-            if completed > len(case['haystack_session']):
-                raise RuntimeError('checkpoint observation index exceeds STALE session count')
-            if checkpoint.exists() and checkpoint.load().get('state_snapshot'):
-                current = checkpoint.load()
-                if current['last_committed_observation_index'] >= 0 or current.get('in_progress'):
-                    await restore_repository_snapshot(
-                        repository,
-                        current['state_snapshot'],
-                        replace=bool(current.get('in_progress')),
-                        group_id=group_id,
-                    )
+            restore_observation = (
+                profiler.observation(f'{case_id}:checkpoint-restore')
+                if profiler is not None else nullcontext()
+            )
+            with restore_observation:
+                restore_scope = (
+                    profiler.stage('CHECKPOINT_IO', operation='resume_and_restore')
+                    if profiler is not None else nullcontext()
+                )
+                with restore_scope:
+                    position = checkpoint.resume_position()
+                    completed = int(position['observation_index'])
+                    if completed > len(case['haystack_session']):
+                        raise RuntimeError(
+                            'checkpoint observation index exceeds STALE session count'
+                        )
+                    if checkpoint.exists() and checkpoint.load().get('state_snapshot'):
+                        current = checkpoint.load()
+                        if current['last_committed_observation_index'] >= 0 or current.get('in_progress'):
+                            await restore_repository_snapshot(
+                                repository,
+                                current['state_snapshot'],
+                                replace=bool(current.get('in_progress')),
+                                group_id=group_id,
+                            )
             for index, session in enumerate(case["haystack_session"][completed:], start=completed):
                 text = session_text(session, index)
                 call_offset = len(client.calls)
@@ -518,43 +643,73 @@ async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     name=f"STALE session {index + 1}",
                     source_description="Official STALE haystack session",
                 )
-                checkpoint.mark_in_progress(index, observation.observation_id)
-                try:
-                    result = await graph.ingest(observation)
-                    snapshot = await snapshot_repository(
-                        repository,
-                        group_id,
-                        evidence_ids=(result.evidence.evidence_id,),
-                        extra={
-                            'last_observation_id': result.observation_id,
-                            'last_observation_index': index,
-                            'invalidated_state_ids': list(result.invalidated_state_ids),
-                            'propagation_steps': [_dump(step) for step in result.propagation_steps],
-                        },
+                observation_scope = (
+                    profiler.observation(observation.observation_id, index)
+                    if profiler is not None else nullcontext()
+                )
+                with observation_scope:
+                    mark_scope = (
+                        profiler.stage('CHECKPOINT_IO', operation='mark_in_progress')
+                        if profiler is not None else nullcontext()
                     )
-                    checkpoint.commit_observation(
-                        index,
-                        observation.observation_id,
-                        state_snapshot=snapshot,
-                        provider_call_manifest=client.calls[call_offset:],
-                        request_hashes=[item['request_hash'] for item in client.calls[call_offset:] if item.get('request_hash')],
-                        accepted_response_hashes=[
-                            hashlib.sha256(str(item['raw_response']).encode('utf-8')).hexdigest()
-                            for item in client.calls[call_offset:] if item.get('raw_response') is not None
-                        ],
-                    )
-                except Exception as exc:
-                    checkpoint.record_failure(exc)
-                    raise
+                    with mark_scope:
+                        checkpoint.mark_in_progress(index, observation.observation_id)
+                    try:
+                        result = await graph.ingest(observation)
+                        snapshot_scope = (
+                            profiler.stage('SNAPSHOT_SERIALIZATION')
+                            if profiler is not None else nullcontext()
+                        )
+                        with snapshot_scope:
+                            snapshot = await snapshot_repository(
+                                repository,
+                                group_id,
+                                evidence_ids=(result.evidence.evidence_id,),
+                                extra={
+                                    'last_observation_id': result.observation_id,
+                                    'last_observation_index': index,
+                                    'invalidated_state_ids': list(result.invalidated_state_ids),
+                                    'propagation_steps': [_dump(step) for step in result.propagation_steps],
+                                },
+                            )
+                        commit_scope = (
+                            profiler.stage('CHECKPOINT_WRITE')
+                            if profiler is not None else nullcontext()
+                        )
+                        with commit_scope:
+                            checkpoint.commit_observation(
+                                index,
+                                observation.observation_id,
+                                state_snapshot=snapshot,
+                                provider_call_manifest=client.calls[call_offset:],
+                                request_hashes=[item['request_hash'] for item in client.calls[call_offset:] if item.get('request_hash')],
+                                accepted_response_hashes=[
+                                    hashlib.sha256(str(item['raw_response']).encode('utf-8')).hexdigest()
+                                    for item in client.calls[call_offset:] if item.get('raw_response') is not None
+                                ],
+                            )
+                    except Exception as exc:
+                        failure_scope = (
+                            profiler.stage('CHECKPOINT_WRITE', operation='record_failure')
+                            if profiler is not None else nullcontext()
+                        )
+                        with failure_scope:
+                            checkpoint.record_failure(exc)
+                        raise
                 ingests.append(result)
             queries: dict[str, Any] = {}
             for dim, query in case["probing_queries"].items():
-                retrieval = await graph.retrieve(query, group_id=group_id, limit=10)
-                queries[dim] = {
-                    "query": query,
-                    "result": _dump(retrieval),
-                    "context": retrieval.grounded_context(),
-                }
+                retrieval_observation = (
+                    profiler.observation(f'{case_id}:retrieval:{dim}')
+                    if profiler is not None else nullcontext()
+                )
+                with retrieval_observation:
+                    retrieval = await graph.retrieve(query, group_id=group_id, limit=10)
+                    queries[dim] = {
+                        "query": query,
+                        "result": _dump(retrieval),
+                        "context": retrieval.grounded_context(),
+                    }
             states = await graph.repository.list_states(group_id)
             relations = await graph.repository.list_relations(group_id)
             row = {
@@ -573,7 +728,20 @@ async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ingested_session_count": len(case["haystack_session"]),
                 "latency_seconds": time.perf_counter() - started,
             }
-            (case_dir / "stage_trace.json").write_text(json.dumps(row, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            trace_observation = (
+                profiler.observation(f'{case_id}:trace-serialization')
+                if profiler is not None else nullcontext()
+            )
+            with trace_observation:
+                trace_scope = (
+                    profiler.stage('SERIALIZATION', output='stage_trace.json')
+                    if profiler is not None else nullcontext()
+                )
+                with trace_scope:
+                    (case_dir / "stage_trace.json").write_text(
+                        json.dumps(row, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
         except Exception as exc:
             row = {
                 "case_id": case_id,
@@ -587,6 +755,9 @@ async def run_stategraph(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "api_error_trace": client.error_trace,
                 "latency_seconds": time.perf_counter() - started,
             }
+        finally:
+            if profiler is not None:
+                profiler.write()
         rows.append(row)
         path = OUT / "raw" / "stategraph_retrieval.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)

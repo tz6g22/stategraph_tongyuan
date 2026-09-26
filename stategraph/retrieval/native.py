@@ -55,6 +55,9 @@ class StateGraphNativeRetriever(CurrentStateRetriever):
         *,
         premise_checker: PremiseChecker | None = None,
         candidate_source: StateGraphCandidateSource | None = None,
+        graph_depth: int = 2,
+        graph_beam_width: int = 4,
+        relational_max_hops: int = 3,
     ) -> None:
         source = candidate_source or StateGraphCandidateSource(repository)
         super().__init__(
@@ -62,6 +65,9 @@ class StateGraphNativeRetriever(CurrentStateRetriever):
             graph_search=None,
             premise_checker=premise_checker,
             candidate_source=source,
+            graph_depth=graph_depth,
+            graph_beam_width=graph_beam_width,
+            relational_max_hops=relational_max_hops,
         )
         self.candidate_source = source
 

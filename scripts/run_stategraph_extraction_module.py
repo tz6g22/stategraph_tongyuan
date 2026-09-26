@@ -25,13 +25,32 @@ class Gpt5Client:
         self.client = OpenAI(api_key=key, timeout=180, max_retries=1)
         self.calls = 0
 
-    async def generate_response(self, messages, **_kwargs):
+    async def generate_response(self, messages, **kwargs):
+        from stategraph.graphiti_adapter.dependency_discovery import (
+            CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
+            DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
+        )
+        from stategraph.state.native_extraction import STATE_EXTRACTION_OUTPUT_SCHEMA
+
+        prompt_name = kwargs.get('prompt_name')
+        schemas = {
+            'stategraph.state_extraction.v2': STATE_EXTRACTION_OUTPUT_SCHEMA,
+            'stategraph.dependency_candidate_discovery.v1': kwargs.get(
+                'candidate_schema', CANDIDATE_DISCOVERY_OUTPUT_SCHEMA
+            ),
+            'stategraph.dependency_verification.v1': DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
+        }
+        schema = schemas.get(prompt_name)
+        response_format = (
+            {'type': 'json_schema', 'name': 'stategraph_structured', 'schema': schema, 'strict': True}
+            if schema is not None else {'type': 'json_object'}
+        )
         response = self.client.responses.create(
             model='gpt-5-nano',
             input=[{'role': m.role, 'content': m.content} for m in messages],
-            max_output_tokens=2048,
+            max_output_tokens=int(kwargs.get('max_tokens', 2048)),
             reasoning={'effort': 'minimal'},
-            text={'format': {'type': 'json_object'}},
+            text={'format': response_format},
         )
         self.calls += 1
         text = response.output_text or ''
@@ -53,7 +72,7 @@ async def main() -> None:
     for case in payload['cases']:
         client = Gpt5Client()
         trace_path = traces / f"{case['case_id']}_extraction_trace.jsonl"
-        extractor = GraphitiLLMStateExtractor(client, trace_path=trace_path)
+        extractor = GraphitiLLMStateExtractor(client, trace_path=trace_path, native_mode=True)
         observations = list(case['history']) + [case['new_observation']]
         for index, item in enumerate(observations):
             observation = Observation(
@@ -62,7 +81,7 @@ async def main() -> None:
                 name=item['id'], group_id=f"statechange-dev-{case['case_id']}",
                 observation_index=index,
             )
-            candidates = await extractor.extract(observation, ())
+            candidates = await extractor.extract(observation)
             rows.append({
                 'case_id': case['case_id'], 'observation_id': item['id'],
                 'source_observation': item['text'],

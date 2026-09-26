@@ -4,12 +4,16 @@ import unittest
 
 from stategraph.evaluation.provider_resilience import (
     ContractViolation,
+    FINISH_REASON_INCOMPLETE,
+    MALFORMED_STRUCTURED_OUTPUT,
     FinishReasonIncomplete,
     MalformedStructuredOutput,
     ProviderRetryPolicy,
     TokenPacer,
     bounded_async_call,
 )
+from stategraph.evaluation.graphiti_runtime import _retryable_taxonomies
+from scripts.run_stale_method import _structured_retry_taxonomies
 
 
 class APIConnectionError(Exception):
@@ -64,6 +68,96 @@ class ProviderResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(attempts, 2)
         self.assertEqual(records[0]["taxonomy"], "TRANSPORT_FAILURE")
+
+    async def test_transport_retry_is_finite_and_semantic_effect_happens_once(self):
+        attempts = 0
+        committed = []
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise APIConnectionError("connection reset")
+            return {"state": "ready"}
+
+        result, records = await self.run_call(
+            operation,
+            retry_policy=policy(transport_retries=2),
+            retry_kinds={"TRANSPORT_FAILURE"},
+            snapshot={"immutable_request": "same", "max_output_tokens": 0},
+        )
+        committed.append(result)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(committed, [{"state": "ready"}])
+        self.assertEqual(len({item["request_hash"] for item in records}), 1)
+
+    async def test_dependency_verifier_truncation_is_subdivided_not_same_batch_retried(self):
+        self.assertNotIn(
+            FINISH_REASON_INCOMPLETE,
+            _retryable_taxonomies('stategraph.dependency_verification.v1'),
+        )
+        self.assertNotIn(
+            MALFORMED_STRUCTURED_OUTPUT,
+            _retryable_taxonomies('stategraph.dependency_verification.v1'),
+        )
+        self.assertIn(
+            'TRANSPORT_FAILURE',
+            _retryable_taxonomies('stategraph.dependency_verification.v1'),
+        )
+        self.assertNotIn(
+            FINISH_REASON_INCOMPLETE,
+            _retryable_taxonomies('stategraph.state_extraction.v2'),
+        )
+        self.assertIn(
+            MALFORMED_STRUCTURED_OUTPUT,
+            _retryable_taxonomies('stategraph.state_extraction.v2'),
+        )
+        self.assertNotIn(
+            FINISH_REASON_INCOMPLETE,
+            _structured_retry_taxonomies('stategraph.state_extraction.v2'),
+        )
+
+    async def test_verifier_truncation_policy_surfaces_after_one_same_batch_attempt(self):
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            raise FinishReasonIncomplete('finish_reason=incomplete', raw_text='{')
+
+        with self.assertRaises(FinishReasonIncomplete):
+            await bounded_async_call(
+                operation,
+                request_snapshot={'pair_count': 8},
+                provider='openai',
+                model='fixture',
+                policy=policy(structured_retries=3),
+                allowed_taxonomies=_retryable_taxonomies(
+                    'stategraph.dependency_verification.v1'
+                ),
+            )
+        self.assertEqual(attempts, 1)
+
+    async def test_extraction_truncation_uses_subdivision_not_identical_retry(self):
+        attempts = 0
+
+        def operation():
+            nonlocal attempts
+            attempts += 1
+            raise FinishReasonIncomplete('finish_reason=incomplete', raw_text='{')
+
+        with self.assertRaises(FinishReasonIncomplete):
+            await bounded_async_call(
+                operation,
+                request_snapshot={'source_chunk': 'same', 'max_output_tokens': 8192},
+                provider='openai',
+                model='fixture',
+                policy=policy(structured_retries=4),
+                allowed_taxonomies=_structured_retry_taxonomies(
+                    'stategraph.state_extraction.v2'
+                ),
+            )
+        self.assertEqual(attempts, 1)
 
     async def test_repeated_transport_fails_after_bound(self):
         attempts = 0

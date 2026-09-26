@@ -299,6 +299,7 @@ async def bounded_async_call(
     policy: ProviderRetryPolicy,
     pacer: TokenPacer | None = None,
     record: Callable[[dict[str, Any]], None] | None = None,
+    record_start: Callable[[dict[str, Any]], None] | None = None,
     classify: Callable[[Exception], str] = classify_error,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     allowed_taxonomies: set[str] | None = None,
@@ -318,6 +319,22 @@ async def bounded_async_call(
     while True:
         attempt += 1
         waited = await pacer.wait(tokens) if pacer is not None else 0.0
+        if record_start is not None:
+            record_start(
+                {
+                    "attempt_index": attempt,
+                    "request_hash": fingerprint,
+                    "provider": provider,
+                    "model": model,
+                    "estimated_input_tokens": input_tokens,
+                    "output_budget": (
+                        request_snapshot.get("max_output_tokens")
+                        if isinstance(request_snapshot, dict)
+                        else None
+                    ),
+                    "wait_seconds": waited,
+                }
+            )
         started = time.perf_counter()
         try:
             result = operation()
@@ -397,6 +414,7 @@ def bounded_sync_call(
     policy: ProviderRetryPolicy,
     pacer: TokenPacer | None = None,
     record: Callable[[dict[str, Any]], None] | None = None,
+    record_start: Callable[[dict[str, Any]], None] | None = None,
     classify: Callable[[Exception], str] = classify_error,
     sleep: Callable[[float], None] = time.sleep,
     allowed_taxonomies: set[str] | None = None,
@@ -415,6 +433,22 @@ def bounded_sync_call(
     while True:
         attempt += 1
         waited = pacer.wait_sync(tokens, sleep=sleep) if pacer is not None else 0.0
+        if record_start is not None:
+            record_start(
+                {
+                    "attempt_index": attempt,
+                    "request_hash": fingerprint,
+                    "provider": provider,
+                    "model": model,
+                    "estimated_input_tokens": input_tokens,
+                    "output_budget": (
+                        request_snapshot.get("max_output_tokens")
+                        if isinstance(request_snapshot, dict)
+                        else None
+                    ),
+                    "wait_seconds": waited,
+                }
+            )
         started = time.perf_counter()
         try:
             result = operation()

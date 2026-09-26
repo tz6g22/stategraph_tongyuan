@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Protocol, Sequence
 
 from stategraph.state.linking import SlotIdentity, StateLinker
-from stategraph.state.schema import StateNode
+from stategraph.state.schema import StateNode, canonical_state_value
 
 
 class ConflictType(str, Enum):
@@ -111,13 +111,15 @@ class ConflictDetector:
             return ConflictType.CONSISTENT, 'states describe different attributes', 1.0
 
         same_value = (
-            new_state.normalised_value == old_state.normalised_value
+            canonical_state_value(
+                new_state.canonical_field_id or new_state.attribute, new_state.value
+            )
+            == canonical_state_value(
+                old_state.canonical_field_id or old_state.attribute, old_state.value
+            )
             or old_state.state_id in new_state.metadata.get('slot_grounding_equivalent_ids', ())
         )
-        same_scope = (
-            new_state.time_scope == old_state.time_scope
-            and new_state.condition_scope == old_state.condition_scope
-        )
+        same_scope = new_state.slot_scope_key == old_state.slot_scope_key
         confirms_open_state = (
             new_state.condition_scope == old_state.condition_scope
             and new_state.time_scope.end is None

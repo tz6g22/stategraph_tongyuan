@@ -1,0 +1,107 @@
+[
+  {"id":"functional_01","category":"functional_replacement","subject":"Nora","predicate":"current_city","steps":[
+    {"text":"After graduating, Nora made Bristol her home.","value":"Bristol","active":[0]},
+    {"text":"Nora relocated to Leeds permanently this summer.","value":"Leeds","op":"REPLACE","active":[1]}]},
+  {"id":"functional_02","category":"functional_replacement","subject":"Owen","predicate":"current_city","steps":[
+    {"text":"Owen's home city is Sapporo.","value":"Sapporo","active":[0]},
+    {"text":"Owen's home city is now Busan; the move is complete.","value":"Busan","op":"REPLACE","active":[1]}]},
+  {"id":"addition_01","category":"set_addition","subject":"Priya","predicate":"likes","steps":[
+    {"text":"For dessert, Priya enjoys mango.","value":"mango","active":[0]},
+    {"text":"Priya has developed a taste for lychee as well.","value":"lychee","op":"ADD","active":[0,1]}]},
+  {"id":"addition_02","category":"set_addition","subject":"Quinn","kind":"RELATION","predicate":"member_of","steps":[
+    {"text":"Quinn belongs to the alpine club.","value":"alpine club","active":[0]},
+    {"text":"Alongside that membership, Quinn joined the astronomy club.","value":"astronomy club","op":"ADD","active":[0,1]}]},
+  {"id":"removal_01","category":"set_removal","subject":"Ravi","predicate":"likes","steps":[
+    {"text":"Ravi enjoys the taste of saffron.","value":"saffron","active":[0]},
+    {"text":"Cardamom is another spice Ravi likes.","value":"Cardamom","op":"ADD","active":[0,1]},
+    {"text":"Ravi no longer likes cardamom, although other tastes are unchanged.","value":"cardamom","op":"REMOVE","polarity":"NEGATED","active":[0,2]}]},
+  {"id":"removal_02","category":"set_removal","subject":"Sana","predicate":"likes","steps":[
+    {"text":"Sana likes basil in cooked dishes.","value":"basil","active":[0]},
+    {"text":"Sana likes thyme in addition to basil.","value":"thyme","op":"ADD","active":[0,1]},
+    {"text":"Thyme no longer appeals to Sana.","value":"Thyme","op":"REMOVE","polarity":"NEGATED","active":[0,2]}]},
+  {"id":"patch_01","category":"partial_patch","subject":"budget review","predicate":"meeting","kind":"EVENT","bindings":[["instance","budget review"]],"steps":[
+    {"text":"The budget review begins at 09:30.","facet":"time","value":"09:30","active":[0]},
+    {"text":"The budget review takes place in Harbor Hall.","facet":"location","value":"Harbor Hall","active":[0,1]},
+    {"text":"The budget review is confirmed.","facet":"status","value":"confirmed","active":[0,1,2]},
+    {"text":"The budget review will begin at 11:00 instead; nothing else changes.","facet":"time","value":"11:00","op":"PATCH","active":[1,2,3]}]},
+  {"id":"patch_02","category":"partial_patch","subject":"Briefing-8","predicate":"meeting","kind":"EVENT","bindings":[["instance","Briefing-8"]],"steps":[
+    {"text":"Briefing-8 is booked for Tuesday.","facet":"time","value":"Tuesday","active":[0]},
+    {"text":"Briefing-8 will use Cedar Room.","facet":"location","value":"Cedar Room","active":[0,1]},
+    {"text":"Briefing-8 is confirmed on the calendar.","facet":"status","value":"confirmed","active":[0,1,2]},
+    {"text":"Briefing-8 has been pushed back to Wednesday; the room is unchanged.","facet":"time","value":"Wednesday","op":"PATCH","active":[1,2,3]}]},
+  {"id":"relation_01","category":"multi_valued_relation","subject":"Tariq","predicate":"member_of","kind":"RELATION","steps":[
+    {"text":"Tariq holds membership in the river guild.","value":"river guild","active":[0]},
+    {"text":"Tariq now belongs to the makers guild as well, retaining the earlier affiliation.","value":"makers guild","op":"ADD","active":[0,1]}]},
+  {"id":"relation_02","category":"multi_valued_relation","subject":"Uma","predicate":"collaborates_with","kind":"RELATION","steps":[
+    {"text":"Uma collaborates with Keiko on acoustic research.","value":"Keiko","active":[0]},
+    {"text":"A separate project has Uma collaborating with Tomas as well.","value":"Tomas","op":"ADD","active":[0,1]}]},
+  {"id":"employment_01","category":"employment_role","subject":"Victor","predicate":"employment","kind":"ROLE","steps":[
+    {"text":"Victor works at Northstar on a part-time contract.","facet":"status","value":"works","bindings":[["organization","Northstar"]],"active":[0]},
+    {"text":"Victor's title at Northstar is analyst.","facet":"role","value":"analyst","bindings":[["organization","Northstar"]],"active":[0,1]},
+    {"text":"Victor also works at Bluebird without leaving Northstar.","facet":"status","value":"works","bindings":[["organization","Bluebird"]],"op":"ADD","active":[0,1,2]},
+    {"text":"At Bluebird, Victor is a consultant.","facet":"role","value":"consultant","bindings":[["organization","Bluebird"]],"op":"ADD","active":[0,1,2,3]},
+    {"text":"Victor left Northstar last week; the other contract continues.","facet":"status","value":"left","bindings":[["organization","Northstar"]],"op":"REMOVE","polarity":"NEGATED","active":[2,3,4]}]},
+  {"id":"employment_02","category":"employment_role","subject":"Willa","predicate":"employment","kind":"ROLE","steps":[
+    {"text":"Willa serves Elmworks as a contractor.","facet":"status","value":"serves","bindings":[["organization","Elmworks"]],"active":[0]},
+    {"text":"Willa is a designer for Elmworks.","facet":"role","value":"designer","bindings":[["organization","Elmworks"]],"active":[0,1]},
+    {"text":"In a concurrent contract, Willa serves Oakline.","facet":"status","value":"serves","bindings":[["organization","Oakline"]],"op":"ADD","active":[0,1,2]},
+    {"text":"Willa's position at Oakline is researcher.","facet":"role","value":"researcher","bindings":[["organization","Oakline"]],"op":"ADD","active":[0,1,2,3]}]},
+  {"id":"event_01","category":"event_update","subject":"Lecture-4","predicate":"meeting","kind":"EVENT","bindings":[["instance","Lecture-4"]],"steps":[
+    {"text":"Lecture-4 is scheduled for Thursday.","facet":"time","value":"Thursday","active":[0]},
+    {"text":"Lecture-4 is scheduled.","facet":"status","value":"scheduled","active":[0,1]},
+    {"text":"Lecture-4 was cancelled after the speaker withdrew.","facet":"status","value":"cancelled","op":"PATCH","active":[0,2]}]},
+  {"id":"event_02","category":"event_update","subject":"Concert-12","predicate":"meeting","kind":"EVENT","bindings":[["instance","Concert-12"]],"steps":[
+    {"text":"Concert-12 will be held at Plaza.","facet":"location","value":"Plaza","active":[0]},
+    {"text":"Concert-12 takes place on Saturday.","facet":"time","value":"Saturday","active":[0,1]},
+    {"text":"Concert-12 moved to Forum while retaining its date.","facet":"location","value":"Forum","op":"PATCH","active":[1,2]}]},
+  {"id":"preference_01","category":"preference_change","subject":"Yara","predicate":"likes","steps":[
+    {"text":"Yara prefers oat milk at breakfast.","value":"oat milk","active":[0]},
+    {"text":"Yara also prefers black tea in the afternoon.","value":"black tea","op":"ADD","active":[0,1]},
+    {"text":"Black tea has lost its appeal for Yara, who still enjoys the other drink.","value":"Black tea","op":"REMOVE","polarity":"NEGATED","active":[0,2]}]},
+  {"id":"preference_02","category":"preference_change","subject":"Zane","predicate":"likes","steps":[
+    {"text":"Zane likes quiet rooms when choosing accommodation.","value":"quiet rooms","active":[0]},
+    {"text":"Zane likes bright rooms too.","value":"bright rooms","op":"ADD","active":[0,1]},
+    {"text":"Zane stopped liking bright rooms after trying one.","value":"bright rooms","op":"REMOVE","polarity":"NEGATED","active":[0,2]}]},
+  {"id":"ownership_01","category":"ownership_membership","subject":"Asha","predicate":"owns","kind":"RELATION","steps":[
+    {"text":"Asha owns a brass compass inherited from a relative.","value":"brass compass","active":[0]},
+    {"text":"Asha bought a field notebook and kept the compass.","value":"field notebook","op":"ADD","active":[0,1]},
+    {"text":"Asha no longer owns the field notebook, having given it away.","value":"field notebook","op":"REMOVE","polarity":"NEGATED","active":[0,2]}]},
+  {"id":"ownership_02","category":"ownership_membership","subject":"Bela","predicate":"member_of","kind":"RELATION","steps":[
+    {"text":"Bela is a member of the chess circle.","value":"chess circle","active":[0]},
+    {"text":"Bela joined the reading circle and retained the chess membership.","value":"reading circle","op":"ADD","active":[0,1]},
+    {"text":"Bela left the chess circle but continues in the reading circle.","value":"chess circle","op":"REMOVE","polarity":"NEGATED","active":[1,2]}]},
+  {"id":"subject_01","category":"third_party_subject","subject":"Cora","predicate":"current_city","steps":[
+    {"text":"Cora is based in Tallinn.","value":"Tallinn","active":[0]},
+    {"text":"Cora mentioned that Deni moved to Riga, not Cora.","subject":"Deni","value":"Riga","op":"REPLACE","active":[0,1]}]},
+  {"id":"subject_02","category":"third_party_subject","subject":"Eli","predicate":"current_city","steps":[
+    {"text":"Eli lives in Porto.","value":"Porto","active":[0]},
+    {"text":"Faye relocated to Ghent; Eli is only helping with the boxes.","subject":"Faye","value":"Ghent","op":"REPLACE","active":[0,1]}]},
+  {"id":"polarity_01","category":"polarity_negation","subject":"Gita","predicate":"available","steps":[
+    {"text":"Gita is available for the assignment.","value":"available","active":[0]},
+    {"text":"Gita is no longer available for that assignment.","value":"available","op":"REPLACE","polarity":"NEGATED","active":[1]}]},
+  {"id":"polarity_02","category":"polarity_negation","subject":"Hugo","predicate":"available","steps":[
+    {"text":"Hugo is available for the shift.","value":"available","active":[0]},
+    {"text":"Hugo isn't available anymore; the shift needs someone else.","value":"available","op":"REPLACE","polarity":"NEGATED","active":[1]}]},
+  {"id":"temporal_01","category":"temporal_scope","subject":"Inez","predicate":"available","steps":[
+    {"text":"Inez is available on 2032-05-01, for that day only.","value":"available","date":"2032-05-01","active":[0]},
+    {"text":"Inez is available again on 2032-06-01, also for one day.","value":"available","date":"2032-06-01","active":[0,1]}]},
+  {"id":"temporal_02","category":"temporal_scope","subject":"Jon","predicate":"available","steps":[
+    {"text":"Jon can help with setup on 2032-07-10 only.","value":"help","date":"2032-07-10","active":[0]},
+    {"text":"For 2032-08-10 only, Jon can help with setup too.","value":"help","date":"2032-08-10","active":[0,1]}]},
+  {"id":"conditional_01","category":"conditional_action","subject":"Kira","predicate":"schedule_meeting","kind":"ACTION","steps":[
+    {"text":"Kira will reserve Room-4 if the projector is available.","facet":"status","value":"reserve","bindings":[["instance","Room-4"]],"modality":"PLANNED","conditions":[["projector","available"]],"condition_text":"the projector is available","active":[0]}]},
+  {"id":"conditional_02","category":"conditional_action","subject":"Luca","predicate":"schedule_meeting","kind":"ACTION","steps":[
+    {"text":"Provided the budget is approved, Luca will book Suite-9.","facet":"status","value":"book","bindings":[["instance","Suite-9"]],"modality":"PLANNED","conditions":[["budget","approved"]],"condition_text":"the budget is approved","active":[0]}]},
+  {"id":"ambiguous_01","category":"ambiguous_update","subject":"Mara","predicate":"current_city","steps":[
+    {"text":"Mara lives in Bern.","value":"Bern","active":[0]},
+    {"text":"Mara might move to Graz, but has not decided.","value":"Graz","op":"UNKNOWN","polarity":"UNKNOWN","active":[0],"uncertain":[1]}]},
+  {"id":"ambiguous_02","category":"ambiguous_update","subject":"Niko","predicate":"current_city","steps":[
+    {"text":"Niko's current address is in Varna.","value":"Varna","active":[0]},
+    {"text":"An undated note lists Plovdiv as Niko's home; its accuracy is unconfirmed.","value":"Plovdiv","op":"UNKNOWN","polarity":"UNKNOWN","active":[0],"uncertain":[1]}]},
+  {"id":"recall_01","category":"ordinary_no_change_recall","subject":"Olia","predicate":"current_city","steps":[
+    {"text":"Olia lives in Quito near the old town.","value":"Quito","active":[0]},
+    {"text":"Quito is still Olia's home city; nothing has changed.","value":"Quito","active":[0]}]},
+  {"id":"recall_02","category":"ordinary_no_change_recall","subject":"Pavel","predicate":"blood_type","steps":[
+    {"text":"Pavel's blood type is AB-positive.","value":"AB-positive","active":[0]},
+    {"text":"A second record confirms AB-positive as Pavel's blood type.","value":"AB-positive","active":[0]}]}
+]

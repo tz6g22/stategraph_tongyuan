@@ -62,13 +62,35 @@ def evidence_id_for(
 
 
 def canonical_field_id(value: str) -> str:
-    """Normalize an explicitly observed field label without semantic aliases."""
+    """Normalize an explicitly observed field label's typography."""
 
     import re
 
     return '_'.join(
         token for token in re.split(r'[\s_-]+', value.casefold().strip()) if token
     )
+
+
+_GENERIC_ATTRIBUTE_ALIASES = {
+    'job': 'employment_role',
+    'occupation': 'employment_role',
+    'current_job': 'employment_role',
+    'current_role': 'employment_role',
+    'job_title': 'employment_role',
+    'free_on': 'availability',
+    'used_tool': 'tool_use',
+    'tool_experience': 'tool_use',
+}
+
+
+def canonical_attribute_id(value: str) -> str:
+    """Return a small, general semantic slot normalization for linking.
+
+    Arbitrary synonym expansion belongs in a separately evaluated ontology.
+    """
+
+    normalized = canonical_field_id(value)
+    return _GENERIC_ATTRIBUTE_ALIASES.get(normalized, normalized)
 
 
 _ATTRIBUTE_GRAMMAR = frozenset(
@@ -91,7 +113,10 @@ def attribute_tokens(attribute: str) -> frozenset[str]:
 
 
 def attributes_compatible(left: str, right: str) -> bool:
-    """Match relation-label variants without introducing domain-specific aliases."""
+    """Match formatting variants and the small generic slot normalization."""
+
+    if canonical_attribute_id(left) == canonical_attribute_id(right):
+        return True
 
     left_tokens = attribute_tokens(left)
     right_tokens = attribute_tokens(right)
@@ -124,6 +149,79 @@ class DependencyStrength(str, Enum):
     STRICT = 'strict_dependency'
     WEAK = 'weak_dependency'
     NONE = 'no_dependency'
+
+
+class SubjectResolutionType(str, Enum):
+    DIRECT_SURFACE = 'DIRECT_SURFACE'
+    DETERMINISTIC_ANTECEDENT = 'DETERMINISTIC_ANTECEDENT'
+    UNRESOLVED = 'UNRESOLVED'
+    # Legacy serialized spelling; production extraction emits UNRESOLVED.
+    NONE = 'NONE'
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectProvenance:
+    """Source anchor for a normalized subject; ranges are observation-absolute."""
+
+    subject_normalized: str
+    subject_surface: str | None = None
+    subject_source_start: int | None = None
+    subject_source_end: int | None = None
+    # Source IDs identify the EvidenceRecord; observation_id identifies its source.
+    subject_source_id: str | None = None
+    observation_id: str | None = None
+    resolution_type: SubjectResolutionType = SubjectResolutionType.NONE
+    coordinate_space: str = 'OBSERVATION_ABSOLUTE'
+    antecedent_surface: str | None = None
+    antecedent_start: int | None = None
+    antecedent_end: int | None = None
+    antecedent_source_id: str | None = None
+    subject_segment_id: str | None = None
+    antecedent_segment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'resolution_type', SubjectResolutionType(self.resolution_type))
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            'subject_normalized': self.subject_normalized,
+            'subject_surface': self.subject_surface,
+            'subject_source_start': self.subject_source_start,
+            'subject_source_end': self.subject_source_end,
+            'subject_source_id': self.subject_source_id,
+            'observation_id': self.observation_id,
+            'resolution_type': self.resolution_type.value,
+            'coordinate_space': self.coordinate_space,
+            'antecedent_surface': self.antecedent_surface,
+            'antecedent_start': self.antecedent_start,
+            'antecedent_end': self.antecedent_end,
+            'antecedent_source_id': self.antecedent_source_id,
+            'subject_segment_id': self.subject_segment_id,
+            'antecedent_segment_id': self.antecedent_segment_id,
+        }
+
+    @classmethod
+    def deserialize(cls, payload: Mapping[str, Any]) -> SubjectProvenance:
+        return cls(
+            subject_normalized=str(payload.get('subject_normalized', '')),
+            subject_surface=payload.get('subject_surface'),
+            subject_source_start=(int(payload['subject_source_start'])
+                                  if payload.get('subject_source_start') is not None else None),
+            subject_source_end=(int(payload['subject_source_end'])
+                                if payload.get('subject_source_end') is not None else None),
+            subject_source_id=payload.get('subject_source_id'),
+            observation_id=payload.get('observation_id'),
+            resolution_type=SubjectResolutionType(payload.get('resolution_type', 'NONE')),
+            coordinate_space=str(payload.get('coordinate_space', 'OBSERVATION_ABSOLUTE')),
+            antecedent_surface=payload.get('antecedent_surface'),
+            antecedent_start=(int(payload['antecedent_start'])
+                              if payload.get('antecedent_start') is not None else None),
+            antecedent_end=(int(payload['antecedent_end'])
+                            if payload.get('antecedent_end') is not None else None),
+            antecedent_source_id=payload.get('antecedent_source_id'),
+            subject_segment_id=payload.get('subject_segment_id'),
+            antecedent_segment_id=payload.get('antecedent_segment_id'),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +257,28 @@ class TimeScope:
         return (self.start is None or self.start <= at) and (self.end is None or at < self.end)
 
 
+def canonical_semantic_scope(
+    time_scope: TimeScope | None,
+    *,
+    observed_at: datetime | None = None,
+) -> TimeScope:
+    """Remove only the observation-derived bookkeeping boundary.
+
+    Extraction currently materializes an omitted start as ``observed_at``.  A
+    boundary at that exact timestamp is therefore implicit; all other bounds
+    remain semantic scope and continue to participate in identity matching.
+    Observation/version timestamps remain on the state for chronology.
+    """
+
+    scope = time_scope or TimeScope()
+    start, end = scope.start, scope.end
+    if observed_at is not None and start == ensure_utc(observed_at):
+        start = None
+        if end == ensure_utc(observed_at):
+            end = None
+    return TimeScope(start, end)
+
+
 @dataclass(frozen=True, slots=True)
 class ConditionScope:
     """A conjunction of explicit conditions under which a state applies."""
@@ -190,6 +310,84 @@ class ConditionScope:
         mine = set(self.conditions)
         theirs = set(other.conditions)
         return theirs.issubset(mine) and mine != theirs
+
+
+def canonical_state_value(attribute: str, value: Any) -> str:
+    """Normalize value surface forms only for detecting equivalent slot versions."""
+
+    normalized = _normalise(str(value))
+    if canonical_attribute_id(attribute) == 'availability':
+        import re
+
+        normalized = re.sub(r'\b(?:free|available)\b', ' ', normalized)
+        normalized = ' '.join(normalized.split())
+        normalized = re.sub(r'^(?:on|at|for)\s+', '', normalized)
+        normalized = ' '.join(normalized.split())
+    return normalized
+
+
+def canonical_state_slot_key(
+    *,
+    entity: str,
+    attribute: str,
+    canonical_subject_id: str | None = None,
+    canonical_field: str | None = None,
+    time_scope: TimeScope | None = None,
+    condition_scope: ConditionScope | None = None,
+    observed_at: datetime | None = None,
+    group_id: str | None = None,
+    value: Any = None,
+) -> tuple[Any, ...]:
+    """Build version-independent identity from entity, field, and normalized scope."""
+
+    import re
+
+    subject = _normalise(canonical_subject_id or entity)
+    raw_field = canonical_field or attribute
+    normalized_field = canonical_attribute_id(raw_field)
+    structural = frozenset({'entity', 'subject', 'state', 'status', 'property', 'attribute'})
+    field_tokens = attribute_tokens(normalized_field)
+    subject_tokens = attribute_tokens(subject)
+    remaining_field_tokens = field_tokens - subject_tokens - structural
+    field_id = (
+        '_'.join(sorted(remaining_field_tokens))
+        if remaining_field_tokens
+        else normalized_field
+    )
+    scope = canonical_semantic_scope(time_scope, observed_at=observed_at)
+    start, end = scope.start, scope.end
+    time_key = (
+        start.isoformat() if start is not None else None,
+        end.isoformat() if end is not None else None,
+    )
+
+    normalized_value_tokens = set(
+        re.findall(r'\w+', canonical_state_value(field_id, value), flags=re.UNICODE)
+    )
+    conditions: list[tuple[str, str]] = []
+    for key, condition_value in (condition_scope or ConditionScope()).conditions:
+        normalized_key = canonical_attribute_id(canonical_field_id(key))
+        normalized_condition_value = _normalise(condition_value)
+        condition_tokens = set(
+            re.findall(r'\w+', normalized_condition_value, flags=re.UNICODE)
+        )
+        # Model output sometimes repeats the proposition as its own condition
+        # (e.g. availability=Saturday on free_on=Saturday). It adds no scope.
+        if (
+            normalized_key == field_id
+            and condition_tokens
+            and condition_tokens.issubset(normalized_value_tokens)
+        ):
+            continue
+        conditions.append((normalized_key, normalized_condition_value))
+
+    return (
+        group_id,
+        subject,
+        field_id,
+        time_key,
+        tuple(sorted(conditions)),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +580,51 @@ class EvidenceRecord:
 EvidenceNode = EvidenceRecord
 
 
+class SlotCardinality(str, Enum):
+    FUNCTIONAL = 'FUNCTIONAL'
+    SET_VALUED = 'SET_VALUED'
+    UNKNOWN = 'UNKNOWN'
+
+
+class AssertionPolarity(str, Enum):
+    POSITIVE = 'POSITIVE'
+    NEGATIVE = 'NEGATIVE'
+    UNKNOWN = 'UNKNOWN'
+
+
+class AssertionMode(str, Enum):
+    ASSERTED = 'ASSERTED'
+    PLANNED = 'PLANNED'
+    OBLIGATORY = 'OBLIGATORY'
+    HYPOTHETICAL = 'HYPOTHETICAL'
+    UNKNOWN = 'UNKNOWN'
+
+
+def _slot_extensions(record: Any) -> dict[str, Any]:
+    # Legacy snapshots retain their exact wire shape until explicitly opted in.
+    if (record.cardinality is None and record.member_key is None
+            and record.polarity == AssertionPolarity.POSITIVE
+            and record.assertion_mode == AssertionMode.ASSERTED):
+        return {}
+    return {
+        'cardinality': SlotCardinality(record.cardinality).value if record.cardinality is not None else None,
+        'member_key': record.member_key,
+        'polarity': AssertionPolarity(record.polarity).value,
+        'assertion_mode': AssertionMode(record.assertion_mode).value,
+    }
+
+
+def _read_slot_extensions(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if not any(key in payload for key in ('cardinality', 'member_key', 'polarity', 'assertion_mode')):
+        return {}
+    return {
+        'cardinality': SlotCardinality(payload['cardinality']) if payload.get('cardinality') is not None else None,
+        'member_key': payload.get('member_key'),
+        'polarity': AssertionPolarity(payload.get('polarity', 'POSITIVE')),
+        'assertion_mode': AssertionMode(payload.get('assertion_mode', 'ASSERTED')),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class StateNode:
     state_id: str
@@ -409,6 +652,12 @@ class StateNode:
     observed_at: datetime = field(default_factory=utc_now)
     created_at: datetime = field(default_factory=utc_now)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    cardinality: SlotCardinality | None = None
+    member_key: str | None = None
+    polarity: AssertionPolarity = AssertionPolarity.POSITIVE
+    assertion_mode: AssertionMode = AssertionMode.ASSERTED
+    subject_provenance: SubjectProvenance | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'observed_at', ensure_utc(self.observed_at))
@@ -455,8 +704,72 @@ class StateNode:
     @property
     def identity_key(self) -> tuple[str, str]:
         if self.canonical_subject_id is not None and self.canonical_field_id is not None:
-            return (_normalise(self.canonical_subject_id), canonical_field_id(self.canonical_field_id))
+            return (
+                _normalise(self.canonical_subject_id),
+                canonical_attribute_id(self.canonical_field_id),
+            )
         return (_normalise(self.entity), _normalise(self.attribute))
+
+    @property
+    def slot_scope_key(self) -> tuple[Any, ...]:
+        return self.canonical_slot_key[3:]
+
+    @property
+    def canonical_slot_key(self) -> tuple[Any, ...]:
+        if self.cardinality is not None:
+            scope = canonical_semantic_scope(self.time_scope, observed_at=self.observed_at)
+            return (
+                self.group_id, _normalise(self.canonical_subject_id or self.entity),
+                _normalise(self.canonical_field_id or self.attribute),
+                scope.start.isoformat() if scope.start else None,
+                scope.end.isoformat() if scope.end else None,
+                self.condition_scope.conditions, self.condition_scope.description,
+                AssertionMode(self.assertion_mode).value,
+                SlotCardinality(self.cardinality).value, self.member_key,
+            )
+        return canonical_state_slot_key(
+            entity=self.entity,
+            attribute=self.attribute,
+            canonical_subject_id=self.canonical_subject_id,
+            canonical_field=self.canonical_field_id,
+            time_scope=self.time_scope,
+            condition_scope=self.condition_scope,
+            observed_at=self.observed_at,
+            group_id=self.group_id,
+            value=self.value,
+        )
+
+    @property
+    def canonical_slot_id(self) -> str:
+        resolved = self.metadata.get('resolved_canonical_slot_id') if self.cardinality is None else None
+        if isinstance(resolved, str) and resolved:
+            return resolved
+        payload = json.dumps(self.canonical_slot_key, ensure_ascii=False, separators=(',', ':'))
+        return f"slot:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+    @property
+    def canonical_value_key(self) -> str:
+        return canonical_state_value(self.canonical_field_id or self.attribute, self.value)
+
+    @property
+    def canonical_version_id(self) -> str:
+        if self.cardinality is not None:
+            return self.state_id
+        resolved = self.metadata.get('resolved_canonical_version_id')
+        if isinstance(resolved, str) and resolved:
+            return resolved
+        payload = json.dumps(
+            (
+                self.canonical_slot_id,
+                self.canonical_value_key,
+                self.observation_id,
+                self.observation_index,
+                self.observed_at.isoformat(),
+            ),
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        return f"version:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
     @property
     def has_canonical_slot(self) -> bool:
@@ -547,8 +860,12 @@ class StateNode:
             'observed_at': self.observed_at.isoformat(),
             'created_at': self.created_at.isoformat(),
             'metadata': dict(self.metadata),
+            'subject_provenance': (
+                self.subject_provenance.serialize() if self.subject_provenance else None
+            ),
             # Old IDs remain readable as opaque compatibility metadata only.
             'backend_metadata': {'legacy_graphiti_fact_ids': list(self.graphiti_fact_ids)},
+            **_slot_extensions(self),
         }
 
     @classmethod
@@ -602,6 +919,11 @@ class StateNode:
             created_at=_datetime_from_string(payload.get('created_at')) or utc_now(),
             metadata=payload.get('metadata') or {},
             graphiti_fact_ids=tuple(legacy_fact_ids or ()),
+            subject_provenance=(
+                SubjectProvenance.deserialize(payload['subject_provenance'])
+                if isinstance(payload.get('subject_provenance'), Mapping) else None
+            ),
+            **_read_slot_extensions(payload),
         )
 
 
@@ -629,6 +951,31 @@ class StateRelation:
             raise ValueError('state relation cannot be a self-loop')
 
 
+def resolve_state_alias_id(state_id: str, states_by_id: Mapping[str, StateNode]) -> str:
+    """Resolve a persisted duplicate ID to its canonical representative, fail-closed."""
+
+    origin = state_id
+    current = state_id
+    seen: set[str] = set()
+    while current not in seen:
+        seen.add(current)
+        state = states_by_id.get(current)
+        if state is None:
+            return current
+        alias = state.metadata.get('canonical_state_id')
+        if not isinstance(alias, str) or not alias or alias not in states_by_id:
+            return current
+        representative = states_by_id[alias]
+        if (
+            representative.group_id != state.group_id
+            or representative.canonical_slot_id != state.canonical_slot_id
+            or representative.canonical_value_key != state.canonical_value_key
+        ):
+            return current
+        current = alias
+    return origin
+
+
 @dataclass(frozen=True, slots=True)
 class StateCandidate:
     """State extraction output before evidence and lifecycle fields are attached."""
@@ -648,6 +995,11 @@ class StateCandidate:
     conflicts: tuple[StateSelector, ...] = ()
     dependency_relations: tuple[DependencyRelationSelector, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    cardinality: SlotCardinality | None = None
+    member_key: str | None = None
+    polarity: AssertionPolarity = AssertionPolarity.POSITIVE
+    assertion_mode: AssertionMode = AssertionMode.ASSERTED
+    subject_provenance: SubjectProvenance | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'evidence_refs', tuple(dict.fromkeys(self.evidence_refs)))
@@ -698,7 +1050,11 @@ class StateCandidate:
                 for item in self.dependency_relations
             ],
             'metadata': dict(self.metadata),
+            'subject_provenance': (
+                self.subject_provenance.serialize() if self.subject_provenance else None
+            ),
             'backend_metadata': {'legacy_graphiti_fact_ids': list(self.graphiti_fact_ids)},
+            **_slot_extensions(self),
         }
 
     @classmethod
@@ -737,6 +1093,11 @@ class StateCandidate:
                 for item in payload.get('dependency_relations', ())
             ),
             metadata=payload.get('metadata') or {},
+            subject_provenance=(
+                SubjectProvenance.deserialize(payload['subject_provenance'])
+                if isinstance(payload.get('subject_provenance'), Mapping) else None
+            ),
+            **_read_slot_extensions(payload),
         )
 
 
@@ -897,6 +1258,7 @@ __all__ = [
     'utc_now',
     'attribute_tokens',
     'attributes_compatible',
+    'canonical_attribute_id',
     'evidence_id_for',
 ]
 

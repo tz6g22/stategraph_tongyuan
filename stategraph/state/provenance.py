@@ -10,7 +10,149 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from .schema import StateCandidate, canonical_field_id
+from .schema import EvidenceRecord, Observation, StateCandidate, canonical_field_id
+
+
+CANONICAL_COORDINATE_SPACE = 'OBSERVATION_ABSOLUTE'
+
+
+def normalized_literal_ranges(source_text: str, value: str) -> tuple[tuple[int, int], ...]:
+    """Map exact casefold/whitespace-normalized token matches to source offsets."""
+
+    target = ' '.join(str(value).casefold().split())
+    if not target:
+        return ()
+    normalized: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    for index, character in enumerate(source_text):
+        if character.isspace():
+            if normalized and normalized[-1] != ' ':
+                normalized.append(' ')
+                starts.append(index)
+                ends.append(index + 1)
+            continue
+        folded = character.casefold()
+        normalized.extend(folded)
+        starts.extend([index] * len(folded))
+        ends.extend([index + 1] * len(folded))
+    if normalized and normalized[-1] == ' ':
+        normalized.pop()
+        starts.pop()
+        ends.pop()
+    text = ''.join(normalized)
+    pattern = re.compile(r'(?<!\w)' + re.escape(target) + r'(?!\w)')
+    return tuple(
+        (starts[match.start()], ends[match.end() - 1])
+        for match in pattern.finditer(text)
+    )
+
+
+def bridge_candidate_evidence(
+    *,
+    observation: Observation,
+    observation_evidence: EvidenceRecord,
+    candidate: StateCandidate,
+    candidate_evidence: EvidenceRecord,
+    observation_index: int,
+) -> EvidenceRecord:
+    """Attach the observation boundary's canonical provenance to one evidence record.
+
+    Native extraction already owns the semantic candidate and its absolute source
+    span.  This bridge only copies the backend coordinate contract and source
+    identity metadata; it never searches source text or rewrites candidate fields.
+    A backend that did not request canonical evidence leaves the record unchanged,
+    preserving the generic native path.
+    """
+
+    requested_space = observation_evidence.backend_metadata.get('coordinate_space')
+    if requested_space is None:
+        return candidate_evidence
+    if requested_space != CANONICAL_COORDINATE_SPACE:
+        raise ValueError('unsupported canonical evidence coordinate space')
+    if candidate_evidence.observation_id != observation.observation_id:
+        raise ValueError('candidate evidence crosses observation boundary')
+    if candidate_evidence.original_text != observation.content:
+        raise ValueError('candidate evidence source does not match observation')
+    start = candidate_evidence.span_start
+    end = candidate_evidence.span_end
+    if end is None or not (0 <= start < end <= len(observation.content)):
+        raise ValueError('candidate evidence has invalid observation span')
+
+    mapping = _source_mapping_for_span(candidate, start, end)
+    metadata = dict(candidate_evidence.backend_metadata)
+    existing_space = metadata.get('coordinate_space')
+    if existing_space is not None and existing_space != CANONICAL_COORDINATE_SPACE:
+        raise ValueError('candidate evidence already declares a non-canonical space')
+    for key, value in (
+        ('observation_index', observation_index),
+        ('absolute_span_start', start),
+        ('absolute_span_end', end),
+    ):
+        if key in metadata and metadata[key] != value:
+            raise ValueError(f'candidate evidence metadata mismatch: {key}')
+        metadata[key] = value
+    metadata['coordinate_space'] = CANONICAL_COORDINATE_SPACE
+    metadata.setdefault('source_observation_id', observation.observation_id)
+    metadata.setdefault('source_message_id', observation.observation_id)
+
+    if mapping is not None:
+        for key in (
+            'source_segment_id',
+            'source_segment_type',
+            'source_message_id',
+            'source_speaker',
+        ):
+            value = mapping.get(key)
+            if value is not None and value != '':
+                metadata.setdefault(key, value)
+        for key in ('source_local_range', 'source_local_range_offset_space'):
+            if mapping.get(key) is not None:
+                metadata.setdefault(key, mapping[key])
+
+    speaker = candidate_evidence.speaker
+    if speaker is None and mapping is not None:
+        speaker = mapping.get('source_speaker') or mapping.get('speaker')
+    if speaker is not None:
+        metadata.setdefault('speaker_attribution', speaker)
+
+    return replace(candidate_evidence, speaker=speaker, backend_metadata=metadata)
+
+
+def _source_mapping_for_span(
+    candidate: StateCandidate, start: int, end: int
+) -> dict[str, object] | None:
+    """Resolve an existing exact source mapping; never infer one from text."""
+
+    raw_mappings = candidate.metadata.get('evidence_deserialization', ())
+    if not raw_mappings:
+        return None
+    matches: list[dict[str, object]] = []
+    expected = [start, end]
+    for raw in raw_mappings:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('original_range') == expected or raw.get('observation_absolute_range') == expected:
+            matches.append(raw)
+    if not matches:
+        # Consolidation may retain the first deserialization map while merging
+        # additional exact ranges.  The range list is still a source mapping; it
+        # is safe to use only when it identifies this span exactly.
+        exact_ranges = {
+            tuple(item)
+            for item in candidate.metadata.get('evidence_source_ranges', ())
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
+        if (start, end) in exact_ranges:
+            return {'original_range': expected}
+        raise ValueError('candidate evidence span has no exact source mapping')
+    identities = {
+        (item.get('source_segment_id'), item.get('source_message_id'))
+        for item in matches
+    }
+    if len(identities) > 1:
+        raise ValueError('candidate evidence span maps to multiple source identities')
+    return matches[0]
 
 
 _EVENT = re.compile(r'(?m)^State\s+\d+\s*$')
@@ -107,4 +249,8 @@ def _normalise_text(value: str) -> str:
     return ' '.join(value.split())
 
 
-__all__ = ['attach_canonical_slot_provenance']
+__all__ = [
+    'CANONICAL_COORDINATE_SPACE',
+    'attach_canonical_slot_provenance',
+    'bridge_candidate_evidence',
+]

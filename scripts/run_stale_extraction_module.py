@@ -82,7 +82,7 @@ async def run() -> None:
         trace_path = traces_dir / f'{case_id}_extraction_trace.jsonl'
         client = StaleGpt5Client()
         extractor = GraphitiLLMStateExtractor(
-            client, max_llm_characters=1800, trace_path=trace_path
+            client, trace_path=trace_path, native_mode=True
         )
         started = time.perf_counter()
         failures: list[dict[str, Any]] = []
@@ -101,7 +101,7 @@ async def run() -> None:
                 source_description='Official STALE haystack session',
             )
             try:
-                candidates = await extractor.extract(observation, ())
+                candidates = await extractor.extract(observation)
                 traces = _trace_rows(trace_path, observation_id)
                 ordered = sorted(traces, key=lambda item: item.get('chunk_index', 0))
                 reconstructed = ''.join(item.get('input_text', '') for item in ordered)

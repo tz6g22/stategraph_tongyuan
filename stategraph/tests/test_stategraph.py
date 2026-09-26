@@ -77,6 +77,23 @@ class StrictDependencyDiscovery:
                     )
                 ),
                 observation.content,
+                direction_supported=True,
+                counterfactual_supported=True,
+                evidence_supported=True,
+                source_grounded=True,
+                target_grounded=True,
+                relation_evidence_supported=True,
+                supporting_evidence_refs=tuple(
+                    dict.fromkeys(
+                        evidence_id
+                        for state in all_states
+                        if state.state_id
+                        in {candidate.prerequisite_state_id, candidate.dependent_state_id}
+                        for evidence_id in state.evidence_refs
+                    )
+                ),
+                structural_direction_valid=True,
+                dependency_semantics_valid=True,
             )
             for candidate in candidates
             if candidate.proposed_relation is not None
@@ -396,20 +413,38 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026, 1, 1, tzinfo=UTC)
         scenarios = {
             RelationType.DEPENDS_ON: (
-                StateCandidate('Alice', 'availability', 'available Friday'),
-                StateCandidate('Friday meeting', 'feasibility', 'feasible'),
+                StateCandidate(
+                    'Alice', 'availability', 'available Friday',
+                    metadata={'evidence_span': 'Alice has availability available Friday.'},
+                ),
+                StateCandidate(
+                    'Friday meeting', 'feasibility', 'feasible',
+                    metadata={'evidence_span': 'The meeting is feasible because Alice is available Friday.'},
+                ),
                 'The meeting is feasible because Alice is available Friday.',
                 'Meeting feasibility relies on Alice being available Friday.',
             ),
             RelationType.DERIVED_FROM: (
-                StateCandidate('Alice', 'flight', 'Friday flight'),
-                StateCandidate('Alice', 'availability', 'unavailable Friday'),
+                StateCandidate(
+                    'Alice', 'flight', 'Friday flight',
+                    metadata={'evidence_span': 'Alice has a Friday flight.'},
+                ),
+                StateCandidate(
+                    'Alice', 'availability', 'unavailable Friday',
+                    metadata={'evidence_span': 'Alice is unavailable Friday as a consequence of her Friday flight.'},
+                ),
                 'Alice is unavailable Friday as a consequence of her Friday flight.',
                 'Friday unavailability is explicitly derived from the Friday flight.',
             ),
             RelationType.AFFECTS_ACTION: (
-                StateCandidate('Alice', 'availability', 'unavailable Friday'),
-                StateCandidate('Friday meeting', 'plan', 'postponed'),
+                StateCandidate(
+                    'Alice', 'availability', 'unavailable Friday',
+                    metadata={'evidence_span': 'Alice is unavailable Friday.'},
+                ),
+                StateCandidate(
+                    'Friday meeting', 'plan', 'postponed',
+                    metadata={'evidence_span': 'The Friday meeting plan is postponed because Alice is unavailable.'},
+                ),
                 'The Friday meeting plan is postponed because Alice is unavailable.',
                 'Alice being unavailable explicitly affects the meeting plan.',
             ),
@@ -432,6 +467,7 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     reason,
                 ),
             ),
+            metadata={'evidence_span': observation_text},
         )
 
         graph = StateGraph(extractor=StaticStrictExtractor((extracted_candidate,)))
@@ -461,7 +497,43 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(relation.evidence_id, downstream.states[0].evidence_id)
         self.assertEqual(relation.group_id, 'default')
         persisted = await graph.repository.list_relations('default', {relation_type})
-        self.assertEqual(persisted, [relation])
+        self.assertEqual(len(persisted), 1)
+        stored = persisted[0]
+        self.assertEqual(stored.relation_id, relation.relation_id)
+        self.assertEqual(stored.relation_type, relation_type)
+        self.assertEqual(stored.source_state_id, prerequisite.states[0].state_id)
+        self.assertEqual(stored.target_state_id, downstream.states[0].state_id)
+        self.assertEqual(stored.dependency_strength, DependencyStrength.STRICT)
+        self.assertEqual(stored.evidence_id, downstream.states[0].evidence_id)
+        self.assertEqual(stored.group_id, 'default')
+        self.assertEqual(
+            stored.supporting_evidence_ids,
+            relation.supporting_evidence_ids,
+        )
+        source_state = await graph.repository.get_state(stored.source_state_id)
+        target_state = await graph.repository.get_state(stored.target_state_id)
+        self.assertIsNotNone(source_state)
+        self.assertIsNotNone(target_state)
+        self.assertEqual(
+            stored.metadata['canonical_source_slot_id'], source_state.canonical_slot_id
+        )
+        self.assertEqual(
+            stored.metadata['canonical_source_version_id'], source_state.canonical_version_id
+        )
+        self.assertEqual(
+            stored.metadata['canonical_target_slot_id'], target_state.canonical_slot_id
+        )
+        self.assertEqual(
+            stored.metadata['canonical_target_version_id'], target_state.canonical_version_id
+        )
+        for flag in (
+            'source_grounded',
+            'target_grounded',
+            'relation_evidence_supported',
+            'structural_direction_valid',
+            'dependency_semantics_valid',
+        ):
+            self.assertIs(stored.metadata[flag], True)
 
     async def test_depends_on_extraction_resolution_and_persistence(self) -> None:
         await self._assert_semantic_relation_population(RelationType.DEPENDS_ON)
@@ -827,22 +899,32 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         availability = await graph.ingest(
             Observation('I am free Friday.', friday - timedelta(days=2), 'calendar'),
             candidates=(
-                StateCandidate('user', 'availability', 'free', condition_scope=condition),
+                StateCandidate(
+                    'user', 'availability', 'free', condition_scope=condition,
+                    metadata={'evidence_span': 'I am free Friday.'},
+                ),
             ),
         )
         action = await graph.ingest(
-            Observation('Plan dinner for Friday.', friday - timedelta(days=1), 'planner'),
+            Observation(
+                'The Friday dinner plan depends on the user being free.',
+                friday - timedelta(days=1),
+                'planner',
+            ),
             candidates=(
                 StateCandidate(
                     'user',
                     'dinner-plan',
                     'booked',
                     condition_scope=condition,
+                    metadata={
+                        'evidence_span': 'The Friday dinner plan depends on the user being free.'
+                    },
                     dependency_relations=(
                         DependencyRelationSelector(
                             RelationType.AFFECTS_ACTION,
                             StateSelector('user', 'availability', 'free'),
-                            'Plan dinner for Friday.',
+                            'The Friday dinner plan depends on the user being free.',
                         ),
                     ),
                 ),
@@ -883,7 +965,10 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
         now = datetime(2026, 1, 1, tzinfo=UTC)
         availability = await graph.ingest(
             Observation('Alice is available Friday.', now, 'unit-test'),
-            candidates=(StateCandidate('Alice', 'availability', 'available Friday'),),
+            candidates=(StateCandidate(
+                'Alice', 'availability', 'available Friday',
+                metadata={'evidence_span': 'Alice is available Friday.'},
+            ),),
         )
         meeting = await graph.ingest(
             Observation(
@@ -896,6 +981,9 @@ class StateGraphLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     'Friday meeting',
                     'feasibility',
                     'feasible',
+                    metadata={
+                        'evidence_span': 'The meeting is feasible because Alice is available Friday.'
+                    },
                     dependency_relations=(
                         DependencyRelationSelector(
                             RelationType.DEPENDS_ON,

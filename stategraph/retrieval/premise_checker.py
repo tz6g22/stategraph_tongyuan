@@ -24,7 +24,13 @@ _PREMISE_STOPWORDS = frozenset(
 class PremiseStatus(str, Enum):
     SUPPORTED = 'supported'
     CONFLICTED = 'conflicted'
+    CONTRADICTED = 'conflicted'
+    # Public semantic names for callers that distinguish a stale claim from a
+    # generic contradiction.  They remain aliases for the persisted status
+    # values so existing artifacts and response policies stay compatible.
+    STALE = 'conflicted'
     UNVERIFIED = 'unverified'
+    UNKNOWN = 'unverified'
 
 
 class ResponsePolicy(str, Enum):
@@ -39,6 +45,7 @@ class Premise:
     entity: str | None = None
     attribute: str | None = None
     expected_value: str | None = None
+    explicit: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +75,13 @@ class PremiseExtractor(Protocol):
 
 
 class ConservativePremiseExtractor:
-    """Extract only linguistically explicit assumptions; avoid inventing premises."""
+    """Extract bounded structured premises without a provider call.
+
+    Explicit clauses receive entity/value fields when the wording supports
+    them.  Imperative queries are retained as an explicit ``UNKNOWN`` premise
+    instead of being silently treated as having no premise; resolving their
+    unstated business conditions remains the StateGraph's graph/evidence job.
+    """
 
     _patterns = (
         re.compile(
@@ -82,8 +95,59 @@ class ConservativePremiseExtractor:
     def extract(self, query: str) -> list[Premise]:
         premises: list[Premise] = []
         for pattern in self._patterns:
-            premises.extend(Premise(match.group(1).strip()) for match in pattern.finditer(query))
+            premises.extend(
+                _structured_premise(match.group(1).strip())
+                for match in pattern.finditer(query)
+            )
+        if not premises and _looks_like_action_query(query):
+            premises.append(Premise(query.strip(), explicit=False))
         return premises
+
+
+_STRUCTURED_POSSESSIVE = re.compile(
+    r"^(?P<entity>.+?)(?:'s|’s)\s+(?P<attribute>[\w][\w\s_-]*?)\s+"
+    r"(?:is|are|was|were)\s+(?P<value>.+?)\.?$",
+    re.IGNORECASE,
+)
+_STRUCTURED_COPULA = re.compile(
+    r"^(?P<entity>[\w][\w -]*?)\s+(?:is|are|was|were)\s+(?P<value>.+?)\.?$",
+    re.IGNORECASE,
+)
+
+
+def _structured_premise(text: str) -> Premise:
+    possessive = _STRUCTURED_POSSESSIVE.match(text)
+    if possessive is not None:
+        groups = possessive.groupdict()
+        return Premise(
+            text=text,
+            entity=' '.join(groups['entity'].split()),
+            attribute=' '.join(groups['attribute'].split()),
+            expected_value=' '.join(groups['value'].strip(' .!?').split()),
+        )
+    copula = _STRUCTURED_COPULA.match(text)
+    if copula is None:
+        return Premise(text)
+    groups = copula.groupdict()
+    return Premise(
+        text=text,
+        entity=' '.join(groups['entity'].split()),
+        # Without an attribute, a copular clause is a value cue rather than a
+        # complete state identity.  Let the checker use token/opposite matching
+        # instead of declaring every other Alice state contradictory.
+        expected_value=None,
+    )
+
+
+def _looks_like_action_query(query: str) -> bool:
+    return bool(
+        re.search(
+            r'\b(?:book|schedule|arrange|reserve|execute|proceed|deploy|send|'
+            r'cancel|reschedule|approve|submit|invite|run|start)\b',
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 class PremiseChecker:

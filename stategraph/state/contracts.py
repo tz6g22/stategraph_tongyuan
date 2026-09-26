@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Awaitable, Mapping, Protocol, Sequence
 
 from .schema import (
@@ -19,6 +20,34 @@ from .schema import (
     StateCandidate,
     StateSelector,
 )
+
+
+class FailureSeverity(str, Enum):
+    """Execution boundary for ingestion failures."""
+
+    CANDIDATE_LOCAL_FAILURE = 'CANDIDATE_LOCAL_FAILURE'
+    OBSERVATION_FATAL_FAILURE = 'OBSERVATION_FATAL_FAILURE'
+    CASE_FATAL_FAILURE = 'CASE_FATAL_FAILURE'
+    SYSTEMIC_FAILURE = 'SYSTEMIC_FAILURE'
+
+
+class CandidateGroundingError(ValueError):
+    """A fail-closed source-grounding rejection isolated to one candidate."""
+
+    failure_severity = FailureSeverity.CANDIDATE_LOCAL_FAILURE
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejection_stage: str,
+        subject_provenance_status: str,
+        value_provenance_status: str,
+    ) -> None:
+        super().__init__(message)
+        self.rejection_stage = rejection_stage
+        self.subject_provenance_status = subject_provenance_status
+        self.value_provenance_status = value_provenance_status
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,8 +181,10 @@ def parse_dependency_relation_selectors(
 
 
 __all__ = [
+    'CandidateGroundingError',
     'ExplicitDependencyIntent',
     'ExtractionResult',
+    'FailureSeverity',
     'NativeStateExtractor',
     'StateExtractor',
     'extract_explicit_dependency_intents',

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -15,8 +15,10 @@ from stategraph.state.schema import (
     StateRelation,
     StateStatus,
     attributes_compatible,
+    resolve_state_alias_id,
     utc_now,
 )
+from stategraph.state.factual_relations import canonical_state_relation
 from stategraph.storage.base import StateRepository
 
 from .premise_checker import Premise, PremiseCheckResult, PremiseChecker
@@ -215,11 +217,24 @@ class CurrentStateRetriever:
         graph_search: EvidenceSearch | None = None,
         premise_checker: PremiseChecker | None = None,
         candidate_source: StateCandidateSource | None = None,
+        *,
+        graph_depth: int = 2,
+        graph_beam_width: int = 4,
+        relational_max_hops: int = 3,
     ) -> None:
+        if graph_depth < 0:
+            raise ValueError('graph_depth must be non-negative')
+        if graph_beam_width < 1:
+            raise ValueError('graph_beam_width must be positive')
+        if relational_max_hops < 1:
+            raise ValueError('relational_max_hops must be positive')
         self._repository = repository
         self._graph_search = graph_search
         self._premise_checker = premise_checker or PremiseChecker()
         self._candidate_source = candidate_source
+        self._graph_depth = graph_depth
+        self._graph_beam_width = graph_beam_width
+        self._relational_max_hops = relational_max_hops
         self._backend_evidence_aliases: dict[str, str] = {}
 
     def register_evidence_aliases(self, aliases: Mapping[str, str]) -> None:
@@ -295,6 +310,20 @@ class CurrentStateRetriever:
             RelationType.AFFECTS_ACTION,
         }
         dependencies = await self._repository.list_relations(group_id, dependency_types)
+        states_by_id = {state.state_id: state for state in (*available, *stale_history)}
+        normalized_dependencies: list[StateRelation] = []
+        for relation in dependencies:
+            source_id = resolve_state_alias_id(relation.source_state_id, states_by_id)
+            target_id = resolve_state_alias_id(relation.target_state_id, states_by_id)
+            if source_id != target_id:
+                normalized_dependencies.append(
+                    replace(
+                        relation,
+                        source_state_id=source_id,
+                        target_state_id=target_id,
+                    )
+                )
+        dependencies = tuple(normalized_dependencies)
         stale_for_query = [
             state for state in stale_history
             if state.status == StateStatus.STALE
@@ -330,15 +359,32 @@ class CurrentStateRetriever:
                     or self._score(query, state, evidence_ids) > 0
                 ]
                 subject_scoped = True
-        selected, coverage_assignments, expansion_sources, candidate_trace = (
+        relational_states, relational_trace = self._select_relational_states(
+            query,
+            selection_pool,
+            at=at,
+            limit=limit,
+            relational_max_hops=self._relational_max_hops,
+            blocked_states=stale_history,
+        )
+        relational_ids = {state.state_id for state in relational_states}
+        selected_dependency, coverage_assignments, expansion_sources, candidate_trace = (
             self._select_dependency_states(
                 query,
                 selection_pool,
                 evidence_ids,
                 dependencies,
-                limit,
+                max(0, limit - len(relational_states)),
+                graph_depth=self._graph_depth,
+                graph_beam_width=self._graph_beam_width,
             )
         )
+        blocked_entities = set(relational_trace.get('blocked_entity_keys', ()))
+        selected = relational_states + [
+            state for state in selected_dependency
+            if state.state_id not in relational_ids
+            and self._relation_entity_key(state.entity) not in blocked_entities
+        ]
 
         # Premise correction sees the full current/candidate graph, not only top-k context.
         premise_check = self._premise_checker.check(
@@ -393,6 +439,7 @@ class CurrentStateRetriever:
                 'candidates': candidate_trace,
                 'coverage_assignments': coverage_assignments,
                 'relation_expansion_sources': expansion_sources,
+                'relational_traversal': relational_trace,
                 'final_state_ids': [state.state_id for state in selected],
                 'shadowed_current_state_ids': sorted(shadowed),
                 'stale_query_candidates': [state.state_id for state in stale_for_query],
@@ -572,6 +619,575 @@ class CurrentStateRetriever:
                     queue.append(neighbour)
         return selected
 
+    @staticmethod
+    def _relation_attribute_family(attribute: str) -> frozenset[str]:
+        """Return a small canonical family for factual field matching.
+
+        This is deliberately morphology/syntax normalization, not a benchmark
+        ontology.  In particular, ``is``/``of`` are never relation fields.
+        """
+        tokens = {
+            token for token in re.split(r'[_\-\s]+', attribute.casefold())
+            if token and re.fullmatch(r'\w+', token, flags=re.UNICODE)
+        }
+        tokens -= _FIELD_STOPWORDS | {'person', 'people'}
+        if tokens & {'author', 'writer', 'written', 'written_by'}:
+            return frozenset({'author', 'writer', 'written'})
+        if tokens & {'spouse', 'spouses', 'married', 'partner', 'husband', 'wife'}:
+            return frozenset({'spouse', 'spouses', 'married', 'partner', 'husband', 'wife'})
+        if tokens & {
+            'citizenship', 'citizen', 'citizens', 'nationality', 'nation',
+            'country', 'countries',
+        }:
+            return frozenset({'citizenship', 'citizen', 'nationality', 'country', 'countries', 'nation'})
+        if tokens & {
+            'residence', 'resides', 'reside', 'lives', 'live', 'location',
+            'located', 'home',
+        }:
+            return frozenset({'residence', 'reside', 'resides', 'location', 'live', 'lives', 'located', 'home'})
+        if tokens & {'ceo', 'chief', 'executive'}:
+            return frozenset({'ceo', 'chief', 'executive'})
+        if tokens & {
+            'occupation', 'job', 'role', 'career', 'profession', 'past_role',
+            'previous_role',
+        }:
+            return frozenset({
+                'occupation', 'job', 'role', 'career', 'profession',
+                'past_role', 'previous_role',
+            })
+        return frozenset(tokens)
+
+    @classmethod
+    def _relation_attribute_match(cls, expected: str, actual: str) -> bool:
+        expected_family = cls._relation_attribute_family(expected)
+        actual_family = cls._relation_attribute_family(actual)
+        return bool(expected_family & actual_family)
+
+    @staticmethod
+    def _canonical_relation_name(family: frozenset[str]) -> str:
+        if family & {'author', 'writer', 'written'}:
+            return 'author'
+        if family & {'spouse', 'married', 'partner', 'husband', 'wife'}:
+            return 'spouse'
+        if family & {'citizenship', 'citizen', 'nationality', 'country', 'nation'}:
+            return 'citizenship'
+        if family & {'residence', 'location', 'lives', 'located', 'home'}:
+            return 'residence'
+        if family & {'ceo', 'chief', 'executive'}:
+            return 'ceo'
+        if family & {'employer', 'employs', 'works'}:
+            return 'employer'
+        if family & {'member', 'membership'}:
+            return 'member_of'
+        if family & {'location'}:
+            return 'location'
+        if family & {
+            'occupation', 'job', 'role', 'career', 'profession',
+            'past_role', 'previous_role',
+        }:
+            return 'occupation'
+        return sorted(family)[0] if family else ''
+
+    @classmethod
+    def _relation_attribute_sequence(
+        cls, query: str, states: Sequence[StateNode]
+    ) -> tuple[str, ...]:
+        plan = cls._relation_query_plan(query, states)
+        return tuple((*plan['relation_hints'], *plan['goal_attributes']))
+
+    @classmethod
+    def _relation_subject_aliases(
+        cls, state: StateNode, relation_tokens: frozenset[str] | None = None
+    ) -> tuple[str, ...]:
+        """Return the literal subject plus a relation-wrapper's object, if any."""
+        projection = canonical_state_relation(state)
+        if projection.normalization_type == 'inverse_relation_normalization':
+            return (cls._relation_entity_key(projection.subject),)
+        if projection.symmetric:
+            return tuple(dict.fromkeys((
+                cls._relation_entity_key(projection.subject),
+                cls._relation_entity_key(projection.object),
+            )))
+        tokens = re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE)
+        while tokens and tokens[0] in {'a', 'an', 'the'}:
+            tokens.pop(0)
+        family = relation_tokens or cls._relation_attribute_family(state.attribute)
+        prefix_end = 0
+        while prefix_end < len(tokens) and tokens[prefix_end] in family:
+            prefix_end += 1
+        if (
+            prefix_end
+            and prefix_end < len(tokens)
+            and tokens[prefix_end] in {'of', 'for'}
+            and prefix_end + 1 < len(tokens)
+        ):
+            # "the author of Book X" is a relation-bearing subject phrase;
+            # Book X is the anchor and author is a path hint, not part of it.
+            return (' '.join(tokens[prefix_end + 1:]),)
+        return (' '.join(re.findall(r'\w+', state.entity.casefold(), flags=re.UNICODE)),)
+
+    @classmethod
+    def _relation_query_plan(
+        cls, query: str, states: Sequence[StateNode], *, max_hops: int = 3
+    ) -> dict[str, Any]:
+        """Separate entity anchors from goal fields and soft relation hints."""
+        tokens = [token.casefold() for token in re.findall(r'\w+', query)]
+        factual_states = [
+            state for state in states
+            if canonical_state_relation(state).normalization_type != 'unknown_relation'
+        ]
+        relation_tokens = frozenset(
+            token
+            for state in states
+            if state in factual_states
+            for token in cls._relation_attribute_family(
+                canonical_state_relation(state).relation
+            )
+        )
+        anchors: list[tuple[int, int, str]] = []
+        for state in factual_states:
+            for alias in cls._relation_subject_aliases(state, relation_tokens):
+                entity_tokens = alias.split()
+                if not entity_tokens:
+                    continue
+                width = len(entity_tokens)
+                for start in range(len(tokens) - width + 1):
+                    if tokens[start:start + width] == entity_tokens:
+                        anchors.append((start, start + width, alias))
+        # Prefer the longest grounded entity phrase, not a longer wrapper such
+        # as "the author of Our Mutual Friend".
+        anchor = max(
+            anchors,
+            key=lambda item: (item[1] - item[0], -item[0], item[2]),
+        ) if anchors else None
+        anchor_candidates = sorted(
+            {
+                (start, end, alias)
+                for start, end, alias in anchors
+            },
+            key=lambda item: (item[0], -(item[1] - item[0]), item[2]),
+        )
+
+        found: dict[frozenset[str], tuple[int, str]] = {}
+        for state in factual_states:
+            relation = canonical_state_relation(state).relation
+            family = cls._relation_attribute_family(relation)
+            if not family:
+                continue
+            positions = [index for index, token in enumerate(tokens) if token in family]
+            if positions:
+                previous = found.get(family)
+                found[family] = (
+                    min(positions) if previous is None else min(min(positions), previous[0]),
+                    cls._canonical_relation_name(family),
+                )
+        occurrences = sorted(
+            ((position, cls._canonical_relation_name(family), family)
+             for family, (position, _) in found.items()),
+            key=lambda item: (item[0], item[1]),
+        )
+        goal_occurrence = None
+        goal_selection = 'none'
+        if occurrences:
+            # Location questions commonly place their destination verb at the
+            # end ("Where does the CEO ... live?"). Country-of-citizenship is
+            # already one family, so "country" is not made a separate hop.
+            if 'where' in tokens:
+                goal_occurrence = next(
+                    (item for item in reversed(occurrences) if item[1] == 'residence'),
+                    None,
+                )
+                if goal_occurrence is not None:
+                    goal_selection = 'where_residence'
+            if goal_occurrence is None:
+                goal_occurrence = occurrences[0]
+                goal_selection = 'first_relation_occurrence'
+        goal = goal_occurrence[1] if goal_occurrence else None
+        goal_position = goal_occurrence[0] if goal_occurrence else -1
+        anchor_position = anchor[0] if anchor else -1
+        hints = [item for item in occurrences if item[1] != goal]
+        if goal_position >= 0 and anchor_position >= 0 and goal_position < anchor_position:
+            before_anchor = [item for item in hints if item[0] < anchor_position]
+            after_anchor = [item for item in hints if item[0] >= anchor[1]]
+            ordered_hints = [*sorted(after_anchor), *reversed(sorted(before_anchor))]
+        else:
+            ordered_hints = sorted(hints)
+        relation_hints = list(dict.fromkeys(item[1] for item in ordered_hints))
+        required_hops = min(max_hops, 1 + len(relation_hints)) if goal else 0
+        return {
+            'anchor_entities': [anchor[2]] if anchor else [],
+            'selected_anchor': anchor[2] if anchor else None,
+            'anchor_candidates': [
+                {
+                    'entity': alias,
+                    'token_start': start,
+                    'token_end': end,
+                    'selected': anchor == (start, end, alias),
+                }
+                for start, end, alias in anchor_candidates
+            ],
+            'goal_attributes': [goal] if goal else [],
+            'relation_hints': relation_hints,
+            'max_hops': required_hops,
+            'matched_patterns': {
+                'anchor_phrase_matches': [alias for _, _, alias in anchor_candidates],
+                'relation_occurrences': [
+                    {'token_index': position, 'relation': relation}
+                    for position, relation, _ in occurrences
+                ],
+                'goal_selection': goal_selection,
+            },
+            'planner_flags': {
+                'anchor_matched_to_state': anchor is not None,
+                'goal_matched_to_state_relation': goal is not None,
+                'relation_hints_found': bool(relation_hints),
+                'max_hops_capped': bool(goal and 1 + len(relation_hints) > max_hops),
+            },
+        }
+
+    @staticmethod
+    def _relation_entity_key(value: object) -> str:
+        return ' '.join(re.findall(r'\w+', str(value).casefold(), flags=re.UNICODE))
+
+    @classmethod
+    def _select_relational_states(
+        cls,
+        query: str,
+        states: Sequence[StateNode],
+        *,
+        at: datetime,
+        limit: int,
+        relational_max_hops: int = 3,
+        blocked_states: Sequence[StateNode] = (),
+    ) -> tuple[list[StateNode], dict[str, Any]]:
+        """Traverse factual StateNode links without creating dependency edges."""
+
+        eligible = [
+            state for state in states
+            if state.status in {StateStatus.CURRENT, StateStatus.UNCERTAIN}
+            and state.time_scope.is_effective(at)
+        ]
+        factual_eligible = [
+            state for state in eligible
+            if canonical_state_relation(state).normalization_type != 'unknown_relation'
+        ]
+        plan = cls._relation_query_plan(
+            query, factual_eligible, max_hops=relational_max_hops
+        )
+        relation_tokens = frozenset(
+            token
+            for state in (
+                *factual_eligible,
+                *(
+                    blocked_state for blocked_state in blocked_states
+                    if canonical_state_relation(blocked_state).normalization_type
+                    != 'unknown_relation'
+                ),
+            )
+            for token in cls._relation_attribute_family(
+                canonical_state_relation(state).relation
+            )
+        )
+        sequence = tuple((*plan['relation_hints'], *plan['goal_attributes']))
+        trace: dict[str, Any] = {
+            'query_plan': plan,
+            'attribute_sequence': list(sequence),
+            'anchor_entity': None,
+            'paths': [],
+            'candidate_paths': [],
+            'selected_path': None,
+            'path_scores': [],
+            'final_state_id': None,
+            'provider_calls': 0,
+            'blocked_entity_keys': [],
+        }
+        anchors_requested = [
+            cls._relation_entity_key(item) for item in plan['anchor_entities']
+        ]
+        goal_attributes = tuple(plan['goal_attributes'])
+        if not anchors_requested or not goal_attributes or not factual_eligible or limit < 1:
+            return [], trace
+
+        def project(state: StateNode) -> tuple[StateNode, Any, tuple[str, ...], tuple[tuple[str, str], ...]]:
+            relation = canonical_state_relation(state)
+            relation_name = cls._canonical_relation_name(
+                cls._relation_attribute_family(relation.relation)
+            ) or relation.relation
+            if relation.symmetric:
+                subjects = tuple(dict.fromkeys((
+                    cls._relation_entity_key(relation.subject),
+                    cls._relation_entity_key(relation.object),
+                )))
+                transitions = (
+                    (subjects[0], subjects[1]),
+                    (subjects[1], subjects[0]),
+                )
+            elif relation.normalization_type == 'inverse_relation_normalization':
+                subjects = (cls._relation_entity_key(relation.subject),)
+                transitions = ((subjects[0], cls._relation_entity_key(relation.object)),)
+            else:
+                subjects = tuple(dict.fromkeys((
+                    *cls._relation_subject_aliases(state, relation_tokens),
+                    cls._relation_entity_key(relation.subject),
+                )))
+                transitions = tuple(
+                    (subject, cls._relation_entity_key(relation.object))
+                    for subject in subjects
+                )
+
+            normalization = state.metadata.get('factual_relation_normalization')
+            if not isinstance(normalization, Mapping):
+                normalization = {
+                    'raw_entity': state.entity,
+                    'raw_attribute': state.attribute,
+                    'raw_value': state.value,
+                    'canonical_subject': relation.subject,
+                    'canonical_relation': relation_name,
+                    'canonical_object': relation.object,
+                    'normalization_type': relation.normalization_type,
+                    'source_forms': [{
+                        'entity': state.entity,
+                        'attribute': state.attribute,
+                        'value': state.value,
+                        'normalization_type': relation.normalization_type,
+                    }],
+                }
+            projected_state = replace(
+                state,
+                entity=relation.subject,
+                attribute=relation_name,
+                value=relation.object,
+                canonical_subject_id=relation.subject,
+                canonical_field_id=relation_name,
+                metadata={
+                    **state.metadata,
+                    'factual_relation_normalization': dict(normalization),
+                    'factual_relation_source_state_ids': [state.state_id],
+                },
+            )
+            return projected_state, relation, subjects, transitions
+
+        projected_rows = [project(state) for state in factual_eligible]
+        grouped: dict[tuple[Any, ...], list[tuple[StateNode, Any, tuple[str, ...], tuple[tuple[str, str], ...]]]] = {}
+        for row in projected_rows:
+            state, relation, _, _ = row
+            key = (
+                cls._relation_entity_key(relation.subject),
+                state.attribute,
+                cls._relation_entity_key(relation.object),
+                state.time_scope.start.isoformat() if state.time_scope.start else None,
+                state.time_scope.end.isoformat() if state.time_scope.end else None,
+                tuple(state.condition_scope.conditions),
+                state.condition_scope.description,
+            )
+            grouped.setdefault(key, []).append(row)
+
+        facts: list[dict[str, Any]] = []
+        for rows in grouped.values():
+            rows.sort(key=lambda item: (
+                0 if item[0].status == StateStatus.CURRENT else 1,
+                -cls._score(query, item[0], set()),
+                item[0].state_id,
+            ))
+            representative, relation, subjects, transitions = rows[0]
+            evidence_refs = tuple(dict.fromkeys(
+                ref for state, _, _, _ in rows for ref in state.evidence_refs
+            ))
+            source_ids = [state.state_id for state, _, _, _ in rows]
+            raw_forms = [
+                form
+                for state, _, _, _ in rows
+                for form in (
+                    state.metadata.get('factual_relation_normalization', {}).get(
+                        'source_forms', ()
+                    )
+                    if isinstance(state.metadata.get('factual_relation_normalization'), Mapping)
+                    else ()
+                )
+            ]
+            normalized_state = replace(
+                representative,
+                evidence_id=evidence_refs[0] if evidence_refs else representative.evidence_id,
+                evidence_ids=evidence_refs,
+                evidence_refs=evidence_refs,
+                metadata={
+                    **representative.metadata,
+                    'factual_relation_source_state_ids': source_ids,
+                    'factual_relation_normalization': {
+                        **dict(representative.metadata['factual_relation_normalization']),
+                        'canonical_subject': relation.subject,
+                        'canonical_relation': representative.attribute,
+                        'canonical_object': relation.object,
+                        'source_forms': raw_forms,
+                    },
+                },
+            )
+            facts.append({
+                'state': normalized_state,
+                'relation': relation,
+                'subjects': subjects,
+                'transitions': transitions,
+                'source_state_ids': source_ids,
+                'normalization_type': relation.normalization_type,
+            })
+
+        blocked_entities: set[str] = set()
+        for blocked_state in blocked_states:
+            _, relation, subjects, transitions = project(blocked_state)
+            for anchor in anchors_requested:
+                for source, target in transitions:
+                    if anchor == source:
+                        blocked_entities.add(target)
+        trace['blocked_entity_keys'] = sorted(item for item in blocked_entities if item)
+        hints = tuple(plan['relation_hints'])
+        max_hops = min(relational_max_hops, int(plan['max_hops']))
+        successes: list[tuple[str, list[dict[str, Any]]]] = []
+        for anchor in anchors_requested:
+            # Breadth-first over canonical factual subject/object links. Relation
+            # hints rank complete paths; they never reject a factual edge.
+            frontier: list[tuple[str, list[dict[str, Any]], frozenset[str]]] = [
+                (anchor, [], frozenset({anchor}))
+            ]
+            for _ in range(max_hops):
+                next_frontier: list[tuple[str, list[dict[str, Any]], frozenset[str]]] = []
+                for current_entity, path, seen_entities in frontier:
+                    if current_entity in blocked_entities and path:
+                        continue
+                    path_state_ids = {
+                        item['state'].state_id for item in path
+                    }
+                    matches = [
+                        (fact, source, target)
+                        for fact in facts
+                        if not path_state_ids.intersection(fact['source_state_ids'])
+                        for source, target in fact['transitions']
+                        if current_entity == source
+                    ]
+                    matches.sort(
+                        key=lambda item: (
+                            -int(any(cls._relation_attribute_match(hint, item[0]['state'].attribute) for hint in hints)),
+                            -cls._score(query, item[0]['state'], set()),
+                            item[0]['state'].state_id,
+                            item[1],
+                            item[2],
+                        )
+                    )
+                    for fact, source, next_entity in matches:
+                        state = fact['state']
+                        step = {
+                            'state': state,
+                            'traversal_from': source,
+                            'next_entity': next_entity,
+                            'canonical_relation': state.attribute,
+                            'canonical_subject': fact['relation'].subject,
+                            'canonical_object': fact['relation'].object,
+                            'normalization_type': fact['normalization_type'],
+                            'source_state_ids': fact['source_state_ids'],
+                        }
+                        new_path = [*path, step]
+                        if any(
+                            cls._relation_attribute_match(goal, step['canonical_relation'])
+                            for goal in goal_attributes
+                        ):
+                            successes.append((anchor, new_path))
+                            continue
+                        if next_entity and next_entity not in seen_entities:
+                            next_frontier.append((
+                                next_entity,
+                                new_path,
+                                frozenset((*seen_entities, next_entity)),
+                            ))
+                frontier = next_frontier
+                if not frontier:
+                    break
+        if successes:
+            def path_quality(item: tuple[str, list[dict[str, Any]]]) -> tuple[Any, ...]:
+                anchor, steps = item
+                hint_index = 0
+                for step in steps:
+                    if hint_index < len(hints) and cls._relation_attribute_match(
+                        hints[hint_index], step['canonical_relation']
+                    ):
+                        hint_index += 1
+                return (
+                    -hint_index,
+                    -sum(cls._score(query, step['state'], set()) for step in steps),
+                    len(steps),
+                    anchor,
+                    tuple(step['state'].state_id for step in steps),
+                )
+
+            def path_metrics(item: tuple[str, list[dict[str, Any]]]) -> dict[str, Any]:
+                anchor_entity, steps = item
+                matched_hints = 0
+                for step in steps:
+                    if matched_hints < len(hints) and cls._relation_attribute_match(
+                        hints[matched_hints], step['canonical_relation']
+                    ):
+                        matched_hints += 1
+                return {
+                    'anchor_entity': anchor_entity,
+                    'state_ids': [step['state'].state_id for step in steps],
+                    'matched_relation_hints': matched_hints,
+                    'semantic_score': sum(
+                        cls._score(query, step['state'], set()) for step in steps
+                    ),
+                    'hop_count': len(steps),
+                }
+
+            def path_steps(item: tuple[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+                return [
+                    {
+                        'state_id': step['state'].state_id,
+                        'source_state_ids': list(step['source_state_ids']),
+                        'entity': step['state'].entity,
+                        'attribute': step['state'].attribute,
+                        'value': step['state'].value,
+                        'status': step['state'].status.value,
+                        'evidence_refs': list(step['state'].evidence_refs),
+                        'traversal_from': step['traversal_from'],
+                        'next_entity': step['next_entity'],
+                        'canonical_subject': step['canonical_subject'],
+                        'canonical_relation': step['canonical_relation'],
+                        'canonical_object': step['canonical_object'],
+                        'normalization_type': step['normalization_type'],
+                    }
+                    for step in item[1]
+                ]
+
+            ordered_successes = sorted(successes, key=path_quality)
+            anchor, steps = ordered_successes[0]
+            selected_state_ids = [step['state'].state_id for step in steps]
+            trace['candidate_paths'] = [
+                {
+                    **path_metrics(item),
+                    'steps': path_steps(item),
+                    'rank': index,
+                    'selected': item[0] == anchor and [
+                        step['state'].state_id for step in item[1]
+                    ] == selected_state_ids,
+                }
+                for index, item in enumerate(ordered_successes)
+            ]
+            trace['path_scores'] = [
+                {
+                    'rank': item['rank'],
+                    'state_ids': item['state_ids'],
+                    'matched_relation_hints': item['matched_relation_hints'],
+                    'semantic_score': item['semantic_score'],
+                    'hop_count': item['hop_count'],
+                    'selected': item['selected'],
+                }
+                for item in trace['candidate_paths']
+            ]
+            path = [step['state'] for step in steps]
+            trace['anchor_entity'] = anchor
+            trace['selected_path'] = path_steps((anchor, steps))
+            trace['paths'] = [trace['selected_path']]
+            trace['final_state_id'] = path[-1].state_id
+            return path, trace
+        return [], trace
+
     @classmethod
     def _select_dependency_states(
         cls,
@@ -580,6 +1196,9 @@ class CurrentStateRetriever:
         evidence_ids: set[str],
         dependencies: Sequence[StateRelation],
         limit: int,
+        *,
+        graph_depth: int = 2,
+        graph_beam_width: int = 4,
     ) -> tuple[list[StateNode], dict[str, int], dict[str, str], list[dict[str, Any]]]:
         """Cover query intents, then traverse explicit typed dependency relations."""
 
@@ -767,19 +1386,20 @@ class CurrentStateRetriever:
         selected_ids: set[str] = set()
         coverage_assignments: dict[str, int] = {}
         expansion_sources: dict[str, str] = {}
+        expansion_relation_types: dict[str, str] = {}
         states_by_id = {state.state_id: state for state in states}
-        adjacency: dict[str, set[str]] = {}
+        adjacency: dict[str, list[tuple[str, StateRelation]]] = {}
         for relation in dependencies:
             if (
                 relation.source_state_id not in states_by_id
                 or relation.target_state_id not in states_by_id
             ):
                 continue
-            adjacency.setdefault(relation.source_state_id, set()).add(
-                relation.target_state_id
+            adjacency.setdefault(relation.source_state_id, []).append(
+                (relation.target_state_id, relation)
             )
-            adjacency.setdefault(relation.target_state_id, set()).add(
-                relation.source_state_id
+            adjacency.setdefault(relation.target_state_id, []).append(
+                (relation.source_state_id, relation)
             )
 
         coverage_anchors: list[StateNode] = []
@@ -818,22 +1438,28 @@ class CurrentStateRetriever:
                 selected_ids.add(anchor.state_id)
 
         def expand(anchor: StateNode) -> None:
-            queue = [anchor]
+            queue: list[tuple[StateNode, int]] = [(anchor, 0)]
             while queue and len(selected) < limit:
-                source = queue.pop(0)
+                source, depth = queue.pop(0)
+                if depth >= graph_depth:
+                    continue
                 neighbours = sorted(
                     (
-                        states_by_id[state_id]
-                        for state_id in adjacency.get(source.state_id, ())
+                        (states_by_id[state_id], relation)
+                        for state_id, relation in adjacency.get(source.state_id, ())
                         if state_id not in selected_ids
                     ),
-                    key=rank_key,
-                )
-                for neighbour in neighbours:
+                    key=lambda item: (
+                        0 if item[1].relation_type == RelationType.DEPENDS_ON else 1,
+                        rank_key(item[0]),
+                    ),
+                )[:graph_beam_width]
+                for neighbour, relation in neighbours:
                     selected.append(neighbour)
                     selected_ids.add(neighbour.state_id)
                     expansion_sources[neighbour.state_id] = source.state_id
-                    queue.append(neighbour)
+                    expansion_relation_types[neighbour.state_id] = relation.relation_type.value
+                    queue.append((neighbour, depth + 1))
                     if len(selected) == limit:
                         break
 
@@ -856,6 +1482,11 @@ class CurrentStateRetriever:
         for state_id, source_id in expansion_sources.items():
             trace_by_id[state_id]['relation_expansion_source'] = source_id
             trace_by_id[state_id]['relation_contribution'] = 'explicit_edge_expansion'
+            trace_by_id[state_id]['relation_type'] = expansion_relation_types[state_id]
+            trace_by_id[state_id]['graph_depth'] = (
+                trace_by_id[source_id].get('graph_depth', 0) + 1
+                if source_id in trace_by_id else 1
+            )
         for state in provenance_anchors:
             if state.state_id in trace_by_id:
                 trace_by_id[state.state_id]['provenance_contribution'] = 'observation_or_evidence_sibling'

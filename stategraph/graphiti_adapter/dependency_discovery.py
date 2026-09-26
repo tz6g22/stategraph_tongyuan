@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
@@ -18,14 +19,21 @@ from stategraph.state.schema import (
     StateStatus,
 )
 from stategraph.state.dependency import DependencyAssessment, DependencyCandidate
+from stategraph.relation_typing import (
+    dependency_semantics_valid,
+    semantic_role,
+    structural_dependency_direction,
+)
 from stategraph.evaluation.provider_resilience import (
     SEMANTIC_CONTRACT_FAILURE,
     ContractViolation,
+    FinishReasonIncomplete,
     ProviderRetryPolicy,
     bounded_async_call,
     classify_error,
 )
 from stategraph.evaluation.profiling import StageProfiler
+from stategraph.state.native_extraction import PromptMessage
 
 
 DEPENDENCY_RELATION_TYPES = frozenset(
@@ -41,17 +49,35 @@ _CANDIDATE_SIGNAL_VALUES = (
     'derived_claim_relation',
     'action_precondition',
     'explicit_source_relation',
+    'explicit_semantic_relation',
     'existing_semantic_relation',
+    'same_entity',
+    'shared_event',
+    'shared_object',
+    'execution_provenance',
+    'causal_text_grounding',
+    'temporal_overlap',
 )
 
-# Keep semantic candidate requests bounded.  Endpoint blocks are paired
-# Cartesianly, so each request can expose up to 64 source and 64 dependent
-# records while the serialized payload remains the hard safety bound.
+# These signals describe a directed relation.  Co-location, overlap and
+# lexical similarity are useful blocking features, but cannot spend a verifier
+# call on their own.
+_DIRECTIONAL_CANDIDATE_SIGNALS = frozenset({
+    'used_by_relation',
+    'derived_claim_relation',
+    'action_precondition',
+    'explicit_source_relation',
+    'explicit_semantic_relation',
+    'existing_semantic_relation',
+    'causal_text_grounding',
+})
+
+# Retained for the private endpoint-batch compatibility helper; production
+# semantic proposals use sparse local directed pairs below.
 CANDIDATE_BATCH_MAX_STATES = 64  # maximum states in either endpoint block
 CANDIDATE_BATCH_MAX_ENDPOINT_RECORDS = CANDIDATE_BATCH_MAX_STATES * 2
-# This limit applies to the complete user payload (observation + states + schema),
-# not just the state array.  The previous state-only limit allowed 70k+ requests
-# on long observations and defeated the batching contract.
+# Maximum serialized payload for the legacy endpoint-batch helper. Local
+# production requests use the same ceiling after source-window projection.
 CANDIDATE_BATCH_MAX_CHARS = 26000
 # Large observations can still make a model emit a dense candidate array even
 # when the input payload is bounded.  Keep the response contract deliberately
@@ -60,6 +86,10 @@ CANDIDATE_BATCH_MAX_CHARS = 26000
 CANDIDATE_BATCH_MAX_OUTPUT_TOKENS = 2048
 CANDIDATE_BATCH_MAX_ITEMS = 16
 CANDIDATE_FULL_OBSERVATION_MAX_CHARS = 8000
+DEPENDENCY_VERIFIER_BATCH_SIZE = 8
+DEPENDENCY_VERIFIER_MAX_SUBDIVISION_DEPTH = 3
+SEMANTIC_PROPOSAL_PAIR_BATCH_SIZE = 16
+SEMANTIC_PROPOSAL_MAX_SUBDIVISION_DEPTH = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +113,285 @@ class _CandidateEndpointBatch:
     @property
     def dependent_ids(self) -> set[str]:
         return {state.state_id for state in self.dependent_states}
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalSemanticPair:
+    pair_id: str
+    prerequisite: StateNode
+    dependent: StateNode
+    source_span: str
+    target_span: str
+    window_start: int
+    window_end: int
+
+
+def _observation_sentence_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (match.start(), match.end())
+        for match in re.finditer(r'[^.!?。！？]+(?:[.!?。！？]+|$)', text)
+        if text[match.start():match.end()].strip()
+    )
+
+
+def _state_observation_evidence(
+    state: StateNode, observation_text: str
+) -> tuple[str, int, int] | None:
+    metadata = state.metadata
+    spans = metadata.get('evidence_spans')
+    if isinstance(spans, str):
+        spans = (spans,)
+    if not isinstance(spans, Sequence):
+        spans = ()
+    spans = tuple(dict.fromkeys((
+        *(str(item).strip() for item in spans if str(item or '').strip()),
+        str(metadata.get('evidence_span') or '').strip(),
+    )))
+    folded = observation_text.casefold()
+    raw_ranges = metadata.get('evidence_source_ranges')
+    if isinstance(raw_ranges, Sequence):
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, Sequence) or len(raw_range) != 2:
+                continue
+            start, end = int(raw_range[0]), int(raw_range[1])
+            if 0 <= start < end <= len(observation_text):
+                span = observation_text[start:end]
+                if span.strip() and any(
+                    span.casefold() == evidence_span.casefold()
+                    for evidence_span in spans
+                ):
+                    return span, start, end
+    for span in spans:
+        start = folded.find(span.casefold()) if span else -1
+        if start >= 0:
+            return observation_text[start:start + len(span)], start, start + len(span)
+    return None
+
+
+def _local_semantic_pairs(
+    states: Sequence[StateNode],
+    new_state_ids: set[str],
+    observation_text: str,
+    *,
+    excluded_pairs: set[tuple[str, str]] | None = None,
+) -> tuple[_LocalSemanticPair, ...]:
+    """Form proposer pairs only when both grounded endpoints share a small source window."""
+    excluded_pairs = excluded_pairs or set()
+    sentences = _observation_sentence_ranges(observation_text)
+    if not sentences:
+        return ()
+
+    def sentence_index(position: int) -> int | None:
+        return next((index for index, (start, end) in enumerate(sentences)
+                     if start <= position < end), None)
+
+    state_by_id = {state.state_id: state for state in states}
+    located = {
+        state_id: evidence
+        for state_id, state in state_by_id.items()
+        if (evidence := _state_observation_evidence(state, observation_text)) is not None
+    }
+    pairs = []
+    for source in sorted(states, key=lambda item: item.state_id):
+        source_evidence = located.get(source.state_id)
+        if source_evidence is None:
+            continue
+        source_span, source_start, _ = source_evidence
+        source_sentence = sentence_index(source_start)
+        if source_sentence is None:
+            continue
+        for target_id in sorted(new_state_ids):
+            target = state_by_id.get(target_id)
+            target_evidence = located.get(target_id)
+            if target is None or target_evidence is None or target_id == source.state_id:
+                continue
+            if (source.state_id, target_id) in excluded_pairs:
+                continue
+            target_span, target_start, _ = target_evidence
+            target_sentence = sentence_index(target_start)
+            if target_sentence is None or abs(source_sentence - target_sentence) > 2:
+                continue
+            first = min(source_sentence, target_sentence)
+            last = max(source_sentence, target_sentence)
+            pair_id = hashlib.sha256(
+                f'{source.state_id}\0{target.state_id}'.encode('utf-8')
+            ).hexdigest()[:24]
+            pairs.append(_LocalSemanticPair(
+                pair_id=pair_id,
+                prerequisite=source,
+                dependent=target,
+                source_span=source_span,
+                target_span=target_span,
+                window_start=sentences[first][0],
+                window_end=sentences[last][1],
+            ))
+    return tuple(sorted(
+        pairs,
+        key=lambda item: (
+            item.window_start, item.window_end,
+            item.prerequisite.state_id, item.dependent.state_id,
+        ),
+    ))
+
+
+def _local_semantic_pair_batches(
+    pairs: Sequence[_LocalSemanticPair], observation_text: str
+) -> tuple[tuple[_LocalSemanticPair, ...], ...]:
+    batches: list[tuple[_LocalSemanticPair, ...]] = []
+
+    def add(items: Sequence[_LocalSemanticPair]) -> None:
+        items = tuple(items)
+        payload, _ = _local_semantic_pair_payload(items, observation_text)
+        if (
+            len(items) <= SEMANTIC_PROPOSAL_PAIR_BATCH_SIZE
+            and len(json.dumps(payload, ensure_ascii=False, default=str))
+            <= CANDIDATE_BATCH_MAX_CHARS
+        ):
+            batches.append(items)
+            return
+        if len(items) <= 1:
+            raise ValueError('one local semantic candidate pair exceeds the request budget')
+        midpoint = len(items) // 2
+        add(items[:midpoint])
+        add(items[midpoint:])
+
+    for start in range(0, len(pairs), SEMANTIC_PROPOSAL_PAIR_BATCH_SIZE):
+        add(pairs[start:start + SEMANTIC_PROPOSAL_PAIR_BATCH_SIZE])
+    return tuple(batches)
+
+
+def _local_semantic_pair_payload(
+    pairs: Sequence[_LocalSemanticPair], observation_text: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    state_map: dict[str, dict[str, Any]] = {}
+    windows: dict[tuple[int, int], dict[str, Any]] = {}
+    evidence_spans: list[str] = []
+    pair_rows = []
+    for pair in pairs:
+        for state, evidence_span in (
+            (pair.prerequisite, pair.source_span),
+            (pair.dependent, pair.target_span),
+        ):
+            if state.state_id not in state_map:
+                state_map[state.state_id] = {
+                    'state_id': state.state_id,
+                    'entity': state.entity,
+                    'attribute': state.attribute,
+                    'value': state.value,
+                    'canonical_entity_id': state.canonical_subject_id,
+                    'canonical_attribute_id': state.canonical_field_id,
+                    'status': state.status.value,
+                    'sequence_index': state.sequence_index,
+                    'observed_at': state.observed_at.isoformat(),
+                    'time_scope': {
+                        'start': state.time_scope.start.isoformat()
+                        if state.time_scope.start else None,
+                        'end': state.time_scope.end.isoformat()
+                        if state.time_scope.end else None,
+                    },
+                    'condition_scope': {
+                        'conditions': dict(state.condition_scope.conditions),
+                        'description': state.condition_scope.description,
+                    },
+                    'evidence_refs': list(state.evidence_refs),
+                    'evidence_span': evidence_span,
+                }
+            else:
+                state_map[state.state_id]['evidence_span'] = evidence_span
+            if evidence_span not in evidence_spans:
+                evidence_spans.append(evidence_span)
+        window_key = (pair.window_start, pair.window_end)
+        window = windows.setdefault(window_key, {
+            'window_id': hashlib.sha256(
+                f'{pair.window_start}:{pair.window_end}'.encode('utf-8')
+            ).hexdigest()[:16],
+            'source_range': [pair.window_start, pair.window_end],
+            'local_context': observation_text[pair.window_start:pair.window_end],
+        })
+        pair_rows.append({
+            'pair_id': pair.pair_id,
+            'source_state_id': pair.prerequisite.state_id,
+            'target_state_id': pair.dependent.state_id,
+            'source_evidence_span': pair.source_span,
+            'target_evidence_span': pair.target_span,
+            'evidence_window_id': window['window_id'],
+        })
+        for sentence in _observation_sentence_ranges(
+            observation_text[pair.window_start:pair.window_end]
+        ):
+            span = observation_text[
+                pair.window_start + sentence[0]:pair.window_start + sentence[1]
+            ].strip()
+            if span and span not in evidence_spans:
+                evidence_spans.append(span)
+    payload = {
+        'observation_id': pairs[0].dependent.observation_id if pairs else '',
+        'states': list(state_map.values()),
+        'evidence_windows': list(windows.values()),
+        'pairs': pair_rows,
+    }
+    safe_spans = tuple(
+        span for span in evidence_spans
+        if not any(char in span for char in '"\n\r\\')
+    )
+    item = {
+        'type': 'object',
+        'additionalProperties': False,
+        'required': ['pair_id', 'proposed_relation', 'signal', 'candidate_reason', 'evidence_span'],
+        'properties': {
+            'pair_id': {'type': 'string', 'enum': [pair.pair_id for pair in pairs]},
+            'proposed_relation': {'type': 'string', 'enum': list(_CANDIDATE_RELATION_VALUES)},
+            'signal': {'type': 'string', 'enum': list(_CANDIDATE_SIGNAL_VALUES)},
+            'candidate_reason': {'type': 'string'},
+            'evidence_span': (
+                {'type': 'string', 'enum': list(safe_spans)}
+                if safe_spans else {'type': 'string', 'minLength': 1}
+            ),
+        },
+    }
+    schema = {
+        'type': 'object',
+        'additionalProperties': False,
+        'required': ['candidates'],
+        'properties': {
+            'candidates': {
+                'type': 'array',
+                'maxItems': min(CANDIDATE_BATCH_MAX_ITEMS, len(pairs)),
+                'items': item,
+            },
+        },
+    }
+    return payload, schema
+
+
+def _translate_pair_proposals(
+    response: Mapping[str, Any], pairs: Sequence[_LocalSemanticPair]
+) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(response, Mapping) or set(response) != {'candidates'}:
+        raise ValueError('candidate discovery response must be exactly {"candidates": [...]}')
+    raw = response.get('candidates')
+    if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
+        raise ValueError('candidate discovery response candidates must be an array')
+    if len(raw) > min(CANDIDATE_BATCH_MAX_ITEMS, len(pairs)):
+        raise ValueError('candidate discovery response exceeded maxItems')
+    by_id = {pair.pair_id: pair for pair in pairs}
+    translated: list[dict[str, Any]] = []
+    required = {'pair_id', 'proposed_relation', 'signal', 'candidate_reason', 'evidence_span'}
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != required:
+            continue
+        pair = by_id.get(str(item.get('pair_id') or ''))
+        if pair is None:
+            continue
+        translated.append({
+            'prerequisite_state_id': pair.prerequisite.state_id,
+            'dependent_state_id': pair.dependent.state_id,
+            'proposed_relation': item.get('proposed_relation'),
+            'signal': item.get('signal'),
+            'candidate_reason': item.get('candidate_reason'),
+            'evidence_span': item.get('evidence_span'),
+        })
+    return {'candidates': translated}
 
 CANDIDATE_DISCOVERY_OUTPUT_SCHEMA = {
     'type': 'object',
@@ -143,6 +452,16 @@ DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA = {
                         'type': 'array',
                         'items': {'type': 'string'},
                     },
+                    'direction_supported': {'type': 'boolean'},
+                    'counterfactual_supported': {'type': 'boolean'},
+                    'evidence_supported': {'type': 'boolean'},
+                    'source_grounded': {'type': 'boolean'},
+                    'target_grounded': {'type': 'boolean'},
+                    'relation_evidence_supported': {'type': 'boolean'},
+                    'supporting_evidence_refs': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                    },
                 },
                 'required': [
                     'candidate_id',
@@ -153,6 +472,13 @@ DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA = {
                     'reason',
                     'verifier_confidence',
                     'supporting_evidence_ids',
+                    'direction_supported',
+                    'counterfactual_supported',
+                    'evidence_supported',
+                    'source_grounded',
+                    'target_grounded',
+                    'relation_evidence_supported',
+                    'supporting_evidence_refs',
                 ],
                 'additionalProperties': False,
             },
@@ -169,11 +495,12 @@ def generate_dependency_candidates(
     new_states: Sequence[StateNode],
     all_states: Sequence[StateNode],
     direct_invalidation_seed_ids: Sequence[str] = (),
+    recall_first: bool = False,
 ) -> tuple[DependencyCandidate, ...]:
-    """Generate candidates from explicit semantics and narrow structural proximity.
+    """Generate candidates from explicit semantics and directional provenance.
 
-    Structural signals improve recall only. They never create a persisted edge without
-    counterfactual verification.
+    Association-only structural signals are blocking features for the semantic
+    proposer; they never admit a verifier pair by themselves.
     """
 
     seed_ids = set(direct_invalidation_seed_ids)
@@ -281,29 +608,31 @@ def generate_dependency_candidates(
                 reason=intent.reason,
             )
 
+    # A shared, StateGraph-owned evidence reference is an explicit provenance
+    # relation (not lexical/topic overlap).  Keep this narrow compatibility
+    # path so evidence-backed states from one source remain discoverable; other
+    # structural associations are intentionally handled only as blocking.
     for dependent in new_states:
         if dependent.status not in {StateStatus.CURRENT, StateStatus.UNCERTAIN}:
             continue
         for prerequisite in available:
-            if prerequisite.state_id == dependent.state_id:
+            if prerequisite.state_id == dependent.state_id or not (
+                set(prerequisite.evidence_refs) & set(dependent.evidence_refs)
+            ):
                 continue
-            # Same subject and temporal overlap are recall/ranking signals, not
-            # dependency evidence.  Only shared execution provenance is strong
-            # enough to enter the structural candidate pool here.
-            if not _shares_provenance(prerequisite, dependent):
-                continue
-            signals = ['execution_provenance']
-            if _same_subject(prerequisite, dependent):
-                signals.append('same_entity')
-            if prerequisite.time_scope.overlaps(dependent.time_scope):
-                signals.append('temporal_overlap')
             add(
                 prerequisite,
                 dependent,
                 proposed_relation=None,
-                signals=signals,
-                reason='shared execution provenance; dependency not yet verified',
+                signals=('execution_provenance',),
+                reason='shared StateGraph evidence provenance',
             )
+
+    # Association-only signals are intentionally not admitted here.  A
+    # same-observation, same-entity, shared-object, or temporal-overlap pair is
+    # only a local blocking feature for semantic proposal; it is not a dependency
+    # candidate.  The admissible paths below are directional: explicit selectors,
+    # grounded causal text, or a semantic proposer that names a source -> target.
 
     # An explicit causal or conditional clause is provenance for a possible
     # prerequisite. It creates candidates only; the counterfactual verifier
@@ -357,20 +686,29 @@ class CounterfactualDependencyVerifier:
     ) -> tuple[DependencyAssessment, ...]:
         if not candidates:
             return ()
+        if len(candidates) > DEPENDENCY_VERIFIER_BATCH_SIZE:
+            assessments: list[DependencyAssessment] = []
+            for start in range(0, len(candidates), DEPENDENCY_VERIFIER_BATCH_SIZE):
+                assessments.extend(
+                    await self.verify(
+                        observation,
+                        candidates=tuple(candidates[start:start + DEPENDENCY_VERIFIER_BATCH_SIZE]),
+                        states=states,
+                    )
+                )
+            return tuple(assessments)
         verifiable = tuple(
             candidate for candidate in candidates if candidate.proposed_relation is not None
         )
         if not verifiable:
             return tuple(_uncertain_assessment(candidate) for candidate in candidates)
-        from graphiti_core.prompts.models import Message
-
         state_by_id = {state.state_id: state for state in states}
         relevant_ids = {
             state_id
             for candidate in verifiable
             for state_id in (candidate.prerequisite_state_id, candidate.dependent_state_id)
         }
-        system = Message(
+        system = PromptMessage(
             role='system',
             content=(
                 'Counterfactually verify each proposed state dependency using only the supplied '
@@ -381,14 +719,14 @@ class CounterfactualDependencyVerifier:
                 'remained unchanged, could the dependent state S2 still remain valid? Evaluate '
                 'the supplied current-state justification and provenance, not an open-world '
                 'search for hypothetical replacement support. Hold all supplied conditions and '
-                'recorded evidence fixed except the prerequisite validity. If the dependent '
-                'evidence presents S1 as the necessary basis for this recorded S2, classify '
-                'STRICT_DEPENDENCY even though an unrecorded future alternative could be '
-                'invented. Do not downgrade a necessary recorded prerequisite merely because '
-                'another real-world cause might exist. Return WEAK_DEPENDENCY only when the '
-                'supplied evidence explicitly provides independent support or says that S1 is '
-                'supportive/influential but not necessary. Return NO_DEPENDENCY when the supplied '
-                'evidence has no grounded dependency or explicitly denies one. A grounded '
+                'recorded evidence fixed except the prerequisite validity. Return '
+                'STRICT_DEPENDENCY only when direction_supported, counterfactual_supported, '
+                'relation_evidence_supported, source_grounded, and target_grounded are all '
+                'true. Return WEAK_DEPENDENCY only when the supplied evidence supports a '
+                'directional but non-necessary relationship with source, target, and relation '
+                'grounding. Return '
+                'NO_DEPENDENCY when the supplied evidence has no grounded dependency or '
+                'explicitly denies one. A grounded '
                 'paraphrase of the supplied prerequisite state is valid; do not require the '
                 'dependent evidence to repeat the exact attribute or value string. Use the '
                 'state record and provenance together, while rejecting mere temporal order, '
@@ -396,19 +734,26 @@ class CounterfactualDependencyVerifier:
                 'Same entity, temporal overlap, semantic similarity, ordinary knowledge-graph '
                 'relations, and value-to-entity matches never prove strict dependency. The '
                 'proposed relation type is fixed upstream and is read-only context: do not '
-                'classify, change, or return a relation type. Your only semantic task is to '
-                'classify dependency_strength. Every STRICT or WEAK decision must '
-                'cite one or more exact literal substrings from the observation in evidence_spans, '
-                'without adding quotation marks. NO_DEPENDENCY must use an empty evidence_spans '
-                'list. Return one assessment per candidate and JSON only as '
+                'classify, change, or return a relation type. Your semantic task is to classify '
+                'dependency_strength and the grounding booleans. Relation evidence may be a '
+                'cross-sentence local bridge from the supplied evidence_context; it need not '
+                'occur in one endpoint span. Every STRICT or WEAK decision must cite one or more '
+                'exact literal substrings from evidence_context in evidence_spans and return '
+                'supporting_evidence_refs, without adding quotation marks. NO_DEPENDENCY must use '
+                'an empty evidence_spans list. Return one assessment per candidate and JSON only as '
                 '{"assessments": [...]}. '
             ),
         )
-        user = Message(
+        verification_context, allowed_evidence_refs = _verification_evidence_context(
+            observation, verifiable, state_by_id
+        )
+        user = PromptMessage(
             role='user',
             content=json.dumps(
                 {
                     'observation': observation.content,
+                    'evidence_context': verification_context,
+                    'allowed_evidence_refs': sorted(allowed_evidence_refs),
                     'states': [
                         _state_payload(state_by_id[state_id])
                         for state_id in sorted(relevant_ids)
@@ -424,6 +769,15 @@ class CounterfactualDependencyVerifier:
                             ),
                             'dependent_state': _state_payload(
                                 state_by_id[item.dependent_state_id]
+                            ),
+                            'source_evidence_spans': _state_evidence_spans(
+                                state_by_id[item.prerequisite_state_id]
+                            ),
+                            'target_evidence_spans': _state_evidence_spans(
+                                state_by_id[item.dependent_state_id]
+                            ),
+                            'relation_evidence_context': list(
+                                dict.fromkeys(item.candidate_evidence)
                             ),
                             'proposed_relation': (
                                 item.proposed_relation.value
@@ -444,10 +798,17 @@ class CounterfactualDependencyVerifier:
                         'dependency_strength': (
                             'STRICT_DEPENDENCY|WEAK_DEPENDENCY|NO_DEPENDENCY'
                         ),
-                        'evidence_spans': ['exact literal observation substring'],
+                        'evidence_spans': ['exact literal evidence_context substring'],
                         'reason': 'string',
                         'verifier_confidence': 'number from 0 to 1',
                         'supporting_evidence_ids': ['string'],
+                        'direction_supported': 'boolean',
+                        'counterfactual_supported': 'boolean',
+                        'evidence_supported': 'boolean',
+                        'source_grounded': 'boolean',
+                        'target_grounded': 'boolean',
+                        'relation_evidence_supported': 'boolean',
+                        'supporting_evidence_refs': ['string'],
                     },
                 },
                 ensure_ascii=False,
@@ -463,22 +824,38 @@ class CounterfactualDependencyVerifier:
             if self._profiler is not None
             else None
         )
-        if scope is None:
-            response = await self._llm_client.generate_response(
-                [system, user],
-                group_id=observation.group_id,
-                prompt_name='stategraph.dependency_verification.v1',
-            )
-        else:
-            with scope:
+        try:
+            if scope is None:
                 response = await self._llm_client.generate_response(
                     [system, user],
                     group_id=observation.group_id,
                     prompt_name='stategraph.dependency_verification.v1',
+                    candidate_schema=DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
                 )
+            else:
+                with scope:
+                    response = await self._llm_client.generate_response(
+                        [system, user],
+                        group_id=observation.group_id,
+                        prompt_name='stategraph.dependency_verification.v1',
+                        candidate_schema=DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
+                    )
+        except FinishReasonIncomplete as exc:
+            self._write_truncation_trace(
+                observation=observation,
+                candidates=verifiable,
+                input_messages=(system.content, user.content),
+                error=exc,
+            )
+            raise
         verified = _parse_assessments(
-            response, verifiable, state_by_id, observation.content
+            response,
+            verifiable,
+            state_by_id,
+            verification_context,
+            allowed_evidence_refs=allowed_evidence_refs,
         )
+        verified = _enforce_directional_antisymmetry(verified)
         self._write_trace(
             observation=observation,
             input_messages=(system.content, user.content),
@@ -601,6 +978,48 @@ class CounterfactualDependencyVerifier:
         with self._trace_path.open('a', encoding='utf-8') as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
 
+    def _write_truncation_trace(
+        self,
+        *,
+        observation: Observation,
+        candidates: Sequence[DependencyCandidate],
+        input_messages: tuple[str, str],
+        error: FinishReasonIncomplete,
+    ) -> None:
+        if self._trace_path is None:
+            return
+        raw = error.raw_text or getattr(self._llm_client, 'last_raw_response_text', '') or ''
+        metadata = error.response_metadata or getattr(
+            self._llm_client, 'last_response_metadata', None
+        ) or {}
+        request_chars = sum(len(item) for item in input_messages)
+        record = {
+            'stage': 'dependency_verification_truncated',
+            'observation_id': observation.observation_id,
+            'group_id': observation.group_id,
+            'candidate_count': len(candidates),
+            'expected_assessment_count': len(candidates),
+            'candidate_pairs': [
+                [item.prerequisite_state_id, item.dependent_state_id]
+                for item in candidates
+            ],
+            'input_characters': request_chars,
+            'estimated_input_tokens': max(1, request_chars // 4),
+            'configured_output_budget': (
+                metadata.get('max_output_tokens')
+                if isinstance(metadata, Mapping) else None
+            ),
+            'finish_reason': (
+                metadata.get('finish_reason')
+                if isinstance(metadata, Mapping) else 'incomplete'
+            ),
+            'partial_response_characters': len(raw),
+            'subdivision_action': 'split_if_multi_candidate',
+        }
+        self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._trace_path.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + '\n')
+
 
 class AutomaticDependencyDiscovery:
     """Generate every candidate first, then verify every candidate once."""
@@ -611,12 +1030,14 @@ class AutomaticDependencyDiscovery:
         *,
         trace_path: str | Path | None = None,
         profiler: StageProfiler | None = None,
+        recall_first: bool = False,
     ) -> None:
         if not hasattr(llm_client, 'generate_response'):
             raise TypeError('llm_client must provide generate_response()')
         self._llm_client = llm_client
         self._trace_path = Path(trace_path) if trace_path is not None else None
         self._profiler = profiler
+        self._recall_first = recall_first
         self._verifier = CounterfactualDependencyVerifier(
             llm_client, trace_path=trace_path, profiler=profiler
         )
@@ -634,12 +1055,14 @@ class AutomaticDependencyDiscovery:
             new_states=new_states,
             all_states=all_states,
             direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            recall_first=self._recall_first,
         )
         semantic_candidates = await self._discover_semantic_candidates(
             observation,
             new_states=new_states,
             all_states=all_states,
             direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            deterministic_candidates=candidates,
         )
         candidates = _merge_candidates((*candidates, *semantic_candidates))
         assessments = await self._verifier.verify(
@@ -687,12 +1110,14 @@ class AutomaticDependencyDiscovery:
             new_states=new_states,
             all_states=all_states,
             direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            recall_first=self._recall_first,
         )
         semantic_candidates = await self._discover_semantic_candidates(
             observation,
             new_states=new_states,
             all_states=all_states,
             direct_invalidation_seed_ids=direct_invalidation_seed_ids,
+            deterministic_candidates=candidates,
         )
         return _merge_candidates((*candidates, *semantic_candidates))
 
@@ -721,15 +1146,35 @@ class AutomaticDependencyDiscovery:
         candidates: Sequence[DependencyCandidate],
         states: Sequence[StateNode],
     ) -> tuple[DependencyAssessment, ...]:
-        """Production verifier stage: one already-typed candidate per call."""
+        """Verify sparse candidates in deterministic bounded structured batches."""
         assessments: list[DependencyAssessment] = []
-        for candidate in candidates:
-            assessments.append(
-                await self._verifier.verify_one(
-                    observation, candidate=candidate, states=states
+
+        async def verify_batch(
+            batch: tuple[DependencyCandidate, ...], depth: int = 0
+        ) -> tuple[DependencyAssessment, ...]:
+            try:
+                return await self._verifier.verify(
+                    observation, candidates=batch, states=states
                 )
-            )
-        return tuple(assessments)
+            except FinishReasonIncomplete:
+                if (
+                    len(batch) <= 1
+                    or depth >= DEPENDENCY_VERIFIER_MAX_SUBDIVISION_DEPTH
+                ):
+                    raise
+                middle = len(batch) // 2
+                left = await verify_batch(batch[:middle], depth + 1)
+                right = await verify_batch(batch[middle:], depth + 1)
+                return (*left, *right)
+
+        for start in range(0, len(candidates), DEPENDENCY_VERIFIER_BATCH_SIZE):
+            batch = tuple(candidates[start:start + DEPENDENCY_VERIFIER_BATCH_SIZE])
+            # ``verify`` returns one fail-closed assessment per supplied pair;
+            # a malformed/omitted item cannot make its neighbours look valid.
+            assessments.extend(await verify_batch(batch))
+        # Reverse pairs can land in different provider batches; apply the guard
+        # once more over the complete deterministic result set.
+        return _enforce_directional_antisymmetry(tuple(assessments))
 
     async def _discover_semantic_candidates(
         self,
@@ -738,9 +1183,8 @@ class AutomaticDependencyDiscovery:
         new_states: Sequence[StateNode],
         all_states: Sequence[StateNode],
         direct_invalidation_seed_ids: Sequence[str],
+        deterministic_candidates: Sequence[DependencyCandidate] = (),
     ) -> tuple[DependencyCandidate, ...]:
-        from graphiti_core.prompts.models import Message
-
         relevant = _relevant_states(
             observation,
             new_states=new_states,
@@ -750,173 +1194,251 @@ class AutomaticDependencyDiscovery:
         new_ids = {state.state_id for state in new_states}
         if len(relevant) < 2 or not new_ids:
             return ()
-        system = Message(
+        deterministic_pairs = {
+            (item.prerequisite_state_id, item.dependent_state_id)
+            for item in deterministic_candidates
+        }
+        pairs = _local_semantic_pairs(
+            relevant, new_ids, observation.content,
+            excluded_pairs=deterministic_pairs,
+        )
+        batches = _local_semantic_pair_batches(pairs, observation.content)
+        if not batches:
+            return ()
+        system = PromptMessage(
             role='system',
             content=(
-                'Discover plausible dependency candidates using only the supplied observation, '
-                'state records, and provenance. Direction is always prerequisite/source -> '
-                'downstream/dependent. Do NOT reverse the dependency direction. The prerequisite '
-                'is the state whose invalidation may affect another state; the dependent is the '
-                'state whose validity may then fail and must be one of dependent_endpoint_ids. '
-                'Propose DEPENDS_ON for an explicit validity prerequisite, DERIVED_FROM for an '
-                'explicitly derived claim, and AFFECTS_ACTION for an action or plan precondition. '
-                'This stage proposes candidates only; it does not decide whether a dependency is '
-                'strict. Same entity, temporal overlap, semantic similarity, ordinary knowledge '
-                'relations, and value-to-entity matches are not semantic dependency evidence. '
-                'Each candidate must cite an exact verbatim evidence_span from the observation. '
-                'Use only an evidence_span present in allowed_evidence_spans for this request; '
-                'copy it character-for-character, preserving spaces, punctuation, and case; '
-                'never replace spaces with underscores or normalized field names. Do not invent '
-                'a span or copy unrelated observation text. Do not add quotation '
-                'marks around the copied span. Choose one proposed relation '
-                'type per candidate; do not collapse different relation types for the same state '
-                'pair. The signal must be exactly one of: used_by_relation, '
-                'derived_claim_relation, action_precondition, explicit_source_relation, or '
-                'existing_semantic_relation. Never use the same state ID as both prerequisite '
-                'and dependent. Every prerequisite_state_id must be copied from '
-                'source_endpoint_ids, and every dependent_state_id must be copied from '
-                'dependent_endpoint_ids in the current batch. If no valid candidate exists, '
-                'return an empty array. '
-                'Return JSON only as {"candidates": [...]}. '
+                'Propose only evidence-grounded directional invalidation candidates from supplied '
+                'local packets: source/prerequisite -> target/dependent. Use DEPENDS_ON for explicit '
+                'validity prerequisites, DERIVED_FROM for explicit derivation, or AFFECTS_ACTION for '
+                'an action/plan precondition. Similarity, shared entity/object, topic, or time alone '
+                'is not a dependency. This is proposal only; the verifier and final deterministic '
+                'persistence gate remain authoritative. Use only pair_ids in this request. Cite an '
+                'exact verbatim evidence_span from its local context. Return only positive proposals; '
+                'omitted pair_ids mean no proposal. Include a short rationale and directional signal. '
+                'Return JSON only.'
             ),
-        )
-        batches = _candidate_state_batches(
-            relevant,
-            new_ids,
-            observation_content=observation.content,
         )
         discovered: list[DependencyCandidate] = []
         for batch_index, batch in enumerate(batches):
-            batch_states = batch.states
-            batch_new_ids = batch.dependent_ids
-            candidate_observation = _candidate_observation_context(
-                observation.content, batch_states
-            )
-            payload = _candidate_batch_payload(
-                candidate_observation,
-                batch_states,
-                batch_new_ids,
-                source_state_ids=batch.source_ids,
-                dependent_state_ids=batch.dependent_ids,
-                evidence_spans=_candidate_evidence_spans(
-                    observation.content, batch_states
-                ),
-            )
-            batch_schema = _candidate_discovery_schema(
-                batch.source_ids,
-                batch.dependent_ids,
-                evidence_spans=_candidate_evidence_spans(
-                    observation.content, batch_states
-                ),
-            )
-            user = Message(
-                role='user',
-                content=json.dumps(payload, ensure_ascii=False, default=str),
-            )
-            started = __import__('time').perf_counter()
-            response = None
-            contract_retries = 0
+            discovered.extend(await self._propose_local_pair_batch(
+                observation, batch, system=system,
+                batch_index=batch_index, batch_count=len(batches),
+                subdivision_depth=0,
+            ))
+        return _merge_candidates(discovered)
 
-            async def request_and_parse() -> tuple[Mapping[str, Any], tuple[DependencyCandidate, ...]]:
-                nonlocal response, contract_retries
-                attempt_messages = [
-                    item.model_copy(deep=True) if hasattr(item, 'model_copy') else copy.deepcopy(item)
-                    for item in (system, user)
-                ]
-                response = await self._llm_client.generate_response(
-                    attempt_messages,
-                    group_id=observation.group_id,
-                    prompt_name='stategraph.dependency_candidate_discovery.v1',
-                    max_tokens=CANDIDATE_BATCH_MAX_OUTPUT_TOKENS,
-                    candidate_schema=batch_schema,
-                )
-                _assert_complete_structured_response(self._llm_client, response)
-                try:
-                    parsed = _parse_discovered_candidates(
-                        response,
-                        states={state.state_id: state for state in batch_states},
-                        new_state_ids=batch_new_ids,
-                        source_state_ids=batch.source_ids,
-                        observation=observation,
-                        # Validate against the full raw observation.  The request
-                        # uses bounded evidence projection for scale, but a model
-                        # may cite an exact span outside that projection; raw
-                        # grounding remains fail-closed.
-                        evidence_context=observation.content,
-                    )
-                except ValueError as exc:
-                    if classify_error(exc) != SEMANTIC_CONTRACT_FAILURE:
-                        raise
-                    contract_retries += 1
-                    raise ContractViolation(str(exc)) from exc
-                return response, parsed
+    async def _propose_local_pair_batch(
+        self,
+        observation: Observation,
+        batch: Sequence[_LocalSemanticPair],
+        *,
+        system: PromptMessage,
+        batch_index: int,
+        batch_count: int,
+        subdivision_depth: int,
+    ) -> tuple[DependencyCandidate, ...]:
+        payload, batch_schema = _local_semantic_pair_payload(batch, observation.content)
+        user = PromptMessage(role='user', content=json.dumps(payload, ensure_ascii=False))
+        response = None
+        contract_retries = 0
+        started = __import__('time').perf_counter()
+
+        async def request_and_parse() -> tuple[Mapping[str, Any], tuple[DependencyCandidate, ...]]:
+            nonlocal response, contract_retries
+            messages = [
+                item.model_copy(deep=True) if hasattr(item, 'model_copy') else copy.deepcopy(item)
+                for item in (system, user)
+            ]
+            response = await self._llm_client.generate_response(
+                messages,
+                group_id=observation.group_id,
+                prompt_name='stategraph.dependency_candidate_discovery.v1',
+                max_tokens=CANDIDATE_BATCH_MAX_OUTPUT_TOKENS,
+                candidate_schema=batch_schema,
+            )
+            _assert_complete_structured_response(self._llm_client, response)
             try:
-                scope = (
-                    self._profiler.stage(
-                        'DEPENDENCY_CANDIDATE_DISCOVERY',
-                        observation_id=observation.observation_id,
-                        batch_id=f'{observation.observation_id}:candidate-{batch_index}',
-                        batch_index=batch_index,
-                    )
-                    if self._profiler is not None
-                    else None
-                )
-                kwargs = {
-                    'request_snapshot': {
-                        'system': system.content,
-                        'user': user.content,
-                        'schema': batch_schema,
-                    },
-                    'provider': getattr(self._llm_client, 'provider', 'openai'),
-                    'model': getattr(self._llm_client, 'model', 'unknown'),
-                    'policy': getattr(
-                        self._llm_client, 'retry_policy', ProviderRetryPolicy.from_env()
-                    ),
-                    'record': getattr(self._llm_client, '_record_attempt', None),
-                    'allowed_taxonomies': {SEMANTIC_CONTRACT_FAILURE},
+                translated = _translate_pair_proposals(response, batch)
+                state_map = {
+                    state.state_id: state for pair in batch
+                    for state in (pair.prerequisite, pair.dependent)
                 }
-                if scope is None:
-                    response, parsed = await bounded_async_call(request_and_parse, **kwargs)
-                else:
-                    with scope:
-                        response, parsed = await bounded_async_call(request_and_parse, **kwargs)
-            except Exception as exc:
-                self._write_candidate_trace(
+                parsed = _parse_discovered_candidates(
+                    translated,
+                    states=state_map,
+                    new_state_ids={pair.dependent.state_id for pair in batch},
+                    source_state_ids={pair.prerequisite.state_id for pair in batch},
                     observation=observation,
-                    batch_index=batch_index,
-                    batch_count=len(batches),
-                    states=batch_states,
-                    new_state_ids=batch_new_ids,
-                    payload=payload,
-                    response=response,
-                    parsed=(),
+                    evidence_context=observation.content,
+                )
+            except ValueError as exc:
+                if classify_error(exc) != SEMANTIC_CONTRACT_FAILURE:
+                    raise
+                contract_retries += 1
+                raise ContractViolation(str(exc)) from exc
+            return response, parsed
+
+        scope = (
+            self._profiler.stage(
+                'DEPENDENCY_CANDIDATE_DISCOVERY',
+                observation_id=observation.observation_id,
+                batch_id=f'{observation.observation_id}:candidate-{batch_index}.{subdivision_depth}',
+                batch_index=batch_index,
+                subdivision_depth=subdivision_depth,
+                pair_count=len(batch),
+            )
+            if self._profiler is not None else None
+        )
+        kwargs = {
+            'request_snapshot': {
+                'system': system.content,
+                'user': user.content,
+                'schema': batch_schema,
+                'max_output_tokens': CANDIDATE_BATCH_MAX_OUTPUT_TOKENS,
+            },
+            'provider': getattr(self._llm_client, 'provider', 'openai'),
+            'model': getattr(self._llm_client, 'model', 'unknown'),
+            'policy': getattr(
+                self._llm_client, 'retry_policy', ProviderRetryPolicy.from_env()
+            ),
+            # The provider client records actual invocations and retries.
+            # Recording this wrapper as well double-counts successful requests.
+            'record': None,
+            'allowed_taxonomies': {SEMANTIC_CONTRACT_FAILURE},
+        }
+        try:
+            if scope is None:
+                response, parsed = await bounded_async_call(request_and_parse, **kwargs)
+            else:
+                with scope:
+                    response, parsed = await bounded_async_call(request_and_parse, **kwargs)
+        except FinishReasonIncomplete as exc:
+            raw = exc.raw_text or getattr(self._llm_client, 'last_raw_response_text', '') or ''
+            response_metadata = exc.response_metadata or getattr(
+                self._llm_client, 'last_response_metadata', None
+            )
+            request_hash = (
+                str(response_metadata.get('request_hash'))
+                if isinstance(response_metadata, Mapping) and response_metadata.get('request_hash')
+                else hashlib.sha256(json.dumps({
+                    'system': system.content,
+                    'user': user.content,
+                    'schema': batch_schema,
+                }, ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+            )
+            states = {
+                state.state_id: state for pair in batch
+                for state in (pair.prerequisite, pair.dependent)
+            }
+            if len(batch) > 1 and subdivision_depth < SEMANTIC_PROPOSAL_MAX_SUBDIVISION_DEPTH:
+                midpoint = len(batch) // 2
+                self._write_candidate_trace(
+                    observation=observation, batch_index=batch_index,
+                    batch_count=batch_count, states=tuple(states.values()),
+                    new_state_ids={pair.dependent.state_id for pair in batch},
+                    payload=payload, response=None, parsed=(),
                     contract_retries=contract_retries,
                     elapsed_seconds=__import__('time').perf_counter() - started,
                     error=f'{type(exc).__name__}: {exc}',
+                    pair_ids=[pair.pair_id for pair in batch],
+                    subdivision_depth=subdivision_depth,
+                    subdivision_action='split_pairs', request_hash=request_hash,
+                    raw_response_characters=len(raw),
                 )
-                raise
-            discovered.extend(parsed)
+                left = await self._propose_local_pair_batch(
+                    observation, batch[:midpoint], system=system,
+                    batch_index=batch_index, batch_count=batch_count,
+                    subdivision_depth=subdivision_depth + 1,
+                )
+                right = await self._propose_local_pair_batch(
+                    observation, batch[midpoint:], system=system,
+                    batch_index=batch_index, batch_count=batch_count,
+                    subdivision_depth=subdivision_depth + 1,
+                )
+                return (*left, *right)
             self._write_candidate_trace(
-                observation=observation,
-                batch_index=batch_index,
-                batch_count=len(batches),
-                states=batch_states,
-                new_state_ids=batch_new_ids,
-                payload=payload,
-                response=response,
-                parsed=parsed,
+                observation=observation, batch_index=batch_index,
+                batch_count=batch_count, states=tuple(states.values()),
+                new_state_ids={pair.dependent.state_id for pair in batch},
+                payload=payload, response=None, parsed=(),
                 contract_retries=contract_retries,
                 elapsed_seconds=__import__('time').perf_counter() - started,
+                error=f'{type(exc).__name__}: {exc}',
+                pair_ids=[pair.pair_id for pair in batch],
+                subdivision_depth=subdivision_depth,
+                subdivision_action='fail_closed', request_hash=request_hash,
+                raw_response_characters=len(raw),
             )
-        return _merge_candidates(discovered)
+            raise
+        except Exception as exc:
+            states = {
+                state.state_id: state for pair in batch
+                for state in (pair.prerequisite, pair.dependent)
+            }
+            self._write_candidate_trace(
+                observation=observation, batch_index=batch_index,
+                batch_count=batch_count, states=tuple(states.values()),
+                new_state_ids={pair.dependent.state_id for pair in batch},
+                payload=payload, response=response, parsed=(),
+                contract_retries=contract_retries,
+                elapsed_seconds=__import__('time').perf_counter() - started,
+                error=f'{type(exc).__name__}: {exc}',
+                pair_ids=[pair.pair_id for pair in batch],
+                subdivision_depth=subdivision_depth,
+            )
+            raise
+        states = {
+            state.state_id: state for pair in batch
+            for state in (pair.prerequisite, pair.dependent)
+        }
+        self._write_candidate_trace(
+            observation=observation, batch_index=batch_index,
+            batch_count=batch_count, states=tuple(states.values()),
+            new_state_ids={pair.dependent.state_id for pair in batch},
+            payload=payload, response=response, parsed=parsed,
+            contract_retries=contract_retries,
+            elapsed_seconds=__import__('time').perf_counter() - started,
+            pair_ids=[pair.pair_id for pair in batch],
+            subdivision_depth=subdivision_depth,
+        )
+        return parsed
 
     def _write_candidate_trace(
         self, *, observation, batch_index, batch_count, states, new_state_ids,
         payload, response, parsed, elapsed_seconds, error=None,
-        contract_retries=0,
+        contract_retries=0, pair_ids=(), subdivision_depth=0,
+        subdivision_action=None, request_hash=None, raw_response_characters=None,
     ) -> None:
         if self._trace_path is None:
             return
+        raw_candidates = response.get('candidates', ()) if isinstance(response, Mapping) else ()
+        if not isinstance(raw_candidates, Sequence) or isinstance(raw_candidates, str | bytes):
+            raw_candidates = ()
+        metadata = getattr(self._llm_client, 'last_response_metadata', None)
+        request_hash = request_hash or (
+            str(metadata.get('request_hash'))
+            if isinstance(metadata, Mapping) and metadata.get('request_hash') else None
+        )
+        raw_by_pair = {
+            str(item.get('pair_id')): item
+            for item in raw_candidates
+            if isinstance(item, Mapping) and item.get('pair_id') is not None
+        }
+        parsed_pairs = {
+            (item.prerequisite_state_id, item.dependent_state_id)
+            for item in parsed
+        }
+        pair_results = [
+            {
+                **dict(item),
+                'proposal': raw_by_pair.get(str(item['pair_id'])),
+                'accepted': (
+                    item['source_state_id'], item['target_state_id']
+                ) in parsed_pairs,
+            }
+            for item in payload.get('pairs', ())
+        ]
         record = {
             'stage': 'candidate_discovery',
             'observation_id': observation.observation_id,
@@ -924,16 +1446,35 @@ class AutomaticDependencyDiscovery:
             'batch_count': batch_count,
             'state_count': len(states),
             'new_state_count': len(new_state_ids),
-            'source_endpoint_ids': list(payload.get('source_endpoint_ids', ())),
-            'dependent_endpoint_ids': list(payload.get('dependent_endpoint_ids', ())),
-            'source_endpoint_count': len(payload.get('source_endpoint_ids', ())),
-            'dependent_endpoint_count': len(payload.get('dependent_endpoint_ids', ())),
+            'source_endpoint_ids': sorted({
+                item['source_state_id'] for item in payload.get('pairs', ())
+            }),
+            'dependent_endpoint_ids': sorted({
+                item['target_state_id'] for item in payload.get('pairs', ())
+            }),
+            'source_endpoint_count': len({
+                item['source_state_id'] for item in payload.get('pairs', ())
+            }),
+            'dependent_endpoint_count': len({
+                item['target_state_id'] for item in payload.get('pairs', ())
+            }),
+            'pair_count': len(pair_ids),
+            'pair_ids': list(pair_ids),
+            'raw_proposal_count': len(raw_by_pair),
+            'accepted_proposal_count': len(parsed),
+            'duplicate_pair_proposal_count': max(0, len(raw_candidates) - len(raw_by_pair)),
+            'zero_result': not raw_by_pair,
+            'pair_results': pair_results,
+            'subdivision_depth': subdivision_depth,
+            'subdivision_action': subdivision_action,
+            'request_hash': request_hash,
+            'raw_response_characters': raw_response_characters,
             'input_chars': len(json.dumps(payload, ensure_ascii=False, default=str)),
             'estimated_input_tokens': len(json.dumps(payload, ensure_ascii=False, default=str)) // 4,
             'output_item_count': len(response.get('candidates', ())) if isinstance(response, Mapping) else None,
             'raw_model_response': response,
             'raw_model_response_text': getattr(self._llm_client, 'last_raw_response_text', None),
-            'response_metadata': getattr(self._llm_client, 'last_response_metadata', None),
+            'response_metadata': metadata,
             'provider_attempts': getattr(self._llm_client, 'last_attempt_trace', None),
             'provider_errors': getattr(self._llm_client, 'last_error_trace', None),
             'parsed_candidates': [_candidate_payload(item) for item in parsed],
@@ -952,7 +1493,7 @@ def _candidate_state_batches(
     *,
     observation_content: str = '',
 ) -> tuple[_CandidateEndpointBatch, ...]:
-    """Partition the complete directed endpoint universe deterministically.
+    """Legacy deterministic endpoint partition used by compatibility fixtures.
 
     A state-list window cannot expose a prerequisite in one window to a
     dependent in another.  Source and dependent blocks therefore form a
@@ -1145,9 +1686,11 @@ def _assert_complete_structured_response(
     finish_reason = metadata.get('finish_reason') if isinstance(metadata, Mapping) else None
     if finish_reason in {'length', 'content_filter', 'incomplete'}:
         raw = getattr(llm_client, 'last_raw_response_text', '') or ''
-        raise ValueError(
+        raise FinishReasonIncomplete(
             'dependency candidate structured response incomplete: '
-            f'finish_reason={finish_reason} raw_chars={len(raw)}'
+            f'finish_reason={finish_reason} raw_chars={len(raw)}',
+            raw_text=raw,
+            metadata=metadata,
         )
     if not isinstance(response, Mapping):
         raise ValueError('dependency candidate response must be a JSON object')
@@ -1200,12 +1743,14 @@ def _parse_discovered_candidates(
     allowed_source_ids = source_state_ids if source_state_ids is not None else set(states)
     for item in raw:
         if not isinstance(item, Mapping):
-            raise ValueError('candidate discovery item must be an object')
+            # One malformed proposal must not abort the observation.  The
+            # envelope/schema remains strict; individual model items fail closed.
+            continue
         if set(item) != {
             'prerequisite_state_id', 'dependent_state_id', 'proposed_relation',
             'signal', 'candidate_reason', 'evidence_span',
         }:
-            raise ValueError('candidate discovery item has invalid fields')
+            continue
         prerequisite_id = str(item.get('prerequisite_state_id') or '').strip()
         dependent_id = str(item.get('dependent_state_id') or '').strip()
         relation_type = _relation_type(item.get('proposed_relation'))
@@ -1223,9 +1768,20 @@ def _parse_discovered_candidates(
             or not reason
             or not evidence_span
         ):
-            raise ValueError('candidate discovery item failed endpoint/schema validation')
+            continue
         prerequisite = states[prerequisite_id]
         dependent = states[dependent_id]
+        if not _candidate_signal_is_admissible(signal, prerequisite, dependent):
+            continue
+        if (
+            semantic_role(prerequisite) == 'ORDINARY_FACT'
+            and semantic_role(dependent) == 'ORDINARY_FACT'
+            and not _has_explicit_dependency_provenance(evidence_span)
+        ):
+            # Ordinary factual relations are retrieval material, not
+            # invalidation candidates, unless the supplied span contains a
+            # grounded causal/prerequisite clause.
+            continue
         output.append(
             DependencyCandidate(
                 prerequisite_state_id=prerequisite_id,
@@ -1243,6 +1799,21 @@ def _parse_discovered_candidates(
             )
         )
     return tuple(output)
+
+
+def _candidate_signal_is_admissible(
+    signal: str, prerequisite: StateNode, dependent: StateNode
+) -> bool:
+    """Reject association-only semantic proposals before verification.
+
+    ``same_entity``/``shared_object``/``temporal_overlap`` are useful features
+    for choosing a local semantic block, but they contain no direction.  A
+    proposal must name a source-to-target signal before it reaches typing or
+    the provider verifier.
+    """
+
+    del prerequisite, dependent
+    return signal in _DIRECTIONAL_CANDIDATE_SIGNALS
 
 
 def _merge_candidates(
@@ -1310,7 +1881,107 @@ def _assessment_payload(assessment: DependencyAssessment) -> dict[str, Any]:
         'verifier_confidence': assessment.verifier_confidence,
         'supporting_evidence_ids': list(assessment.supporting_evidence_ids),
         'evidence_spans': list(assessment.evidence_spans),
+        'direction_supported': assessment.direction_supported,
+        'counterfactual_supported': assessment.counterfactual_supported,
+        'evidence_supported': assessment.evidence_supported,
+        'source_grounded': assessment.source_grounded,
+        'target_grounded': assessment.target_grounded,
+        'relation_evidence_supported': assessment.relation_evidence_supported,
+        'supporting_evidence_refs': list(assessment.supporting_evidence_refs),
+        'structural_direction_valid': assessment.structural_direction_valid,
+        'dependency_semantics_valid': assessment.dependency_semantics_valid,
+        'source_role': assessment.source_role,
+        'target_role': assessment.target_role,
+        'structural_direction_reason': assessment.structural_direction_reason,
     }
+
+
+def _enforce_directional_antisymmetry(
+    assessments: Sequence[DependencyAssessment],
+) -> tuple[DependencyAssessment, ...]:
+    """Fail closed on unsupported A->B and B->A pairs."""
+
+    by_pair = {
+        (
+            item.candidate.prerequisite_state_id,
+            item.candidate.dependent_state_id,
+        ): item
+        for item in assessments
+        if item.strength is not DependencyStrength.NONE
+    }
+    result = list(assessments)
+    processed_pairs: set[frozenset[str]] = set()
+    for index, item in enumerate(result):
+        if item.strength is DependencyStrength.NONE:
+            continue
+        pair_set = frozenset({
+            item.candidate.prerequisite_state_id,
+            item.candidate.dependent_state_id,
+        })
+        if pair_set in processed_pairs:
+            continue
+        reverse = by_pair.get(
+            (item.candidate.dependent_state_id, item.candidate.prerequisite_state_id)
+        )
+        if reverse is None:
+            continue
+        # Mutual dependencies need an explicit relation assertion; ordinary
+        # similarity, co-occurrence, and mirrored model output are not enough.
+        mutual = bool(re.search(
+            r'\b(?:mutual|reciprocal|bidirectional|each\s+other)\b',
+            f'{item.verification_reason} {reverse.verification_reason}',
+            flags=re.IGNORECASE,
+        ))
+        if mutual:
+            processed_pairs.add(pair_set)
+            continue
+        current_key = (
+            item.candidate.prerequisite_state_id,
+            item.candidate.dependent_state_id,
+        )
+        reverse_key = (
+            reverse.candidate.prerequisite_state_id,
+            reverse.candidate.dependent_state_id,
+        )
+        def rank(assessment: DependencyAssessment) -> tuple[int, float, str]:
+            strength_rank = {
+                DependencyStrength.STRICT: 2,
+                DependencyStrength.WEAK: 1,
+            }.get(assessment.strength, 0)
+            return (
+                strength_rank,
+                assessment.verifier_confidence,
+                '|'.join(assessment.candidate.signals),
+            )
+        # Keep the stronger direction; lexical order breaks exact ties.
+        if rank(item) > rank(reverse) or (
+            rank(item) == rank(reverse) and current_key < reverse_key
+        ):
+            loser = reverse
+        else:
+            loser = item
+        loser_index = result.index(loser)
+        result[loser_index] = replace(
+            loser,
+            strength=DependencyStrength.NONE,
+            relation_type=None,
+            verification_reason='reverse dependency rejected by antisymmetry guard',
+            verifier_confidence=0.0,
+            supporting_evidence_ids=(),
+            evidence_span=None,
+            evidence_spans=(),
+            direction_supported=False,
+            counterfactual_supported=False,
+            evidence_supported=False,
+            source_grounded=False,
+            target_grounded=False,
+            relation_evidence_supported=False,
+            supporting_evidence_refs=(),
+            structural_direction_valid=False,
+            dependency_semantics_valid=False,
+        )
+        processed_pairs.add(pair_set)
+    return tuple(result)
 
 
 def _uncertain_assessment(candidate: DependencyCandidate) -> DependencyAssessment:
@@ -1328,6 +1999,8 @@ def _parse_assessments(
     candidates: Sequence[DependencyCandidate],
     states: Mapping[str, StateNode],
     observation: str,
+    *,
+    allowed_evidence_refs: set[str] | None = None,
 ) -> tuple[DependencyAssessment, ...]:
     candidate_by_key = {_candidate_key(item): item for item in candidates}
     candidate_by_id = {
@@ -1365,6 +2038,11 @@ def _parse_assessments(
         key = _candidate_key(candidate) if candidate is not None else (*pair, '')
         if candidate is None or key in parsed:
             continue
+        endpoint_pair = (
+            pair
+            if pair[0] or pair[1]
+            else (candidate.prerequisite_state_id, candidate.dependent_state_id)
+        )
         strength = _strength(item.get('dependency_strength', item.get('strength')))
         reason = str(item.get('reason') or item.get('verification_reason') or '').strip()
         try:
@@ -1385,9 +2063,23 @@ def _parse_assessments(
         evidence_span = evidence_spans[0] if evidence_spans else None
         allowed_evidence_ids = {
             evidence_id
-            for state_id in pair
+            for state_id in endpoint_pair
             for evidence_id in (states.get(state_id).evidence_ids if states.get(state_id) else ())
         }
+        candidate_evidence_refs = set(allowed_evidence_ids)
+        candidate_evidence_refs.update(
+            str(value)
+            for key_name in (
+                'prerequisite_evidence_ids',
+                'dependent_evidence_ids',
+                'shared_evidence_ids',
+            )
+            for value in (
+                candidate.provenance.get(key_name, ())
+                if isinstance(candidate.provenance, Mapping)
+                else ()
+            )
+        )
         raw_evidence_ids = item.get('supporting_evidence_ids', ())
         if not isinstance(raw_evidence_ids, Sequence) or isinstance(
             raw_evidence_ids, str | bytes
@@ -1400,20 +2092,159 @@ def _parse_assessments(
         )
         if not supporting_evidence_ids:
             supporting_evidence_ids = tuple(sorted(allowed_evidence_ids))
+        raw_evidence_refs = item.get('supporting_evidence_refs', ())
+        if not isinstance(raw_evidence_refs, Sequence) or isinstance(
+            raw_evidence_refs, str | bytes
+        ):
+            raw_evidence_refs = ()
+        supporting_evidence_refs = tuple(
+            dict.fromkeys(
+                str(value)
+                for value in raw_evidence_refs
+                if str(value) in (allowed_evidence_refs or candidate_evidence_refs)
+            )
+        )
+        if not supporting_evidence_refs:
+            supporting_evidence_refs = tuple(sorted(candidate_evidence_refs))
         grounded = bool(evidence_spans) and spans_valid
+        # Keep a narrow legacy read path for sealed pre-contract fixtures.  New
+        # responses carry independent endpoint/relation grounding booleans.
+        flags_present = any(
+            name in item
+            for name in (
+                'direction_supported',
+                'counterfactual_supported',
+                'evidence_supported',
+                'source_grounded',
+                'target_grounded',
+                'relation_evidence_supported',
+            )
+        )
+        direction_supported = (
+            _bool_value(item.get('direction_supported'))
+            if flags_present else candidate is not None and (
+                (not pair[0] and not pair[1]) or pair == (
+                    candidate.prerequisite_state_id,
+                    candidate.dependent_state_id,
+                )
+            )
+        )
+        counterfactual_supported = (
+            _bool_value(item.get('counterfactual_supported'))
+            if flags_present else strength is DependencyStrength.STRICT
+        )
+        evidence_supported = (
+            _bool_value(item.get('evidence_supported'))
+            if flags_present else grounded
+        )
+        new_grounding_contract = any(
+            name in item
+            for name in (
+                'source_grounded', 'target_grounded', 'relation_evidence_supported',
+                'supporting_evidence_refs',
+            )
+        )
+        source_grounded = (
+            _bool_value(item.get('source_grounded'))
+            if 'source_grounded' in item
+            else (bool(
+                states.get(endpoint_pair[0])
+                and _state_evidence_spans(states[endpoint_pair[0]])
+            ) or not new_grounding_contract)
+        )
+        target_grounded = (
+            _bool_value(item.get('target_grounded'))
+            if 'target_grounded' in item
+            else (bool(
+                states.get(endpoint_pair[1])
+                and _state_evidence_spans(states[endpoint_pair[1]])
+            ) or not new_grounding_contract)
+        )
+        relation_evidence_supported = (
+            _bool_value(item.get('relation_evidence_supported'))
+            if 'relation_evidence_supported' in item
+            else evidence_supported
+        )
+        evidence_supported = relation_evidence_supported
+        structural_direction_valid = False
+        dependency_semantics_ok = False
+        dependency_semantics_reason = 'dependency endpoints missing'
+        structural_reason = 'dependency endpoints missing'
+        source_role = 'UNKNOWN'
+        target_role = 'UNKNOWN'
+        prerequisite = states.get(endpoint_pair[0])
+        dependent = states.get(endpoint_pair[1])
+        if prerequisite is not None and dependent is not None:
+            (
+                structural_direction_valid,
+                structural_reason,
+                source_role,
+                target_role,
+            ) = structural_dependency_direction(
+                candidate, prerequisite, dependent, evidence=evidence_spans
+            )
+            verifier_contract = {
+                'dependency_strength': strength.value,
+                'direction_supported': direction_supported,
+                'counterfactual_supported': counterfactual_supported,
+                'relation_evidence_supported': relation_evidence_supported,
+                'source_grounded': source_grounded,
+                'target_grounded': target_grounded,
+                'verification_evidence_spans': evidence_spans,
+                'supporting_evidence_refs': supporting_evidence_refs,
+            }
+            dependency_semantics_ok, dependency_semantics_reason = dependency_semantics_valid(
+                candidate,
+                prerequisite,
+                dependent,
+                verifier_contract,
+                evidence=evidence_spans,
+            )
         if strength is DependencyStrength.NONE:
             relation_type = None
             evidence_span = None
             evidence_spans = ()
             supporting_evidence_ids = ()
-        elif not grounded:
+            direction_supported = False
+            counterfactual_supported = False
+            evidence_supported = False
+            source_grounded = False
+            target_grounded = False
+            relation_evidence_supported = False
+            supporting_evidence_refs = ()
+            structural_direction_valid = False
+            dependency_semantics_ok = False
+        elif (
+            not grounded
+            or not direction_supported
+            or not relation_evidence_supported
+            or not source_grounded
+            or not target_grounded
+            or (strength is DependencyStrength.STRICT and not counterfactual_supported)
+            or not structural_direction_valid
+            or not dependency_semantics_ok
+        ):
             strength = DependencyStrength.NONE
             relation_type = None
             evidence_span = None
             evidence_spans = ()
             supporting_evidence_ids = ()
-            reason = 'verification rejected: dependency was not grounded or type-consistent'
+            reason = (
+                'verification rejected: directionality, structural role, counterfactual, '
+                f'or evidence contract was not satisfied ({structural_reason}; '
+                f'{dependency_semantics_reason}; '
+                f'{source_role}->{target_role})'
+            )
             confidence = 0.0
+            direction_supported = False
+            counterfactual_supported = False
+            evidence_supported = False
+            source_grounded = False
+            target_grounded = False
+            relation_evidence_supported = False
+            supporting_evidence_refs = ()
+            structural_direction_valid = False
+            dependency_semantics_ok = False
         else:
             if not reason:
                 reason = 'grounded dependency-strength assessment'
@@ -1427,6 +2258,18 @@ def _parse_assessments(
             supporting_evidence_ids=supporting_evidence_ids,
             evidence_span=evidence_span,
             evidence_spans=evidence_spans,
+            direction_supported=direction_supported,
+            counterfactual_supported=counterfactual_supported,
+            evidence_supported=evidence_supported,
+            source_grounded=source_grounded,
+            target_grounded=target_grounded,
+            relation_evidence_supported=relation_evidence_supported,
+            supporting_evidence_refs=supporting_evidence_refs,
+            structural_direction_valid=structural_direction_valid,
+            dependency_semantics_valid=dependency_semantics_ok,
+            source_role=source_role,
+            target_role=target_role,
+            structural_direction_reason=structural_reason,
         )
     for key, candidate in candidate_by_key.items():
         if key not in parsed:
@@ -1440,6 +2283,12 @@ def _parse_assessments(
     return tuple(parsed[key] for key in candidate_by_key)
 
 
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {'1', 'true', 'yes'}
+
+
 def _literal_span(value: Any, observation: str) -> str | None:
     span = str(value or '').strip()
     if span and span.casefold() in observation.casefold():
@@ -1449,6 +2298,42 @@ def _literal_span(value: Any, observation: str) -> str | None:
         if unquoted and unquoted.casefold() in observation.casefold():
             return unquoted
     return None
+
+
+def _state_evidence_spans(state: StateNode) -> tuple[str, ...]:
+    spans = [str(state.metadata.get('evidence_span') or '').strip()]
+    spans.extend(
+        str(value).strip()
+        for value in state.metadata.get('evidence_spans', ())
+        if str(value).strip()
+    )
+    return tuple(dict.fromkeys(value for value in spans if value))
+
+
+def _verification_evidence_context(
+    observation: Observation,
+    candidates: Sequence[DependencyCandidate],
+    states: Mapping[str, StateNode],
+) -> tuple[str, set[str]]:
+    """Project endpoint and bridge evidence without requiring one shared span."""
+
+    context: list[str] = [observation.content]
+    refs: set[str] = set()
+    for candidate in candidates:
+        source = states.get(candidate.prerequisite_state_id)
+        target = states.get(candidate.dependent_state_id)
+        for state in (source, target):
+            if state is None:
+                continue
+            context.extend(_state_evidence_spans(state))
+            refs.update(state.evidence_ids)
+            refs.update(state.evidence_refs)
+        context.extend(candidate.candidate_evidence)
+        for key in ('prerequisite_evidence_ids', 'dependent_evidence_ids', 'shared_evidence_ids'):
+            values = candidate.provenance.get(key, ())
+            if isinstance(values, Sequence) and not isinstance(values, str | bytes):
+                refs.update(str(value) for value in values)
+    return '\n'.join(dict.fromkeys(value for value in context if value.strip())), refs
 
 
 def _state_payload(state: StateNode) -> dict[str, Any]:
@@ -1483,12 +2368,63 @@ def _shares_provenance(left: StateNode, right: StateNode) -> bool:
     )
 
 
+def _shared_object_signal(left: StateNode, right: StateNode) -> bool:
+    """Return a bounded lexical recall signal for a shared object/event.
+
+    This intentionally does not classify a dependency.  It only keeps a pair
+    available for counterfactual verification when both states mention at least
+    two meaningful non-subject tokens in their grounded evidence/value text.
+    """
+
+    if left.attribute.casefold() == right.attribute.casefold():
+        return False
+
+    def tokens(state: StateNode) -> set[str]:
+        subject = set(_meaningful_tokens(state.canonical_subject_id or state.entity))
+        text = ' '.join(
+            (
+                str(state.metadata.get('evidence_span') or ''),
+                str(state.value),
+                state.attribute,
+            )
+        )
+        return (
+            set(_meaningful_tokens(text))
+            - subject
+            - {'status', 'value', 'field', 'state', 'item', 'thing'}
+        )
+
+    return len(tokens(left) & tokens(right)) >= 2
+
+
+def _compatible_attribute_signal(left: StateNode, right: StateNode) -> bool:
+    """Return a small same-entity structural signal, never a dependency proof.
+
+    Same-entity states are common and are not dependent merely because they share
+    an entity.  Require a cross-slot lexical bridge (for example a status/action
+    or object/value phrase) before spending a verifier call on the pair.
+    """
+
+    if left.attribute.casefold() == right.attribute.casefold():
+        return False
+    generic = {'status', 'value', 'field', 'state', 'item', 'thing'}
+    left_terms = _meaningful_tokens(f'{left.attribute} {left.value}') - generic
+    right_terms = _meaningful_tokens(f'{right.attribute} {right.value}') - generic
+    return bool(left_terms & right_terms)
+
+
 def _has_explicit_dependency_provenance(evidence: str) -> bool:
     """Recognize general causal/conditional source syntax for candidate recall."""
 
     return bool(
         re.search(
-            r'\b(?:because|requires?|only\s+(?:if|when)|provided\s+that|after)\b',
+            r'\b(?:because|due\s+to|requires?|is\s+required\s+for|'
+            r'depends?\s+on|relies?\s+on|only\s+(?:if|when|while)|'
+            r'provided\s+that|unless|without|derived\s+from|computed\s+from|'
+            r'calculated\s+from|inferred\s+from|based\s+on|causes?|'
+            r'leads?\s+to|enables?|may\s+affect|might\s+affect|'
+            r'could\s+affect|affects?|results?\s+in|necessary\s+for|'
+            r'prerequisite\s+for)\b',
             evidence,
             flags=re.IGNORECASE,
         )
@@ -1527,21 +2463,24 @@ def _causal_evidence_mentions(evidence: str, prerequisite: StateNode) -> bool:
     if marker is None:
         return False
     causal_text = evidence[marker.start():]
-    causal_tokens = _meaningful_tokens(causal_text)
-    prerequisite_tokens = (
-        _meaningful_tokens(prerequisite.entity)
-        | _meaningful_tokens(prerequisite.attribute)
-        | _meaningful_tokens(prerequisite.value)
-    )
-    if causal_tokens & _meaningful_tokens(prerequisite.entity):
+    causal_folded = causal_text.casefold()
+    entity = str(prerequisite.entity).strip().casefold()
+    # Prefer an exact grounded entity phrase.  Token overlap such as the
+    # generic word "user" would otherwise admit every user state in a batch.
+    if entity and re.search(
+        rf'(?<![\w]){re.escape(entity)}(?![\w])', causal_folded
+    ):
         return True
-    if causal_tokens & (_meaningful_tokens(prerequisite.attribute) | _meaningful_tokens(prerequisite.value)):
-        return True
+    # Do not fall back to generic attribute/value overlap here.  A value such
+    # as "Tuesday" is shared by many independent states; semantic proposal is
+    # the safe path when a causal clause does not name its source entity.
     # "after" clauses can name the prerequisite before the temporal marker
     # (e.g. "reserved for the interview after ...").  Keep this fallback
     # constrained to meaningful prerequisite tokens and an explicit marker.
     if re.match(r'\s*after\b', evidence[marker.start():], flags=re.IGNORECASE):
-        return bool(_meaningful_tokens(evidence) & prerequisite_tokens)
+        return bool(entity and re.search(
+            rf'(?<![\w]){re.escape(entity)}(?![\w])', evidence.casefold()
+        ))
     return False
 
 

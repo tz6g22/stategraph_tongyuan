@@ -19,8 +19,10 @@ from openai import OpenAI
 
 from stategraph.final_answer import build_answer_input, parse_answer
 from stategraph.graphiti_adapter.dependency_discovery import (
+    CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
     DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
 )
+from stategraph.state.native_extraction import STATE_EXTRACTION_OUTPUT_SCHEMA
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +90,21 @@ class Gpt5Client:
 
     async def generate_response(self, messages, **kwargs):
         prompt_name = kwargs.get("prompt_name")
-        if prompt_name == "stategraph.dependency_verification.v1":
+        if prompt_name == "stategraph.state_extraction.v2":
+            response_format = {
+                "type": "json_schema",
+                "name": "stategraph_state_extraction",
+                "schema": kwargs.get("candidate_schema", STATE_EXTRACTION_OUTPUT_SCHEMA),
+                "strict": True,
+            }
+        elif prompt_name == "stategraph.dependency_candidate_discovery.v1":
+            response_format = {
+                "type": "json_schema",
+                "name": "stategraph_dependency_candidate_discovery",
+                "schema": kwargs.get("candidate_schema", CANDIDATE_DISCOVERY_OUTPUT_SCHEMA),
+                "strict": True,
+            }
+        elif prompt_name == "stategraph.dependency_verification.v1":
             response_format = {
                 "type": "json_schema",
                 "name": "stategraph_dependency_verification",
@@ -100,7 +116,7 @@ class Gpt5Client:
         response = self.client.responses.create(
             model=MODEL,
             input=[{"role": item.role, "content": item.content} for item in messages],
-            max_output_tokens=2048,
+            max_output_tokens=int(kwargs.get("max_tokens", 2048)),
             reasoning={"effort": "minimal"},
             text={"format": response_format},
         )
@@ -155,7 +171,7 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
     extraction_path = case_dir / f"{case['case_id']}_extraction_trace.jsonl"
     revision_path = case_dir / f"{case['case_id']}_revision_trace.jsonl"
     graph = StateGraph(
-        extractor=GraphitiLLMStateExtractor(client, trace_path=extraction_path),
+        extractor=GraphitiLLMStateExtractor(client, trace_path=extraction_path, native_mode=True),
         revision_trace_path=revision_path,
         stop_after=STOP_AFTER,
     )

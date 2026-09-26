@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from collections.abc import Sequence
+from collections.abc import AsyncIterator
 
 from stategraph.state.schema import (
     EvidenceNode,
@@ -20,6 +22,41 @@ class InMemoryStateRepository:
         self._evidence: dict[str, EvidenceNode] = {}
         self._relations: dict[str, StateRelation] = {}
         self._lock = asyncio.Lock()
+        self._observation_transaction_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def observation_transaction(self, group_id: str) -> AsyncIterator[None]:
+        """Rollback this group's semantic graph if an observation fails."""
+
+        # ponytail: one repository-wide transaction lock keeps snapshots simple;
+        # per-group locks are only warranted if concurrent ingestion becomes needed.
+        async with self._observation_transaction_lock:
+            async with self._lock:
+                snapshot = (
+                    {key: value for key, value in self._states.items() if value.group_id == group_id},
+                    {key: value for key, value in self._evidence.items() if value.group_id == group_id},
+                    {key: value for key, value in self._relations.items() if value.group_id == group_id},
+                )
+            try:
+                yield
+            except BaseException:
+                async with self._lock:
+                    self._states = {
+                        key: value for key, value in self._states.items()
+                        if value.group_id != group_id
+                    }
+                    self._evidence = {
+                        key: value for key, value in self._evidence.items()
+                        if value.group_id != group_id
+                    }
+                    self._relations = {
+                        key: value for key, value in self._relations.items()
+                        if value.group_id != group_id
+                    }
+                    self._states.update(snapshot[0])
+                    self._evidence.update(snapshot[1])
+                    self._relations.update(snapshot[2])
+                raise
 
     async def save_evidence(self, evidence: EvidenceNode) -> None:
         async with self._lock:

@@ -102,7 +102,7 @@ async def run_scb(method: str) -> list[dict[str, Any]]:
         for case in payload["cases"]:
             started = time.perf_counter(); client = StaleGpt5Client(); group = f"matrix-scb-{case['case_id']}"
             try:
-                graph = StateGraph(extractor=GraphitiLLMStateExtractor(client, trace_path=OUT / "statechangebench" / method / f"{case['case_id']}_extraction.jsonl"), revision_trace_path=OUT / "statechangebench" / method / f"{case['case_id']}_revision.jsonl")
+                graph = StateGraph(extractor=GraphitiLLMStateExtractor(client, trace_path=OUT / "statechangebench" / method / f"{case['case_id']}_extraction.jsonl", native_mode=True), revision_trace_path=OUT / "statechangebench" / method / f"{case['case_id']}_revision.jsonl")
                 ingests = []
                 for i, item in enumerate([*case["history"], case["new_observation"]]):
                     ingests.append(await graph.ingest(Observation(observation_id=item["id"], content=item["text"], origin="StateChangeBench", occurred_at=datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i), group_id=group, observation_index=i, name=item["id"], source_description="matrix raw input")))

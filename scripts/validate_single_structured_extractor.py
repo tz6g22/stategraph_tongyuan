@@ -30,6 +30,7 @@ async def main() -> None:
     extractor = GraphitiLLMStateExtractor(
         llm,
         trace_path=OUTPUT / 'extraction_trace.jsonl',
+        native_mode=True,
     )
     results = []
     for case_id in CASE_IDS:

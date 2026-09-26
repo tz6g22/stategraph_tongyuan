@@ -95,6 +95,14 @@ class _VerifiedExtractor:
                         if strength is not DependencyStrength.NONE
                         else None
                     ),
+                    direction_supported=strength is not DependencyStrength.NONE,
+                    counterfactual_supported=strength is DependencyStrength.STRICT,
+                    evidence_supported=strength is not DependencyStrength.NONE,
+                    source_grounded=strength is not DependencyStrength.NONE,
+                    target_grounded=strength is not DependencyStrength.NONE,
+                    relation_evidence_supported=strength is not DependencyStrength.NONE,
+                    structural_direction_valid=strength is not DependencyStrength.NONE,
+                    dependency_semantics_valid=strength is not DependencyStrength.NONE,
                 )
             )
         return candidates, tuple(assessments)
@@ -165,7 +173,10 @@ class AutomaticDependencyPipelineTests(unittest.IsolatedAsyncioTestCase):
             Observation('User is free Friday.', now, 'test'),
             candidates=(StateCandidate('user', 'availability', 'free Friday'),),
         )
-        text = 'Availability supports the plan, which also has independent support.'
+        text = (
+            "The user's Friday availability may affect whether the meeting plan proceeds, "
+            'although the plan also has independent support.'
+        )
         plan = await graph.ingest(
             Observation(text, now + timedelta(hours=1), 'test'),
             candidates=(
@@ -338,28 +349,30 @@ class AutomaticDependencyPipelineTests(unittest.IsolatedAsyncioTestCase):
 
 class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
     async def test_candidate_contract_keeps_relation_types_and_normalizes_quote_wrapper(self) -> None:
-        observation_text = 'A is required for B.'
-        states = (_node('A'), _node('B'))
+        observation_text = 'Alpha is required for Bravo.'
+        states = (
+            _node('Alpha', metadata={'evidence_span': observation_text}),
+            _node('Bravo', metadata={'evidence_span': observation_text}),
+        )
 
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
                 if kwargs['prompt_name'] == 'stategraph.dependency_candidate_discovery.v1':
+                    pair_id = json.loads(messages[-1].content)['pairs'][0]['pair_id']
                     return {'candidates': [
                         {
-                            'prerequisite_state_id': 'A',
-                            'dependent_state_id': 'B',
+                            'pair_id': pair_id,
                             'proposed_relation': 'DEPENDS_ON',
                             'signal': 'explicit_source_relation',
                             'candidate_reason': 'required',
-                            'evidence_span': '"A is required for B."',
+                            'evidence_span': '"Alpha is required for Bravo."',
                         },
                         {
-                            'prerequisite_state_id': 'A',
-                            'dependent_state_id': 'B',
+                            'pair_id': pair_id,
                             'proposed_relation': 'AFFECTS_ACTION',
                             'signal': 'action_precondition',
                             'candidate_reason': 'alternative candidate type',
-                            'evidence_span': 'A is required for B.',
+                            'evidence_span': 'Alpha is required for Bravo.',
                         },
                     ]}
                 payload = json.loads(messages[-1].content)
@@ -390,7 +403,10 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_llm_discovers_then_verifies_cross_observation_dependency(self) -> None:
-        old = _node('prerequisite')
+        old = _node(
+            'prerequisite',
+            metadata={'evidence_span': 'prerequisite remains active'},
+        )
         dependent = StateNode.create(
             state_id='dependent',
             entity='deployment',
@@ -399,6 +415,7 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
             evidence_id='e:dependent',
             observation_id='o:dependent',
             observed_at=datetime(2030, 1, 2, tzinfo=UTC),
+            metadata={'evidence_span': 'Deployment is ready only while prerequisite remains active.'},
         )
         observation_text = 'Deployment is ready only while prerequisite remains active.'
 
@@ -409,10 +426,10 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
             async def generate_response(self, messages, **kwargs):
                 self.prompts.append(kwargs['prompt_name'])
                 if kwargs['prompt_name'] == 'stategraph.dependency_candidate_discovery.v1':
+                    pair_id = json.loads(messages[-1].content)['pairs'][0]['pair_id']
                     return {
                         'candidates': [{
-                            'prerequisite_state_id': 'prerequisite',
-                            'dependent_state_id': 'dependent',
+                            'pair_id': pair_id,
                             'proposed_relation': 'DEPENDS_ON',
                             'signal': 'action_precondition',
                             'candidate_reason': 'Readiness explicitly requires the prerequisite.',
@@ -428,6 +445,12 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
                         'verifier_confidence': 1.0,
                         'supporting_evidence_ids': ['e:prerequisite', 'e:dependent'],
                         'evidence_span': observation_text,
+                        'direction_supported': True,
+                        'counterfactual_supported': True,
+                        'evidence_supported': True,
+                        'source_grounded': True,
+                        'target_grounded': True,
+                        'relation_evidence_supported': True,
                     }]
                 }
 
@@ -445,14 +468,19 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assessments[0].strength, DependencyStrength.STRICT)
 
     async def test_verifier_returns_strict_weak_and_no_with_grounding(self) -> None:
-        observation_text = 'A is required for B. C merely supports D. E and F are related.'
-        states = tuple(_node(name, evidence_id=f'e:{name}') for name in 'ABCDEF')
+        observation_text = (
+            'Alpha is required for Bravo. Charlie may affect whether Delta proceeds. '
+            'Delta has independent support. Echo and Foxtrot are related.'
+        )
+        states = tuple(_node(name, evidence_id=f'e:{name}') for name in (
+            'Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot'
+        ))
         candidates = tuple(
             _candidate(left, right, relation)
             for left, right, relation in (
-                ('A', 'B', RelationType.DEPENDS_ON),
-                ('C', 'D', RelationType.DEPENDS_ON),
-                ('E', 'F', RelationType.DEPENDS_ON),
+                ('Alpha', 'Bravo', RelationType.DEPENDS_ON),
+                ('Charlie', 'Delta', RelationType.DEPENDS_ON),
+                ('Echo', 'Foxtrot', RelationType.DEPENDS_ON),
             )
         )
 
@@ -463,9 +491,15 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
                 self.candidate_count = len(payload['candidates'])
                 return {
                     'assessments': [
-                        _raw_assessment('A', 'B', 'STRICT_DEPENDENCY', 'A is required for B.'),
-                        _raw_assessment('C', 'D', 'WEAK_DEPENDENCY', 'C merely supports D.'),
-                        _raw_assessment('E', 'F', 'NO_DEPENDENCY', None),
+                        _raw_assessment(
+                            'Alpha', 'Bravo', 'STRICT_DEPENDENCY',
+                            'Alpha is required for Bravo.',
+                        ),
+                        _raw_assessment(
+                            'Charlie', 'Delta', 'WEAK_DEPENDENCY',
+                            'Charlie may affect whether Delta proceeds.',
+                        ),
+                        _raw_assessment('Echo', 'Foxtrot', 'NO_DEPENDENCY', None),
                     ]
                 }
 
@@ -481,22 +515,31 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
             tuple(item.strength for item in result),
             (DependencyStrength.STRICT, DependencyStrength.WEAK, DependencyStrength.NONE),
         )
-        self.assertEqual(result[0].evidence_spans, ('A is required for B.',))
+        self.assertEqual(result[0].evidence_spans, ('Alpha is required for Bravo.',))
 
     async def test_verifier_only_classifies_strength_and_preserves_upstream_types(self) -> None:
-        observation_text = 'A supports B. C produces D. E enables action F.'
-        states = tuple(_node(name) for name in 'ABCDEF')
+        observation_text = (
+            'Bravo requires Alpha. Delta is computed from Charlie. '
+            'Echo enables action Foxtrot.'
+        )
+        states = tuple(_node(name) for name in (
+            'Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot'
+        ))
         candidates = (
-            _candidate('A', 'B', RelationType.DEPENDS_ON),
-            _candidate('C', 'D', RelationType.DERIVED_FROM),
-            _candidate('E', 'F', RelationType.AFFECTS_ACTION),
+            _candidate('Alpha', 'Bravo', RelationType.DEPENDS_ON),
+            _candidate('Charlie', 'Delta', RelationType.DERIVED_FROM),
+            _candidate('Echo', 'Foxtrot', RelationType.AFFECTS_ACTION),
         )
 
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
                 payload = json.loads(messages[-1].content)
                 self.payload = payload
-                spans = ('A supports B.', 'C produces D.', 'E enables action F.')
+                spans = (
+                    'Bravo requires Alpha.',
+                    'Delta is computed from Charlie.',
+                    'Echo enables action Foxtrot.',
+                )
                 return {'assessments': [
                     {
                         'candidate_id': item['candidate_id'],
@@ -505,6 +548,13 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
                         'dependency_strength': 'STRICT_DEPENDENCY',
                         'evidence_spans': [span],
                         'reason': 'explicit necessity for test',
+                        'direction_supported': True,
+                        'counterfactual_supported': True,
+                        'evidence_supported': True,
+                        'source_grounded': True,
+                        'target_grounded': True,
+                        'relation_evidence_supported': True,
+                        'supporting_evidence_refs': [f'evidence:{item["candidate_id"]}'],
                     }
                     for item, span in zip(payload['candidates'], spans, strict=True)
                 ]}
@@ -559,9 +609,16 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0].strength, DependencyStrength.NONE)
 
     async def test_candidate_discovery_batches_large_state_sets_and_merges(self) -> None:
-        states = tuple(_node(f's{index:03d}') for index in range(70))
+        observation_text = 'A0 A1 A2 A3 A4 A5 A6 A7 A8 A9. A requires B.'
+        states = tuple(
+            _node(f'A{index}', metadata={'evidence_span': observation_text})
+            for index in range(10)
+        ) + tuple(
+            _node(f'B{index}', metadata={'evidence_span': observation_text})
+            for index in range(10)
+        )
         observation = Observation(
-            'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
+            observation_text, datetime(2030, 1, 1, tzinfo=UTC), 'test'
         )
 
         class FakeLLM:
@@ -571,17 +628,13 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
             async def generate_response(self, messages, **kwargs):
                 payload = json.loads(messages[-1].content)
                 self.calls.append(payload)
-                source_ids = payload['source_endpoint_ids']
-                dependent_ids = payload['dependent_endpoint_ids']
-                if not source_ids or not dependent_ids or source_ids[0] == dependent_ids[0]:
-                    return {'candidates': []}
+                pair = payload['pairs'][0]
                 return {'candidates': [{
-                    'prerequisite_state_id': source_ids[0],
-                    'dependent_state_id': dependent_ids[0],
+                    'pair_id': pair['pair_id'],
                     'proposed_relation': 'DEPENDS_ON',
                     'signal': 'explicit_source_relation',
                     'candidate_reason': 'explicit requirement',
-                    'evidence_span': 'A requires B.',
+                    'evidence_span': observation_text,
                 }]}
 
         llm = FakeLLM()
@@ -592,17 +645,17 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(json.dumps(item)) <= 26000 for item in llm.calls))
         self.assertGreaterEqual(len(candidates), 2)
         self.assertEqual(
-            {item.dependent_state_id for item in candidates},
             {
-                item['dependent_endpoint_ids'][0]
-                for item in llm.calls
-                if item['source_endpoint_ids']
-                and item['dependent_endpoint_ids']
-                and item['source_endpoint_ids'][0] != item['dependent_endpoint_ids'][0]
+                (item.prerequisite_state_id, item.dependent_state_id)
+                for item in candidates
+            },
+            {
+                (call['pairs'][0]['source_state_id'], call['pairs'][0]['target_state_id'])
+                for call in llm.calls
             },
         )
 
-    async def test_candidate_batch_budget_includes_long_observation(self) -> None:
+    async def test_candidate_discovery_skips_unrelated_full_observation(self) -> None:
         states = tuple(_node(f's{index:03d}') for index in range(70))
         observation = Observation(
             'long observation ' + ('x' * 12000),
@@ -622,13 +675,9 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         await AutomaticDependencyDiscovery(llm).discover_candidates(
             observation, new_states=states, all_states=states
         )
-        self.assertGreater(len(llm.payloads), 1)
-        self.assertLessEqual(
-            max(len(json.dumps(payload, ensure_ascii=False)) for payload in llm.payloads),
-            CANDIDATE_BATCH_MAX_CHARS,
-        )
+        self.assertEqual(llm.payloads, [])
 
-    async def test_candidate_discovery_rejects_invalid_item_fail_closed(self) -> None:
+    async def test_candidate_discovery_skips_invalid_item_fail_closed(self) -> None:
         class FakeLLM:
             async def generate_response(self, messages, **kwargs):
                 return {'candidates': [{
@@ -640,32 +689,67 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
                     'evidence_span': 'A requires B.',
                 }]}
 
-        with self.assertRaises(ValueError):
-            await AutomaticDependencyDiscovery(FakeLLM()).discover_candidates(
-                Observation('A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
-                new_states=(_node('B'),), all_states=(_node('A'), _node('B')),
-            )
+        candidates = await AutomaticDependencyDiscovery(FakeLLM()).discover_candidates(
+            Observation('A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+            new_states=(_node('B'),), all_states=(_node('A'), _node('B')),
+        )
+        self.assertEqual(candidates, ())
 
-    async def test_candidate_discovery_rejects_out_of_batch_dependent(self) -> None:
-        with self.assertRaises(ValueError):
-            from stategraph.graphiti_adapter.dependency_discovery import _parse_discovered_candidates
+    async def test_candidate_discovery_skips_out_of_batch_dependent(self) -> None:
+        from stategraph.graphiti_adapter.dependency_discovery import _parse_discovered_candidates
 
-            _parse_discovered_candidates(
-                {'candidates': [{
+        candidates = _parse_discovered_candidates(
+            {'candidates': [{
+                'prerequisite_state_id': 'A',
+                'dependent_state_id': 'C',
+                'proposed_relation': 'DEPENDS_ON',
+                'signal': 'explicit_source_relation',
+                'candidate_reason': 'out of batch',
+                'evidence_span': 'A requires B.',
+            }]},
+            states={'A': _node('A'), 'B': _node('B')},
+            new_state_ids={'B'},
+            source_state_ids={'A'},
+            observation=Observation(
+                'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
+            ),
+        )
+        self.assertEqual(candidates, ())
+
+    def test_candidate_discovery_keeps_valid_sibling_after_malformed_item(self) -> None:
+        from stategraph.graphiti_adapter.dependency_discovery import _parse_discovered_candidates
+
+        observation = Observation(
+            'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
+        )
+        candidates = _parse_discovered_candidates(
+            {'candidates': [
+                {
                     'prerequisite_state_id': 'A',
-                    'dependent_state_id': 'C',
+                    'dependent_state_id': 'B',
                     'proposed_relation': 'DEPENDS_ON',
                     'signal': 'explicit_source_relation',
-                    'candidate_reason': 'out of batch',
+                    'candidate_reason': 'valid sibling',
                     'evidence_span': 'A requires B.',
-                }]},
-                states={'A': _node('A'), 'B': _node('B')},
-                new_state_ids={'B'},
-                source_state_ids={'A'},
-                observation=Observation(
-                    'A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'
-                ),
-            )
+                },
+                {
+                    'prerequisite_state_id': 'A',
+                    'dependent_state_id': 'A',
+                    'proposed_relation': 'DEPENDS_ON',
+                    'signal': 'same_entity',
+                    'candidate_reason': 'malformed self-loop',
+                    'evidence_span': 'A requires B.',
+                },
+            ]},
+            states={'A': _node('A'), 'B': _node('B')},
+            new_state_ids={'B'},
+            source_state_ids={'A'},
+            observation=observation,
+        )
+        self.assertEqual(
+            [(item.prerequisite_state_id, item.dependent_state_id) for item in candidates],
+            [('A', 'B')],
+        )
 
     async def test_candidate_discovery_rejects_malformed_envelope(self) -> None:
         class FakeLLM:
@@ -675,9 +759,161 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await AutomaticDependencyDiscovery(FakeLLM()).discover_candidates(
                 Observation('A requires B.', datetime(2030, 1, 1, tzinfo=UTC), 'test'),
-                new_states=(_node('A'), _node('B')),
-                all_states=(_node('A'), _node('B')),
+                new_states=(
+                    _node('A', metadata={'evidence_span': 'A requires B.'}),
+                    _node('B', metadata={'evidence_span': 'A requires B.'}),
+                ),
+                all_states=(
+                    _node('A', metadata={'evidence_span': 'A requires B.'}),
+                    _node('B', metadata={'evidence_span': 'A requires B.'}),
+                ),
             )
+
+    async def test_semantic_proposal_uses_local_packets_and_stable_pair_ids(self) -> None:
+        text = (
+            'Unrelated opening sentence. A1 is free Friday. '
+            'A2 is required for B. B was scheduled Friday. Unrelated closing sentence.'
+        )
+        states = (
+            _node('A1', metadata={'evidence_span': 'A1 is free Friday.'}),
+            _node('A2', metadata={'evidence_span': 'A2 is required for B.'}),
+            _node('B', metadata={'evidence_span': 'B was scheduled Friday.'}),
+        )
+
+        class FakeLLM:
+            def __init__(self):
+                self.payload = None
+
+            async def generate_response(self, messages, **kwargs):
+                self.payload = json.loads(messages[-1].content)
+                pair = self.payload['pairs'][1]
+                return {'candidates': [{
+                    'pair_id': pair['pair_id'],
+                    'proposed_relation': 'AFFECTS_ACTION',
+                    'signal': 'action_precondition',
+                    'candidate_reason': 'The plan is explicitly based on this prerequisite.',
+                    'evidence_span': 'A2 is required for B.',
+                }]}
+
+        llm = FakeLLM()
+        observation = Observation(text, datetime(2030, 1, 1, tzinfo=UTC), 'test')
+        candidates = await AutomaticDependencyDiscovery(llm).discover_candidates(
+            observation, new_states=(states[2],), all_states=states
+        )
+        self.assertEqual(
+            [(item.prerequisite_state_id, item.dependent_state_id) for item in candidates],
+            [('A2', 'B')],
+        )
+        payload_text = json.dumps(llm.payload)
+        self.assertNotIn(text, payload_text)
+        self.assertNotIn('observation"', payload_text)
+        self.assertEqual(len(llm.payload['pairs']), 2)
+        self.assertEqual(len({item['pair_id'] for item in llm.payload['pairs']}), 2)
+        self.assertEqual(llm.payload['pairs'][1]['source_state_id'], 'A2')
+        self.assertEqual(
+            llm.payload['pairs'][1]['source_evidence_span'],
+            'A2 is required for B.',
+        )
+        self.assertEqual(
+            llm.payload['pairs'][1]['target_evidence_span'],
+            'B was scheduled Friday.',
+        )
+
+    async def test_semantic_proposer_locality_skips_distant_unbridged_pairs(self) -> None:
+        text = (
+            'Alice likes tea. Another unrelated event. A further separate event. '
+            'More unrelated context. Bob lives in Berlin.'
+        )
+        source = _node('Alice', metadata={'evidence_span': 'Alice likes tea.'})
+        target = _node('Bob', metadata={'evidence_span': 'Bob lives in Berlin.'})
+
+        class NeverCalled:
+            async def generate_response(self, messages, **kwargs):
+                raise AssertionError('distant, unbridged pair must not reach proposer')
+
+        candidates = await AutomaticDependencyDiscovery(NeverCalled()).discover_candidates(
+            Observation(text, datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+            new_states=(target,), all_states=(source, target),
+        )
+        self.assertEqual(candidates, ())
+
+    async def test_proposer_truncation_subdivides_pairs_without_same_request_retry(self) -> None:
+        from stategraph.evaluation.provider_resilience import FinishReasonIncomplete
+
+        text = 'A0, A1, A2 and A3 are explicitly required for B.'
+        states = tuple(
+            _node(f'A{index}', metadata={'evidence_span': text})
+            for index in range(4)
+        ) + (_node('B', metadata={'evidence_span': text}),)
+
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+                self.last_response_metadata = None
+
+            async def generate_response(self, messages, **kwargs):
+                payload = json.loads(messages[-1].content)
+                self.calls.append((payload, kwargs['candidate_schema']))
+                if len(self.calls) == 1:
+                    self.last_response_metadata = {'finish_reason': 'incomplete'}
+                    raise FinishReasonIncomplete(
+                        'truncated', raw_text='{"candidates":[',
+                        metadata=self.last_response_metadata,
+                    )
+                self.last_response_metadata = {'finish_reason': 'stop'}
+                return {'candidates': []}
+
+        llm = FakeLLM()
+        await AutomaticDependencyDiscovery(llm).discover_candidates(
+            Observation(text, datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+            new_states=(states[-1],), all_states=states,
+        )
+        self.assertEqual([len(item[0]['pairs']) for item in llm.calls], [4, 2, 2])
+        self.assertEqual(len({json.dumps(item[0], sort_keys=True) for item in llm.calls}), 3)
+        self.assertTrue(all(item[1]['properties']['candidates']['maxItems'] <= 16
+                            for item in llm.calls))
+
+    async def test_nested_profiler_does_not_double_count_proposer_request(self) -> None:
+        from stategraph.evaluation.profiling import StageProfiler
+
+        text = 'The source status changed; the plan status is pending.'
+        states = (
+            _node('source', metadata={'evidence_span': text}),
+            _node('plan', metadata={'evidence_span': text}),
+        )
+        profiler = StageProfiler('/tmp/stategraph-profiler-request-count.json')
+
+        class RecordingFake:
+            async def generate_response(self, messages, **kwargs):
+                profiler.record_provider_attempt(
+                    {
+                        'attempt_index': 1,
+                        'taxonomy': 'VALID_RESPONSE',
+                        'prompt_name': kwargs['prompt_name'],
+                        'raw_response_chars': 16,
+                        'latency_seconds': 0.01,
+                    },
+                    request_snapshot={
+                        'messages': [item.model_dump() for item in messages],
+                        'max_output_tokens': kwargs['max_tokens'],
+                        'response_schema': kwargs['candidate_schema'],
+                    },
+                )
+                return {'candidates': []}
+
+        await AutomaticDependencyDiscovery(
+            RecordingFake(), profiler=profiler
+        ).discover_candidates(
+            Observation(text, datetime(2030, 1, 1, tzinfo=UTC), 'test'),
+            new_states=(states[1],), all_states=states,
+        )
+        result = profiler.result()
+        self.assertEqual(result['request_count'], 1)
+        self.assertEqual(result['attempt_count'], 1)
+        self.assertEqual(
+            result['provider_stage_summary']['SEMANTIC_CANDIDATE_PROPOSAL']['semantic_requests'],
+            1,
+        )
 
     async def test_candidate_batch_pair_coverage_is_complete_across_blocks(self) -> None:
         states = tuple(_node(f's{index:03d}') for index in range(70))
@@ -700,7 +936,12 @@ class CounterfactualVerifierTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-def _node(state_id: str, *, evidence_id: str | None = None) -> StateNode:
+def _node(
+    state_id: str,
+    *,
+    evidence_id: str | None = None,
+    metadata: dict | None = None,
+) -> StateNode:
     return StateNode.create(
         state_id=state_id,
         entity=state_id,
@@ -709,6 +950,7 @@ def _node(state_id: str, *, evidence_id: str | None = None) -> StateNode:
         evidence_id=evidence_id or f'e:{state_id}',
         observation_id=f'o:{state_id}',
         observed_at=datetime(2030, 1, 1, tzinfo=UTC),
+        metadata=metadata or {},
     )
 
 
@@ -739,6 +981,8 @@ def _candidate(source: str, target: str, relation: RelationType | None):
 
 
 def _raw_assessment(source: str, target: str, strength: str, evidence: str | None):
+    strict = strength == 'STRICT_DEPENDENCY'
+    positive = strength in {'STRICT_DEPENDENCY', 'WEAK_DEPENDENCY'}
     return {
         'prerequisite_state_id': source,
         'dependent_state_id': target,
@@ -747,6 +991,12 @@ def _raw_assessment(source: str, target: str, strength: str, evidence: str | Non
         'verifier_confidence': 1.0,
         'supporting_evidence_ids': [f'e:{source}', f'e:{target}'],
         'evidence_spans': [evidence] if evidence else [],
+        'direction_supported': positive,
+        'counterfactual_supported': strict,
+        'evidence_supported': positive,
+        'source_grounded': positive,
+        'target_grounded': positive,
+        'relation_evidence_supported': positive,
     }
 
 

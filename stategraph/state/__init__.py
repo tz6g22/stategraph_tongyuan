@@ -1,24 +1,5 @@
-from .contracts import (
-    ExplicitDependencyIntent,
-    ExtractionResult,
-    NativeStateExtractor,
-    StateExtractor,
-    extract_explicit_dependency_intents,
-    parse_dependency_relation_selectors,
-)
-from .extraction_v2 import HybridStateExtractorV2, ObservationLocalStateExtractorV2
-from .native_extraction import (
-    PromptMessage,
-    STATE_EXTRACTION_OUTPUT_SCHEMA,
-    StateGraphNativeStateExtractor,
-)
-from .snapshot import (
-    BackendSnapshot,
-    StateGraphSnapshot,
-    StateGraphSnapshotCodec,
-)
-from .dependency import DependencyAssessment, DependencyCandidate
-from .linking import LinkedState, SlotIdentity, SlotIdentityDecision, StateLinker
+from importlib import import_module
+
 from .schema import (
     ConditionScope,
     DependencyStrength,
@@ -32,13 +13,17 @@ from .schema import (
     StateCandidate,
     State,
     StateNode,
+    SubjectProvenance,
+    SubjectResolutionType,
     StateRelation,
     StateSelector,
     StateStatus,
     TimeScope,
     attribute_tokens,
     attributes_compatible,
+    canonical_attribute_id,
     canonical_field_id,
+    canonical_semantic_scope,
     evidence_id_for,
 )
 
@@ -46,6 +31,8 @@ __all__ = [
     'ConditionScope',
     'DependencyStrength',
     'DependencyRelationSelector',
+    'CandidateGroundingError',
+    'FailureSeverity',
     'DependencyAssessment',
     'DependencyCandidate',
     'EvidenceNode',
@@ -71,15 +58,49 @@ __all__ = [
     'parse_dependency_relation_selectors',
     'StateLinker',
     'StateNode',
+    'SubjectProvenance',
+    'SubjectResolutionType',
     'StateRelation',
     'StateSelector',
     'StateStatus',
     'TimeScope',
     'attribute_tokens',
     'attributes_compatible',
+    'canonical_attribute_id',
     'canonical_field_id',
+    'canonical_semantic_scope',
     'evidence_id_for',
     'STATE_EXTRACTION_OUTPUT_SCHEMA',
+    'AbsoluteSpan',
+    'Cardinality',
+    'CardinalityRegistry',
+    'CardinalityRule',
+    'ChangeOperation',
+    'FrameCandidate',
+    'FrameKind',
+    'FrameModality',
+    'FramePolarity',
+    'FrameProvenance',
+    'ParticipantRef',
+    'PredicateRef',
+    'ProposedChangeIntent',
+    'ResolvedChangeIntent',
+    'RevisionResolution',
+    'ShadowExtractionResult',
+    'StateFrame',
+    'StateFrameShadowExtractor',
+    'DEPENDENCY_RELATION_TYPES',
+    'LegacyStateCandidateShadowRepository',
+    'ShadowRevisionRecord',
+    'StateFrameEndpoint',
+    'TypedStateFrameShadowRepository',
+    'frame_candidate_to_legacy_state_node',
+    'legacy_state_node_to_frame',
+    'relation_from_frame_endpoints',
+    'SubjectRef',
+    'frame_candidate_from_state_candidate',
+    'materialize_frame',
+    'resolve_change',
     'BackendSnapshot',
     'StateGraphSnapshot',
     'StateGraphSnapshotCodec',
@@ -87,13 +108,27 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Lazily expose old Graphiti-shaped symbols for legacy callers only."""
-
-    if name in {'GraphitiFact', 'GraphitiFactStateExtractor'}:
-        from .extraction import GraphitiFact, GraphitiFactStateExtractor
-
-        return {
-            'GraphitiFact': GraphitiFact,
-            'GraphitiFactStateExtractor': GraphitiFactStateExtractor,
-        }[name]
-    raise AttributeError(name)
+    """Keep historical exports without importing their pipelines for schema users."""
+    modules = {
+        'contracts': ('CandidateGroundingError', 'FailureSeverity',
+                      'ExplicitDependencyIntent', 'ExtractionResult', 'NativeStateExtractor',
+                      'StateExtractor', 'extract_explicit_dependency_intents', 'parse_dependency_relation_selectors'),
+        'extraction_v2': ('HybridStateExtractorV2', 'ObservationLocalStateExtractorV2'),
+        'native_extraction': ('PromptMessage', 'STATE_EXTRACTION_OUTPUT_SCHEMA', 'StateGraphNativeStateExtractor'),
+        'snapshot': ('BackendSnapshot', 'StateGraphSnapshot', 'StateGraphSnapshotCodec'),
+        'stateframe_shadow': ('ShadowExtractionResult', 'StateFrameShadowExtractor'),
+        'stateframe_repository': ('DEPENDENCY_RELATION_TYPES', 'LegacyStateCandidateShadowRepository',
+            'ShadowRevisionRecord', 'StateFrameEndpoint', 'TypedStateFrameShadowRepository',
+            'frame_candidate_to_legacy_state_node', 'legacy_state_node_to_frame', 'relation_from_frame_endpoints'),
+        'dependency': ('DependencyAssessment', 'DependencyCandidate'),
+        'linking': ('LinkedState', 'SlotIdentity', 'SlotIdentityDecision', 'StateLinker'),
+        'extraction': ('GraphitiFact', 'GraphitiFactStateExtractor'),
+    }
+    module = next((m for m, names in modules.items() if name in names), None)
+    if module is None:
+        if name not in __all__:
+            raise AttributeError(name)
+        module = 'stateframe'
+    value = getattr(import_module(f'.{module}', __name__), name)
+    globals()[name] = value
+    return value

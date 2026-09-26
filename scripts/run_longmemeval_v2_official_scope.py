@@ -162,8 +162,8 @@ async def run() -> None:
     graph = StateGraph(
         extractor=GraphitiLLMStateExtractor(
             client,
-            max_llm_characters=1800,
             trace_path=run_dir / "extraction_trace.jsonl",
+            native_mode=True,
         ),
         revision_trace_path=run_dir / "revision_trace.jsonl",
     )

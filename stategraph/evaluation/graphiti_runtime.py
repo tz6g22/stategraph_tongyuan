@@ -28,6 +28,24 @@ from stategraph.evaluation.profiling import StageProfiler
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROVIDER = 'openai'
 DEFAULT_MODEL = 'gpt-5-nano'
+_TRANSPORT_RETRY_TAXONOMIES = frozenset({
+    TRANSPORT_FAILURE, TPM_RATE_LIMIT, TIMEOUT,
+})
+_STRUCTURED_RETRY_TAXONOMIES = frozenset({
+    FINISH_REASON_INCOMPLETE, MALFORMED_STRUCTURED_OUTPUT,
+})
+
+
+def _retryable_taxonomies(prompt_name: str | None) -> set[str]:
+    """Use subdivision rather than identical-request retries for truncation."""
+    allowed = set(_TRANSPORT_RETRY_TAXONOMIES)
+    if prompt_name == 'stategraph.dependency_verification.v1':
+        return allowed
+    if prompt_name == 'stategraph.state_extraction.v2':
+        allowed.add(MALFORMED_STRUCTURED_OUTPUT)
+    else:
+        allowed.update(_STRUCTURED_RETRY_TAXONOMIES)
+    return allowed
 
 
 def _workspace_gateway_config(path: Path) -> dict[str, Any]:
@@ -101,6 +119,27 @@ def _strict_pydantic_schema(response_model: Any) -> dict[str, Any]:
     return schema
 
 
+def _usage_fields(usage: Any) -> dict[str, int]:
+    """Project provider usage when the Responses transport exposes it."""
+
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        getter = usage.get
+    else:
+        getter = lambda name, default=None: getattr(usage, name, default)
+    fields: dict[str, int] = {}
+    for source, target in (
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        value = getter(source)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            fields[target] = int(value)
+    return fields
+
+
 def _create_responses_llm(
     config: Any, gateway: dict[str, Any], *, profiler: StageProfiler | None = None
 ) -> Any:
@@ -160,6 +199,9 @@ def _create_responses_llm(
                 )
                 if self.last_raw_response_text is not None:
                     details.setdefault('raw_response_text', self.last_raw_response_text)
+            for key in ('input_tokens', 'output_tokens', 'total_tokens'):
+                if isinstance(metadata.get(key), (int, float)):
+                    details.setdefault(key, int(metadata[key]))
             request_hash = details.get('request_hash')
             if request_hash != self._last_attempt_hash:
                 self.last_attempt_trace = []
@@ -176,6 +218,17 @@ def _create_responses_llm(
                     request_snapshot=self._active_request_snapshot,
                 )
 
+        def _record_attempt_start(
+            self,
+            details: dict[str, Any],
+            request_snapshot: dict[str, Any],
+        ) -> None:
+            if self._profiler is not None:
+                self._profiler.record_provider_start(
+                    details,
+                    request_snapshot=request_snapshot,
+                )
+
         async def _generate_response_with_retry(
             self,
             messages: list[Message],
@@ -185,30 +238,28 @@ def _create_responses_llm(
         ) -> dict[str, Any]:
             """Replace Graphiti's unbounded/random retry decorator with one policy."""
 
+            request_snapshot = {
+                'model': self.small_model if model_size == ModelSize.small else self.model,
+                'messages': [message.model_dump() for message in messages],
+                'max_output_tokens': max_tokens,
+                'response_schema': (
+                    _strict_pydantic_schema(response_model)
+                    if response_model is not None
+                    else self._active_candidate_schema
+                ),
+            }
             return await bounded_async_call(
                 lambda: self._generate_response(messages, response_model, max_tokens, model_size),
-                request_snapshot={
-                    'model': self.small_model if model_size == ModelSize.small else self.model,
-                    'messages': [message.model_dump() for message in messages],
-                    'max_output_tokens': max_tokens,
-                    'response_schema': (
-                        _strict_pydantic_schema(response_model)
-                        if response_model is not None
-                        else self._active_candidate_schema
-                    ),
-                },
+                request_snapshot=request_snapshot,
                 provider='openai',
                 model=self.small_model if model_size == ModelSize.small else self.model,
                 policy=self.retry_policy,
                 pacer=self.token_pacer,
                 record=self._record_attempt,
-                allowed_taxonomies={
-                    TRANSPORT_FAILURE,
-                    TPM_RATE_LIMIT,
-                    TIMEOUT,
-                    FINISH_REASON_INCOMPLETE,
-                    MALFORMED_STRUCTURED_OUTPUT,
-                },
+                record_start=lambda details: self._record_attempt_start(
+                    details, request_snapshot
+                ),
+                allowed_taxonomies=_retryable_taxonomies(self._active_prompt_name),
             )
 
         async def generate_response(
@@ -224,6 +275,9 @@ def _create_responses_llm(
             candidate_schema=None,
         ):
             """Keep the shared endpoint contract available to production callers."""
+            # Graphiti's base client cleans messages in place; StateGraph's
+            # provider-neutral PromptMessage is frozen, so adapt at this boundary.
+            messages = [Message(role=message.role, content=message.content) for message in messages]
             previous_prompt_name = self._active_prompt_name
             self._active_prompt_name = prompt_name
             try:
@@ -314,6 +368,7 @@ def _create_responses_llm(
                 raise
             chunks: list[str] = []
             completion_status = None
+            completed_response = None
             stream_error: Exception | None = None
             try:
                 try:
@@ -321,6 +376,7 @@ def _create_responses_llm(
                         if event.type == 'response.output_text.delta':
                             chunks.append(event.delta)
                         elif event.type == 'response.completed':
+                            completed_response = getattr(event, 'response', None)
                             completion_status = getattr(getattr(event, 'response', None), 'status', None)
                 except Exception as exc:
                     stream_error = exc
@@ -339,8 +395,10 @@ def _create_responses_llm(
                 )
                 output = _strip_json_fence(response.output_text or '')
                 completion_status = getattr(response, 'status', None)
+                usage = getattr(response, 'usage', None)
             else:
                 output = _strip_json_fence(''.join(chunks))
+                usage = getattr(completed_response, 'usage', None)
             self.last_raw_response_text = output
             self.last_response_metadata = {
                 'status': completion_status,
@@ -348,6 +406,7 @@ def _create_responses_llm(
                 'model': model,
                 'max_output_tokens': max_tokens,
                 'request_hash': request_hash,
+                **_usage_fields(usage),
             }
             if completion_status == 'incomplete':
                 raise FinishReasonIncomplete(
