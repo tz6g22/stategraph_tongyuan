@@ -124,7 +124,7 @@ def main() -> None:
             if result.get('status') == 'SUCCESS':
                 evaluator_python = EVALUATOR_PYTHONS.get(dataset, python)
                 evaluation = subprocess.run(
-                    [str(evaluator_python), str(ROOT / 'evaluate_smoke.py'), baseline, dataset, str(output_dir)],
+                    [str(evaluator_python), str(ADAPTER_ROOT / 'evaluate_smoke.py'), baseline, dataset, str(output_dir)],
                     cwd=ROOT, env=env, text=True, capture_output=True,
                 )
                 with (output_dir / 'run.log').open('a', encoding='utf-8') as log:

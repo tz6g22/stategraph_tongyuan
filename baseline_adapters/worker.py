@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -210,7 +211,8 @@ def main() -> int:
                 adapter.reset()
                 if baseline == 'cupmem':
                     os.environ['QWEN_CALL_CONTEXT'] = f'{baseline}/{dataset}/{sample.case_id}/native_pipeline'
-                    native_result = adapter.run_sample(sample)
+                    native_sample = replace(sample, memory_items=tuple(_split_memory_items(sample.memory_items)))
+                    native_result = adapter.run_sample(native_sample)
                     _assert_provider_events_valid(_read_events(call_log)[before_events:], 'native ingestion')
                     write_results = native_result['trace'].get('session_logs', [])
                     for query in sample.queries:
