@@ -2,13 +2,16 @@
 
 This is a recovery plan only; none of these commands were run on IRIDIS.
 
-1. Clone the existing repository and checkout the freeze tag:
+1. Clone the existing repository and checkout the pushed migration branch.
+   The annotated freeze tag pins the original source-freeze commit; the branch
+   also contains the verified push record and post-freeze path inventory.
 
    ```bash
    git clone https://github.com/tz6g22/stategraph_tongyuan.git
    cd stategraph_tongyuan
    git fetch --tags origin
-   git checkout iridis-migration-freeze-2026-10-05
+   git checkout freeze/iridis-migration-2026-10-05
+   git rev-parse HEAD
    ```
 
 2. Define roots rather than assuming `/home/cody`:
