@@ -1,9 +1,11 @@
 # Baseline source consolidation
 
 Baseline source code is consolidated under `baselines/`; adapter glue is under
-`baseline_adapters/`. Source imports now resolve through these locations. Old
-source checkouts remain intact until the GitHub push succeeds. Existing venvs
-remain at their original paths and are excluded from Git.
+`baseline_adapters/`. Source imports now resolve through these locations. Once
+the freeze commit and tag were verified on GitHub, tracked source files and
+nested `.git` metadata were removed from the former checkout locations.
+Existing `.venv`, cache, build, and local runtime data paths were left in place
+and excluded from Git. The pushed freeze commit is the recoverable source copy.
 
 | Baseline | Old path | New path | Upstream commit | Local modifications | Static check |
 |---|---|---|---|---|---|
@@ -24,6 +26,6 @@ standard-library `os` import in `baseline_adapters/prepare_smoke.py`; adding
 that import made the suite pass and did not alter baseline algorithms.
 
 The former `external_baselines/e2e_validation/` project-owned adapter glue was
-copied to `baseline_adapters/`. Paths still mentioning
+moved to `baseline_adapters/`. Paths still mentioning
 `external_baselines/<name>/.venv` refer only to intentionally unmoved virtual
 environments; executable baseline source imports use `baselines/`.
