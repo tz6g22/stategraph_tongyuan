@@ -16,7 +16,9 @@ from stategraph.state.provenance import normalized_literal_ranges
 from stategraph.state.schema import (
     AssertionMode, AssertionPolarity, ConditionScope, EvidenceRecord,
     RelationType, SlotCardinality, StateCandidate, StateNode, StateRelation,
-    StateStatus, SubjectProvenance, SubjectResolutionType, TimeScope, evidence_id_for,
+    StateStatus, SubjectProvenance, SubjectResolutionType, TimeScope,
+    canonical_attribute_id, canonical_semantic_scope, canonical_state_value,
+    evidence_id_for,
 )
 from stategraph.storage.memory import InMemoryStateRepository
 
@@ -36,6 +38,274 @@ def _value_key(value: object) -> str:
 def _digest(prefix: str, value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, allow_nan=False, separators=(',', ':'))
     return prefix + ':' + hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _negative_value_core(value: object) -> str:
+    text = _normal(str(value))
+    text = re.sub(r'^(?:no longer|not|never)\s+', '', text)
+    return text[2:] if text.startswith('un') and len(text) > 4 else text
+
+
+_WEEKDAYS = (
+    'monday|tuesday|wednesday|thursday|friday|saturday|sunday'
+)
+_TEMPORAL_TAIL = re.compile(
+    rf'\s+(?:on|at|during|in)\s+(?P<day>{_WEEKDAYS})'
+    r'(?:\s+(?P<period>morning|afternoon|evening|night))?\s*$',
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _SemanticProposition:
+    """Comparison-only view; source state/evidence remain untouched."""
+
+    subject: str
+    relation: str
+    raw_relation: str
+    raw_value: str
+    evidence_id: str
+    evidence_span: str
+    value: str
+    value_key: str
+    value_known: bool
+    polarity: AssertionPolarity
+    scope: tuple[tuple[str, str], ...]
+    scope_known: bool
+    cardinality: SlotCardinality
+    assertion_mode: AssertionMode
+    time_scope: TimeScope
+    condition_scope: ConditionScope
+
+
+class _ScopeRelation(str, Enum):
+    EXACT = 'EXACT'
+    OVERLAP = 'OVERLAP'
+    BROADER = 'BROADER'
+    NARROWER = 'NARROWER'
+    DISJOINT = 'DISJOINT'
+    UNKNOWN = 'UNKNOWN'
+
+
+def _canonical_value(value: object, polarity: AssertionPolarity):
+    text = _normal(str(value)).strip(' .,!?:;')
+    if polarity == AssertionPolarity.NEGATIVE:
+        text = re.sub(r'^(?:no longer|not|never)\s+', '', text)
+        if text.startswith('un') and len(text) > 4:
+            text = text[2:]
+    text = re.sub(r'^(?:is|was|are|were|a|an|the)\s+', '', text)
+    modifiers: list[tuple[str, str]] = []
+    temporal = _TEMPORAL_TAIL.search(text)
+    if temporal:
+        modifiers.append(('weekday', temporal.group('day').casefold()))
+        if temporal.group('period'):
+            modifiers.append(('daypart', temporal.group('period').casefold()))
+        text = text[:temporal.start()].rstrip()
+    return text.strip(' .,!?:;'), tuple(modifiers)
+
+
+def _proposition(node: StateNode, evidence: EvidenceRecord) -> _SemanticProposition:
+    atom = node.metadata.get('atomic_state_proposition')
+    atom = atom if isinstance(atom, Mapping) else {}
+    validation = str(atom.get('validation', ''))
+    polarity = AssertionPolarity(node.polarity)
+    node_relation = canonical_attribute_id(node.canonical_field_id or node.attribute)
+    relation = canonical_attribute_id(
+        str(atom.get('canonical_attribute') or node_relation)
+    )
+    atomic_relation_matches = relation == node_relation
+    condition_scope = node.condition_scope
+
+    if atom.get('contract') == 'ATOMIC_STATE_PROPOSITION_V1':
+        core = _normal(str(atom.get('canonical_value') or '')).strip(' .,!?:;')
+        scope_info = atom.get('time_scope')
+        scope_info = scope_info if isinstance(scope_info, Mapping) else {}
+        scope_kind = str(scope_info.get('kind', '')).upper()
+        scope_known = (
+            validation in {'VALID', 'REPAIRABLE_DETERMINISTICALLY'}
+            and scope_kind in {'UNSPECIFIED', 'TEXTUAL', 'STRUCTURED'}
+            and (scope_kind != 'TEXTUAL' or bool(scope_info.get('text')))
+            and atomic_relation_matches
+        )
+        node_start = node.time_scope.start.isoformat() if node.time_scope.start else None
+        node_end = node.time_scope.end.isoformat() if node.time_scope.end else None
+        scope_known &= (
+            scope_info.get('start') == node_start
+            and scope_info.get('end') == node_end
+        )
+        time_text = str(scope_info.get('text') or '').strip()
+        time_bounds = canonical_semantic_scope(
+            node.time_scope, observed_at=node.observed_at
+        )
+        atom_conditions = atom.get('condition_scope')
+        if isinstance(atom_conditions, Mapping):
+            raw_conditions = atom_conditions.get('conditions', ())
+            if isinstance(raw_conditions, Mapping):
+                raw_conditions = tuple(raw_conditions.items())
+            if isinstance(raw_conditions, (list, tuple)):
+                try:
+                    condition_scope = ConditionScope(
+                        tuple((str(key), str(value)) for key, value in raw_conditions),
+                        atom_conditions.get('description'),
+                    )
+                    scope_known &= condition_scope == node.condition_scope
+                except (TypeError, ValueError):
+                    scope_known = False
+            else:
+                scope_known = False
+        else:
+            scope_known = False
+    else:
+        # Compatibility for persisted states created before the atomic contract.
+        core, modifiers = _canonical_value(node.value, polarity)
+        time_text = ''
+        scope_known = True
+        if modifiers:
+            time_text = ' '.join(value for _, value in modifiers)
+        elif core:
+            subject = re.escape(_normal(node.entity))
+            field = re.escape(_normal(node.attribute.rsplit('.', 1)[-1]))
+            match = re.search(
+                rf'{subject}(?:\'s)?\s+(?:(?:is|was)\s+)?'
+                rf'(?:{field}\s+(?:(?:is|was)\s+)?)?'
+                rf'(?:not\s+|no longer\s+|never\s+)?(?:a\s+|an\s+)?'
+                rf'{re.escape(core)}\s+(?:on|at|during|in)\s+'
+                rf'(?P<day>{_WEEKDAYS})'
+                r'(?:\s+(?P<period>morning|afternoon|evening|night))?',
+                _normal(evidence.span),
+            )
+            if match:
+                time_text = ' '.join(filter(None, (
+                    match.group('day').casefold(),
+                    match.group('period').casefold() if match.group('period') else '',
+                )))
+        time_bounds = canonical_semantic_scope(node.time_scope, observed_at=node.observed_at)
+
+    value_known = bool(core) and atomic_relation_matches
+    value_key = canonical_state_value(relation, core) if value_known else ''
+    constraints: dict[str, str] = {}
+    if time_text:
+        normalized_time = _normal(re.sub(r'^(?:on|at|during|in)\s+', '', time_text))
+        weekday = re.fullmatch(
+            rf'(?P<day>{_WEEKDAYS})(?:\s+(?P<period>morning|afternoon|evening|night))?',
+            normalized_time,
+        )
+        if weekday:
+            constraints['weekday'] = weekday.group('day').casefold()
+            if weekday.group('period'):
+                constraints['daypart'] = weekday.group('period').casefold()
+        else:
+            constraints['time_text'] = normalized_time
+    constraints.update({f'condition:{key}': value
+                        for key, value in condition_scope.conditions})
+    if condition_scope.description:
+        constraints['condition:description'] = _normal(condition_scope.description)
+    scope = tuple(sorted(constraints.items()))
+    return _SemanticProposition(
+        subject=_normal(node.canonical_subject_id or node.entity),
+        relation=relation,
+        raw_relation=node.attribute,
+        raw_value=str(node.value),
+        evidence_id=evidence.evidence_id,
+        evidence_span=evidence.span,
+        value=core,
+        value_key=value_key,
+        value_known=value_known,
+        polarity=polarity,
+        scope=scope,
+        scope_known=scope_known,
+        cardinality=SlotCardinality(node.cardinality or SlotCardinality.UNKNOWN),
+        assertion_mode=AssertionMode(node.assertion_mode),
+        time_scope=time_bounds,
+        condition_scope=condition_scope,
+    )
+
+
+def _scope_relation(new: _SemanticProposition,
+                    old: _SemanticProposition) -> _ScopeRelation:
+    """Classify the negative's scope relative to the positive's scope."""
+    if not new.scope_known or not old.scope_known:
+        return _ScopeRelation.UNKNOWN
+    new_constraints, old_constraints = dict(new.scope), dict(old.scope)
+    for key, value in new_constraints.items():
+        if key in old_constraints and old_constraints[key] != value:
+            return (
+                _ScopeRelation.UNKNOWN
+                if key in {'time_text', 'condition:description'}
+                else _ScopeRelation.DISJOINT
+            )
+    new_constraint_items, old_constraint_items = (
+        set(new_constraints.items()), set(old_constraints.items())
+    )
+    if new_constraint_items == old_constraint_items:
+        constraint_relation = _ScopeRelation.EXACT
+    elif old_constraint_items.issubset(new_constraint_items):
+        constraint_relation = _ScopeRelation.NARROWER
+    elif new_constraint_items.issubset(old_constraint_items):
+        constraint_relation = _ScopeRelation.BROADER
+    else:
+        constraint_relation = _ScopeRelation.OVERLAP
+    new_time, old_time = new.time_scope, old.time_scope
+    if not new_time.overlaps(old_time):
+        return _ScopeRelation.DISJOINT
+    if new_time == old_time:
+        time_relation = _ScopeRelation.EXACT
+    elif new_time.contains(old_time):
+        time_relation = _ScopeRelation.BROADER
+    elif old_time.contains(new_time):
+        time_relation = _ScopeRelation.NARROWER
+    else:
+        time_relation = _ScopeRelation.OVERLAP
+    relations = {constraint_relation, time_relation} - {_ScopeRelation.EXACT}
+    if not relations:
+        return _ScopeRelation.EXACT
+    if relations == {_ScopeRelation.NARROWER}:
+        return _ScopeRelation.NARROWER
+    if relations == {_ScopeRelation.BROADER}:
+        return _ScopeRelation.BROADER
+    return _ScopeRelation.OVERLAP
+
+
+def _same_canonical_proposition(
+    new: _SemanticProposition,
+    old: _SemanticProposition,
+) -> bool:
+    return (
+        new.subject == old.subject
+        and new.relation == old.relation
+        and new.value_known and old.value_known
+        and new.value_key == old.value_key
+        and new.cardinality == old.cardinality
+        and new.assertion_mode == old.assertion_mode == AssertionMode.ASSERTED
+        and _scope_relation(new, old) == _ScopeRelation.EXACT
+    )
+
+
+def _negative_matches_old(
+    new: _SemanticProposition,
+    old: _SemanticProposition,
+) -> bool:
+    """A negative refutes only the same grounded proposition over its scope."""
+    return (
+        new.polarity == AssertionPolarity.NEGATIVE
+        and old.polarity == AssertionPolarity.POSITIVE
+        and _same_canonical_proposition(new, old)
+    )
+
+
+def _field_value_related(field: str, value: object) -> bool:
+    """Allow a copular assertion only when field and value share a clear root."""
+
+    def root(text: str) -> set[str]:
+        roots = set()
+        for token in re.findall(r"[a-z]+", _normal(text)):
+            roots.add(token)
+            for suffix in ('ability', 'able', 'ibility', 'ible', 'ation', 'tion', 's'):
+                if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                    roots.add(token[:-len(suffix)])
+        return roots
+
+    return bool(root(field) & root(str(value)))
 
 
 @dataclass(frozen=True)
@@ -345,12 +615,32 @@ class ShrunkStateRepository:
         # Everything outside these already supported assertion shapes abstains.
         subject = re.escape(_normal(node.entity))
         field = re.escape(_normal(policy.surface))
-        value = re.escape(_normal(str(node.value)))
+        value_text = _normal(str(node.value))
+        value_core = (
+            _negative_value_core(value_text)
+            if node.polarity is AssertionPolarity.NEGATIVE else value_text
+        )
+        core = re.escape(value_core)
         text = _normal(evidence.span).rstrip('.')
-        positive = rf"{subject}(?:'s)? {field}(?: is| equals)? {value}"
-        negative = rf"{subject}(?:'s)? (?:(?:does not|no longer) {field} {value}|{field} is not {value})"
+        value = re.escape(_normal(str(node.value)).strip(' .,!?:;'))
+        temporal = rf'(?:\s+(?:on|at|during|in)\s+(?:{_WEEKDAYS})(?:\s+(?:morning|afternoon|evening|night))?)?'
+        positive = rf"{subject}(?:'s)? {field}(?: is| equals)? {value}{temporal}"
+        negative = (
+            rf"{subject}(?:'s)? (?:(?:does not|no longer) {field} (?:is )?{value}"
+            rf"|{field} is (?:not|no longer|never) (?:a |an )?{core}"
+            rf"|(?:is|was) (?:not|no longer|never) "
+            rf"(?:a |an )?{core}|(?:is|was) un{core}){temporal}"
+        )
         matches_positive = re.fullmatch(positive, text) is not None
         matches_negative = re.fullmatch(negative, text) is not None
+        if _field_value_related(policy.surface, value_core):
+            copular_positive = rf"{subject} (?:is|was) {core}"
+            copular_negative = (
+                rf"{subject} (?:is|was) (?:not|no longer|never) "
+                rf"(?:a |an )?{core}|{subject} (?:is|was) un{core}"
+            )
+            matches_positive |= re.fullmatch(copular_positive + temporal, text) is not None
+            matches_negative |= re.fullmatch(copular_negative + temporal, text) is not None
         if node.polarity == AssertionPolarity.POSITIVE:
             return (SemanticVerdict.SUPPORTED if matches_positive else
                     SemanticVerdict.CONTRADICTED if matches_negative else SemanticVerdict.UNKNOWN)
@@ -390,12 +680,19 @@ class ShrunkStateRepository:
 
     @staticmethod
     def _compatible(new: StateNode, old: StateNode) -> bool:
+        same_temporal_scope = new.time_scope == old.time_scope
+        ongoing_scopes_overlap = (
+            new.time_scope.end is None
+            and old.time_scope.end is None
+            and old.time_scope.is_effective(new.observed_at)
+            and new.time_scope.is_effective(new.observed_at)
+        )
         return (
             new.canonical_slot_id == old.canonical_slot_id
             and new.cardinality in (SlotCardinality.FUNCTIONAL, SlotCardinality.SET_VALUED)
             and old.status == StateStatus.CURRENT
             and new.assertion_mode == old.assertion_mode == AssertionMode.ASSERTED
-            and new.time_scope == old.time_scope
+            and (same_temporal_scope or ongoing_scopes_overlap)
             and new.condition_scope == old.condition_scope == ConditionScope()
             and new.observation_id != old.observation_id
             and new.observed_at > old.observed_at
@@ -442,6 +739,20 @@ class ShrunkStateRepository:
                        if state.status == StateStatus.CURRENT
                        and state.canonical_slot_id == node.canonical_slot_id]
             local = self._local_assertion(node, evidence, policy)
+            new_proposition = _proposition(node, evidence)
+            evidence_ids = tuple(dict.fromkeys(
+                evidence_id for target in targets for evidence_id in target.evidence_ids
+            ))
+            old_evidence = await self.get_evidence(evidence_ids)
+            evidence_by_id = {item.evidence_id: item for item in old_evidence}
+            propositions_by_target = {
+                target.state_id: [
+                    _proposition(target, evidence_by_id[evidence_id])
+                    for evidence_id in target.evidence_ids
+                    if evidence_id in evidence_by_id
+                ]
+                for target in targets
+            }
             identity_known = (candidate.canonical_subject_id is not None
                               and candidate.canonical_field_id is not None
                               and _normal(candidate.canonical_subject_id) == _normal(candidate.entity))
@@ -451,8 +762,14 @@ class ShrunkStateRepository:
                        and node.time_scope.is_effective(evidence.timestamp)
                        and node.condition_scope == ConditionScope())
             old = targets[0] if len(targets) == 1 else None
-            same = (old is not None and _value_key(old.value) == _value_key(node.value)
-                    and old.polarity == node.polarity)
+            old_propositions = propositions_by_target.get(old.state_id, ()) if old else ()
+            same = (
+                old is not None
+                and old.polarity == node.polarity
+                and old_propositions
+                and all(_same_canonical_proposition(new_proposition, proposition)
+                        for proposition in old_propositions)
+            )
             merge_safe = (
                 identity_known
                 and node.polarity == AssertionPolarity.POSITIVE
@@ -484,36 +801,73 @@ class ShrunkStateRepository:
                 # but must not suppress the first CURRENT state.
                 pass
             elif targets:
-                # Negative functional assertions only retire the exact asserted value.
-                operation_ok = (node.polarity == AssertionPolarity.POSITIVE or
-                                (old is not None and old.polarity == AssertionPolarity.POSITIVE
-                                 and _value_key(node.value) == _value_key(old.value)))
-                eligible = (certain and old is not None and not same and operation_ok
-                            and self._compatible(node, old))
+                negative_matches: list[StateNode] = []
+                if node.polarity == AssertionPolarity.NEGATIVE and certain:
+                    for target in targets:
+                        target_propositions = propositions_by_target.get(target.state_id, ())
+                        if (target_propositions
+                                and all(_negative_matches_old(new_proposition, proposition)
+                                        for proposition in target_propositions)
+                                and self._compatible(node, target)):
+                            negative_matches.append(target)
+                # Positive replacement retains its existing single-target contract.
+                operation_ok = node.polarity == AssertionPolarity.POSITIVE
+                eligible_targets = ([old] if operation_ok and old is not None
+                                    and propositions_by_target.get(old.state_id)
+                                    and all(_scope_relation(new_proposition, proposition)
+                                            == _ScopeRelation.EXACT
+                                            for proposition in propositions_by_target[old.state_id])
+                                    and self._compatible(node, old) else negative_matches)
+                eligible = certain and bool(eligible_targets) and not same
                 transition = 'REMOVE' if node.polarity == AssertionPolarity.NEGATIVE else 'REPLACE'
-                verdict = self._verify(node, old, evidence, transition, local) if eligible else SemanticVerdict.UNKNOWN
+                verdict = (self._verify(node, eligible_targets[0], evidence, transition, local)
+                           if eligible and len(eligible_targets) == 1
+                           else local if eligible else SemanticVerdict.UNKNOWN)
                 if eligible and verdict == SemanticVerdict.SUPPORTED:
                     # The verifier never commits. Recheck the exact snapshot under the transaction.
                     current = [s for s in await self.list_states(node.group_id)
                                if s.status == StateStatus.CURRENT
                                and s.canonical_slot_id == node.canonical_slot_id]
                     self._ground(candidate, evidence)
-                    if current != [old] or not self._compatible(node, old):
-                        node = node.with_status(StateStatus.UNCERTAIN)
-                    else:
-                        changed = (old.with_status(StateStatus.STALE),)
-                        invalidated = (old.state_id,)
-                        edge = StateRelation(
-                            source_state_id=node.state_id, target_state_id=old.state_id,
-                            relation_type=RelationType.UPDATES, group_id=node.group_id,
-                            evidence_id=evidence.evidence_id, reason='exact slot revision',
-                            relation_id=_digest('revision', (node.state_id, old.state_id)),
+                    if (current != targets
+                            or any(not self._compatible(node, target)
+                                   for target in eligible_targets)):
+                        node = node.with_status(StateStatus.UNCERTAIN).with_metadata(
+                            uncertainty_reason='revision_snapshot_changed_before_commit'
                         )
-                        edges = (edge,)
+                    else:
+                        changed = tuple(target.with_status(StateStatus.STALE)
+                                        for target in eligible_targets)
+                        invalidated = tuple(target.state_id for target in eligible_targets)
+                        edges = tuple(StateRelation(
+                            source_state_id=node.state_id, target_state_id=target.state_id,
+                            relation_type=RelationType.UPDATES, group_id=node.group_id,
+                            evidence_id=evidence.evidence_id, reason='semantic proposition revision',
+                            relation_id=_digest('revision', (node.state_id, target.state_id)),
+                        ) for target in eligible_targets)
                 else:
-                    node = node.with_status(StateStatus.UNCERTAIN)
+                    if not certain:
+                        reason = 'candidate_identity_scope_or_polarity_unverified'
+                    elif node.polarity == AssertionPolarity.NEGATIVE and not negative_matches:
+                        reason = 'negative_assertion_value_or_scope_unproven'
+                    elif old is None and node.polarity != AssertionPolarity.NEGATIVE:
+                        reason = 'multiple_current_slot_targets'
+                    elif not eligible_targets:
+                        reason = 'revision_scope_or_chronology_mismatch'
+                    elif local == SemanticVerdict.CONTRADICTED or verdict == SemanticVerdict.CONTRADICTED:
+                        reason = 'source_evidence_contradicts_revision'
+                    else:
+                        reason = 'local_revision_assertion_unproven'
+                    node = node.with_status(StateStatus.UNCERTAIN).with_metadata(
+                        uncertainty_reason=reason
+                    )
             elif not certain or local != SemanticVerdict.SUPPORTED:
-                node = node.with_status(StateStatus.UNCERTAIN)
+                node = node.with_status(StateStatus.UNCERTAIN).with_metadata(
+                    uncertainty_reason=(
+                        'candidate_identity_scope_or_polarity_unverified'
+                        if not certain else 'local_initial_assertion_unproven'
+                    )
+                )
             if node.time_scope.end is not None and node.time_scope.end <= evidence.timestamp:
                 node = node.with_status(StateStatus.HISTORICAL)
             await self._store.save_evidence(evidence)

@@ -1,0 +1,61 @@
+diff --git a/graphiti_core/llm_client/openai_generic_client.py b/graphiti_core/llm_client/openai_generic_client.py
+index d462c4e..46f5496 100644
+--- a/graphiti_core/llm_client/openai_generic_client.py
++++ b/graphiti_core/llm_client/openai_generic_client.py
+@@ -37,6 +37,10 @@ DEFAULT_MODEL = 'gpt-4.1-mini'
+ StructuredOutputMode = Literal['json_schema', 'json_object']
+ 
+ 
++class StructuredOutputError(ValueError):
++    """Provider returned an unusable structured response; fail closed."""
++
++
+ class OpenAIGenericClient(LLMClient):
+     """
+     OpenAIClient is a client class for interacting with OpenAI's language models.
+@@ -93,6 +97,8 @@ class OpenAIGenericClient(LLMClient):
+         # Override max_tokens to support higher limits for local models
+         self.max_tokens = max_tokens
+         self.structured_output_mode: StructuredOutputMode = structured_output_mode
++        self.last_raw_response_text: str | None = None
++        self.last_response_metadata: dict[str, Any] | None = None
+ 
+         if client is None:
+             self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+@@ -159,14 +165,33 @@ class OpenAIGenericClient(LLMClient):
+                 max_tokens=max_tokens,
+                 response_format=self._build_response_format(response_model),  # type: ignore[arg-type]
+             )
+-            result = response.choices[0].message.content or ''
++            choice = response.choices[0]
++            result = choice.message.content or ''
++            self.last_raw_response_text = result
++            self.last_response_metadata = {
++                'finish_reason': getattr(choice, 'finish_reason', None),
++                'response_id': getattr(response, 'id', None),
++                'model': getattr(response, 'model', None),
++                'usage': getattr(response, 'usage', None),
++            }
++            if self.last_response_metadata['finish_reason'] in {'length', 'content_filter'}:
++                raise StructuredOutputError(
++                    'structured response ended before a complete JSON object: '
++                    f"finish_reason={self.last_response_metadata['finish_reason']} "
++                    f'raw_chars={len(result)}'
++                )
+             # An empty body (refusal, length finish_reason, or a flaky endpoint) would make
+             # json.loads raise a cryptic JSONDecodeError; surface a clear error instead.
+             if not result:
+-                raise EmptyResponseError('LLM returned an empty response')
++                raise StructuredOutputError('LLM returned an empty structured response')
+             # Many OpenAI-compatible/local models wrap JSON in a ```json fence even under a
+             # structured response_format; strip it before parsing.
+-            return json.loads(self._strip_code_fences(result))
++            try:
++                return json.loads(self._strip_code_fences(result))
++            except json.JSONDecodeError as exc:
++                raise StructuredOutputError(
++                    f'malformed structured JSON: {exc}; raw_chars={len(result)}'
++                ) from exc
+         except openai.RateLimitError as e:
+             raise RateLimitError from e
+         except Exception as e:

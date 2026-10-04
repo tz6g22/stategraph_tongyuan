@@ -182,7 +182,7 @@ def _static_audit() -> dict[str, object]:
             'stategraph/graphiti_adapter/**',
             'stategraph/compatibility/**',
             'stategraph/evaluation/graphiti_runtime.py',
-            'external_baselines/graphiti/**',
+            'baselines/graphiti/**',
         ],
         'graphiti_imports_in_stategraph_core': len(import_hits),
         'graphiti_import_hits': import_hits,

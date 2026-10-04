@@ -1,29 +1,76 @@
-# Secrets and local credentials
-apikey/
-*.env
-*.key
+# Credentials and local secrets
+/apikey/
+**/apikey/
+.env
+.env.*
+!.env.example
 *.pem
+*.key
+*.p12
+*.pfx
+*.cookie
+credentials.json
+**/.netrc
+**/.ssh/
+*.p8
 
-# Experiment artifacts and datasets
-outputs/
-data/
-external_baselines/
+# Local datasets: retain only the frozen, small, project-authored SCB v5 file.
+/data/*
+!/data/benchmarks/
+/data/benchmarks/*
+!/data/benchmarks/statechangebench_cases_001_050_v5.jsonl
 *.jsonl
-*.sqlite
-*.db
-*.ses
+!/data/benchmarks/statechangebench_cases_001_050_v5.jsonl
 
-# Python/build caches
-__pycache__/
+# Large outputs; explicitly allow only the migration-relevant small reports.
+/outputs/*
+!/outputs/qwen27b_baseline_adapter/
+/outputs/qwen27b_baseline_adapter/*
+!/outputs/qwen27b_baseline_adapter/ADAPTER_CHANGES.md
+!/outputs/qwen27b_baseline_adapter/BASELINE_INVENTORY.md
+!/outputs/qwen27b_baseline_adapter/COMPATIBILITY_MATRIX.md
+!/outputs/qwen27b_baseline_adapter/DATASET_INVENTORY.md
+!/outputs/qwen27b_baseline_adapter/EXTERNAL_PROVIDER_AUDIT.md
+!/outputs/qwen27b_baseline_adapter/HANDOFF.md
+!/outputs/qwen27b_baseline_adapter/MODEL_BACKEND.md
+!/outputs/qwen27b_baseline_adapter/PROJECT_STATE.md
+!/outputs/qwen27b_baseline_adapter/SMOKE_TEST_REPORT.md
+!/outputs/qwen27b_baseline_adapter/TODO.md
+!/outputs/qwen27b_baseline_adapter/model_config.json
+
+# External upstream checkouts and runtime data stay separate; see migration/.
+/external_baselines/
+
+# Environments, caches, databases, model artifacts, generated build files.
+**/.venv/
+**/.venv-*/
+**/venv/
+**/__pycache__/
+**/.cache/
+**/node_modules/
+**/build/
+**/dist/
+**/.pytest_cache/
 *.py[cod]
-.pytest_cache/
-.venv/
-venv/
+*.sqlite*
+*.db
+*.wal
+*.shm
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.onnx
+*.core
+core.*
+*.log
+*.ses
+*.swap
+*.swp
 
-# Local Codex/agent settings
-.claude/
-.agents/
-.codex/
-
-# Documentation and generated reports are intentionally not published here
-*.md
+# Local IDE/agent settings and project-specific main venv.
+/.claude/
+/.agents/
+/.codex/
+/.venv-mab-parquet/

@@ -1,5 +1,5 @@
 # This file is byte-identical for StateGraph and every admitted baseline.
-version: agent-memory-comparison-v1
+version: shared-answer-generation-v2
 model:
   provider: openai
   base_url: https://api.openai.com/v1
@@ -7,7 +7,9 @@ model:
   api_key_env: OPENAI_API_KEY
   api_key_fallback_env: ANSWER_GENERATOR_API_KEY
   name: gpt-5-nano
-  temperature: 0.0
+  reasoning_effort: minimal
+  # GPT-5 reasoning requests with non-none effort omit temperature.
+  temperature: null
   max_tokens: 512
   seed: null
 context:

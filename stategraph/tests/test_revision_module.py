@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 
 from stategraph.revision import ConflictDetector, ConflictType, StateRevision
@@ -73,6 +74,56 @@ class DirectRevisionModuleTests(unittest.IsolatedAsyncioTestCase):
         )
         decision = ConflictDetector().detect(new, old)
         self.assertEqual(decision.conflict_type, ConflictType.CONSISTENT)
+
+    async def test_temporary_exception_does_not_destroy_broader_current_state(self) -> None:
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        old = _node('old', 'available', 'Server is available.', observed_at=start)
+        new = StateNode.create(
+            state_id='new', entity='person', attribute='availability', value='busy',
+            evidence_id='new', canonical_subject_id='person',
+            canonical_field_id='availability', observed_at=start + timedelta(days=1),
+            time_scope=TimeScope(start + timedelta(days=2), start + timedelta(days=3)),
+            metadata={'evidence_span': 'Person is busy Tuesday.'},
+        )
+        repository = InMemoryStateRepository()
+        await repository.apply((old,))
+        result = await StateRevision(repository).revise(
+            new, (LinkedState(old, 1.0, ('verified',)),),
+        )
+        self.assertEqual(result.decisions[0].conflict_type, ConflictType.TEMPORARY_EXCEPTION)
+        self.assertEqual(result.invalidated_state_ids, ())
+        self.assertEqual((await repository.get_state('old')).status, StateStatus.CURRENT)
+
+    async def test_unresolved_equal_time_conflict_is_uncertain_not_destructive(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        old = _node('old', 'free', 'Person is free.', observed_at=now)
+        new = _node('new', 'busy', 'Person is busy.', observed_at=now)
+        new = replace(new, confidence=0.3)
+        repository = InMemoryStateRepository()
+        await repository.apply((old,))
+        result = await StateRevision(repository).revise(
+            new, (LinkedState(old, 1.0, ('verified',)),),
+        )
+        self.assertEqual(result.decisions[0].conflict_type, ConflictType.UNCERTAIN)
+        self.assertEqual(result.invalidated_state_ids, ())
+        self.assertEqual((await repository.get_state('old')).status, StateStatus.CURRENT)
+        self.assertEqual((await repository.get_state('new')).status, StateStatus.UNCERTAIN)
+
+    async def test_explicit_implicit_invalidation_emits_seed(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        old = _node('old', 'enabled', 'Service is enabled.', observed_at=now)
+        new = StateNode.create(
+            state_id='new', entity='server', attribute='status', value='failed',
+            evidence_id='new', observed_at=now + timedelta(days=1),
+            metadata={'evidence_span': 'Server failed.', 'invalidates_state_ids': ['old']},
+        )
+        repository = InMemoryStateRepository()
+        await repository.apply((old,))
+        result = await StateRevision(repository).revise(
+            new, (LinkedState(old, 1.0, ('verified',)),),
+        )
+        self.assertEqual(result.decisions[0].conflict_type, ConflictType.IMPLICIT_INVALIDATION)
+        self.assertEqual(result.invalidated_state_ids, ('old',))
 
 
 if __name__ == '__main__':

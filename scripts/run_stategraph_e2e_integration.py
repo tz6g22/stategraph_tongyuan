@@ -1,7 +1,7 @@
 """True production StateGraph run from raw StateChangeBench inputs.
 
-This runner deliberately does not import any Module 1--9 frozen output.  It
-only reads the raw first ten cases, runs the real StateGraph ingest/retrieve/
+This runner deliberately does not import any Module 1--9 frozen output. It
+reads manifest-pinned raw cases, runs the real StateGraph ingest/retrieve/
 answer path, seals predictions, and then performs evaluation/post-hoc mapping.
 """
 
@@ -11,13 +11,22 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from stategraph.final_answer import build_answer_input, parse_answer
+from evaluation_protocol.agent_memory_comparison_common import (  # noqa: E402
+    answer_base_url,
+    answer_messages,
+    bounded_context,
+    call_deepseek,
+    load_answer_config,
+    load_statechangebench_dataset,
+)
 from stategraph.graphiti_adapter.dependency_discovery import (
     CANDIDATE_DISCOVERY_OUTPUT_SCHEMA,
     DEPENDENCY_VERIFICATION_OUTPUT_SCHEMA,
@@ -25,11 +34,19 @@ from stategraph.graphiti_adapter.dependency_discovery import (
 from stategraph.state.native_extraction import STATE_EXTRACTION_OUTPUT_SCHEMA
 
 
-ROOT = Path(__file__).resolve().parents[1]
-DATASET = Path("/home/cody/data/stategraphbenchmark/statechangebench_cases_001_050_v2.jsonl")
-OUT = Path(os.environ.get("STATEGRAPH_E2E_OUT", ROOT / "outputs" / "stategraph_e2e_integration_dev_v1"))
-MODEL = "gpt-5-nano"
+ANSWER_CONFIG, ANSWER_CONFIG_BYTES, ANSWER_CONFIG_SHA256 = load_answer_config()
+MODEL = ANSWER_CONFIG['model']['name']
+RUN_ID = f"statechangebench-v4-stategraph-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+OUT = Path(os.environ.get(
+    "STATEGRAPH_E2E_OUT",
+    ROOT / "outputs" / "statechangebench_v4_runs" / RUN_ID,
+))
 STOP_AFTER = os.environ.get("STATEGRAPH_E2E_STOP_AFTER")
+GOLD_ISOLATION_MANIFEST_FIELDS = {
+    # The production runner's runtime is the source-only generation-through-seal phase.
+    "gold_loaded_during_generation": False,
+    "gold_loaded_during_runtime": False,
+}
 
 
 def _dump(value: Any) -> Any:
@@ -46,46 +63,38 @@ def _dump(value: Any) -> Any:
     return value
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _load_runtime_cases() -> list[dict[str, Any]]:
-    """Strip the raw rows before any model call; gold fields never enter runtime."""
-
-    rows = []
-    for line in DATASET.read_text(encoding="utf-8").splitlines()[:10]:
-        raw = json.loads(line)
-        rows.append(
-            {
-                "case_id": raw["case_id"],
-                "history": [{"id": item["id"], "text": item["text"]} for item in raw["history"]],
-                "new_observation": {
-                    "id": raw["new_observation"]["id"],
-                    "text": raw["new_observation"]["text"],
-                },
-                "query": raw["query"],
-                "query_type": raw.get("query_type"),
-            }
-        )
+def _load_runtime_cases() -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    """Load manifest-pinned v4 rows through the source-only inference whitelist."""
+    config, rows, config_sha256 = load_statechangebench_dataset(source_only=True)
     selected = {
         value.strip()
         for value in os.environ.get("STATEGRAPH_CASE_IDS", "").split(",")
         if value.strip()
     }
     if selected:
+        unknown = selected - {row['case_id'] for row in rows}
+        if unknown:
+            raise RuntimeError(f"unknown StateChangeBench case IDs: {sorted(unknown)}")
         rows = [row for row in rows if row["case_id"] in selected]
-    if not selected and [row["case_id"] for row in rows] != [f"SCB_{i:03d}" for i in range(1, 11)]:
-        raise RuntimeError("raw dataset first ten cases are not SCB_001..SCB_010")
-    return rows
+    return config, rows, config_sha256
 
 
 class Gpt5Client:
     def __init__(self) -> None:
-        key = os.environ.get("OPENAI_API_KEY")
+        from openai import OpenAI
+
+        model_config = ANSWER_CONFIG['model']
+        key = os.environ.get(model_config['api_key_env']) or os.environ.get(
+            model_config.get('api_key_fallback_env', '')
+        )
         if not key:
-            raise RuntimeError("OPENAI_API_KEY is missing")
-        self.client = OpenAI(api_key=key, timeout=60, max_retries=0)
+            raise RuntimeError("shared answer protocol API key is missing")
+        self.client = OpenAI(
+            api_key=key,
+            base_url=answer_base_url(model_config),
+            timeout=60,
+            max_retries=0,
+        )
         self.calls: list[dict[str, Any]] = []
 
     async def generate_response(self, messages, **kwargs):
@@ -134,28 +143,38 @@ class Gpt5Client:
         return json.loads(text)
 
     def answer(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        messages = build_answer_input(row, improved=True)
-        response = self.client.responses.create(
-            model=MODEL,
-            input=messages,
-            max_output_tokens=512,
-            reasoning={"effort": "minimal"},
-        )
-        text = parse_answer(response.output_text)
+        context, budget = bounded_context(row.get('final_context', []), ANSWER_CONFIG)
+        messages = answer_messages(row['query'], context, ANSWER_CONFIG)
+        text, metadata = call_deepseek(messages, ANSWER_CONFIG)
         self.calls.append(
             {
                 "kind": "answer",
-                "raw_response": response.output_text or "",
                 "parsed_answer": text,
-                "usage": _dump(response.usage),
+                "usage": metadata.get('usage'),
             }
         )
-        return text, {"messages": messages, "raw_response": response.output_text or "", "usage": _dump(response.usage)}
+        return text, {
+            'messages': messages,
+            'context_budget': budget,
+            'usage': metadata.get('usage'),
+            'provider_metadata': metadata,
+        }
 
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _read_optional_jsonl_trace(path: Path) -> tuple[list[dict[str, Any]], bool, str | None]:
+    if not path.is_file():
+        return [], False, f"optional revision trace missing: {path}"
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    return rows, True, None
 
 
 async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -195,6 +214,9 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
             )
             ingest_results.append(result)
         if STOP_AFTER is not None:
+            revision_trace, revision_trace_present, revision_trace_warning = (
+                _read_optional_jsonl_trace(revision_path)
+            )
             stage = {
                 "case_id": case["case_id"],
                 "status": "ready",
@@ -214,11 +236,9 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
                 },
                 "linking_revision": {
                     "trace_file": str(revision_path),
-                    "trace": [
-                        json.loads(line)
-                        for line in revision_path.read_text(encoding="utf-8").splitlines()
-                        if line
-                    ],
+                    "trace_present": revision_trace_present,
+                    "trace": revision_trace,
+                    "diagnostic_warning": revision_trace_warning,
                 },
                 "dependency": {
                     "candidates": [
@@ -265,19 +285,23 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
         row = {
             "case_id": case["case_id"],
             "query": case["query"],
-            "query_type": case.get("query_type"),
             "response_policy": retrieval.premise_check.response_policy.value,
             "premise_status": [item.status.value for item in retrieval.premise_check.premises],
             "stale_premise_rejected": retrieval.premise_check.response_policy.value == "reject_stale_premise",
             "final_context": retrieval.grounded_context(),
         }
         answer, answer_trace = client.answer(row)
+        revision_trace, revision_trace_present, revision_trace_warning = (
+            _read_optional_jsonl_trace(revision_path)
+        )
         prediction = {
+            "run_id": RUN_ID,
             "case_id": case["case_id"],
             "query": case["query"],
-            "query_type": case.get("query_type"),
             "status": "ready",
             "answer": answer,
+            "final_answer": answer,
+            "answer_config_sha256": ANSWER_CONFIG_SHA256,
             "context_state_ids": list(retrieval.all_state_ids),
             "premise_status": row["premise_status"],
             "stale_premise_rejected": row["stale_premise_rejected"],
@@ -293,7 +317,9 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
             },
             "linking_revision": {
                 "trace_file": str(revision_path),
-                "trace": [json.loads(line) for line in revision_path.read_text(encoding="utf-8").splitlines() if line],
+                "trace_present": revision_trace_present,
+                "trace": revision_trace,
+                "diagnostic_warning": revision_trace_warning,
             },
             "dependency": {
                 "candidates": [_dump(item.dependency_candidates) for item in ingest_results],
@@ -333,20 +359,32 @@ async def _run_case(case: dict[str, Any], case_dir: Path) -> tuple[dict[str, Any
 
 
 async def run() -> None:
-    cases = _load_runtime_cases()
+    dataset_config, cases, dataset_config_sha256 = _load_runtime_cases()
+    if OUT.exists():
+        raise FileExistsError(f"refusing to overwrite existing run directory: {OUT}")
     OUT.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        OUT / "CASE_MANIFEST.json",
-        {
-            "source": str(DATASET),
-            "source_sha256": _sha256(DATASET),
+    run_manifest = {
+            "run_id": RUN_ID,
+            "baseline": "stategraph",
+            "source": dataset_config['dataset_path'],
+            "dataset_sha256": dataset_config['dataset_sha256'],
+            "source_sha256": dataset_config['dataset_sha256'],
+            "dataset_config_path": "evaluation_protocol/statechangebench_formal_dataset.json",
+            "dataset_config_sha256": dataset_config_sha256,
+            "answer_config_path": "evaluation_protocol/shared_answer_generation.yaml",
+            "answer_config_sha256": ANSWER_CONFIG_SHA256,
+            "dataset_name": dataset_config['dataset_name'],
+            "dataset_version": dataset_config['dataset_version'],
             "case_ids": [case["case_id"] for case in cases],
             "case_count": len(cases),
-            "gold_loaded_during_runtime": False,
+            **GOLD_ISOLATION_MANIFEST_FIELDS,
             "model": MODEL,
+            "reasoning_effort": ANSWER_CONFIG['model']['reasoning_effort'],
             "stop_after": STOP_AFTER,
-        },
-    )
+        }
+    _write_json(OUT / "CASE_MANIFEST.json", run_manifest)
+    _write_json(OUT / "run_manifest.json", run_manifest)
+    (OUT / 'answer_config.yaml').write_bytes(ANSWER_CONFIG_BYTES)
     predictions: list[dict[str, Any]] = []
     stages: list[dict[str, Any]] = []
     for case in cases:
@@ -360,16 +398,21 @@ async def run() -> None:
     payload = "".join(json.dumps(item, ensure_ascii=False, default=str) + "\n" for item in predictions).encode()
     (OUT / "predictions.jsonl").write_bytes(payload)
     _write_json(
-        OUT / "prediction_seals.json",
+        OUT / "PREDICTION_SEAL.json",
         {
             "status": "SEALED",
             "prediction_count": len(predictions),
+            "case_count": len(cases),
             "predictions_sha256": hashlib.sha256(payload).hexdigest(),
             "gold_loaded_during_generation": False,
             "answer_model": MODEL,
+            "answer_config_sha256": ANSWER_CONFIG_SHA256,
+            "dataset_config_sha256": dataset_config_sha256,
+            "dataset_sha256": dataset_config['dataset_sha256'],
+            "case_ids": [case["case_id"] for case in cases],
             "structured_output_max_tokens": 2048,
-            "answer_max_output_tokens": 512,
-            "reasoning_effort": "minimal",
+            "answer_max_output_tokens": ANSWER_CONFIG['model']['max_tokens'],
+            "reasoning_effort": ANSWER_CONFIG['model']['reasoning_effort'],
             "DEEPSEEK_CALL_PATHS": 0,
             "stop_after": STOP_AFTER,
         },

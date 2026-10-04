@@ -23,7 +23,8 @@ def sha256(value: str) -> str:
 
 
 def git_commit(name: str) -> str:
-    return subprocess.check_output(['git', '-C', str(ROOT / 'external_baselines' / name), 'rev-parse', 'HEAD'], text=True).strip()
+    manifest = json.loads((ROOT / 'baselines' / 'source_manifest.json').read_text(encoding='utf-8'))
+    return manifest[name]['commit']
 
 
 def answer(question: str, context: str) -> str:

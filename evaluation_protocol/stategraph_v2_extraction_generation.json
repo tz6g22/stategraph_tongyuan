@@ -1,0 +1,7 @@
+{
+  "version": "stategraph-v2-extraction-repair-1",
+  "model": "gpt-5-mini",
+  "reasoning_effort": "low",
+  "scope": "fact proposal, semantic support validation, direct revision relation classification",
+  "answer_and_dependency_provider_configuration_changed": false
+}

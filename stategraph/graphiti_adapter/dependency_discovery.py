@@ -16,7 +16,9 @@ from stategraph.state.schema import (
     Observation,
     RelationType,
     StateNode,
+    StateRelation,
     StateStatus,
+    canonical_attribute_id,
 )
 from stategraph.state.dependency import DependencyAssessment, DependencyCandidate
 from stategraph.relation_typing import (
@@ -88,6 +90,9 @@ CANDIDATE_BATCH_MAX_ITEMS = 16
 CANDIDATE_FULL_OBSERVATION_MAX_CHARS = 8000
 DEPENDENCY_VERIFIER_BATCH_SIZE = 8
 DEPENDENCY_VERIFIER_MAX_SUBDIVISION_DEPTH = 3
+MAX_ALTERNATIVE_SUPPORT_STATES = 8
+MAX_INCOMING_RELATIONS = 12
+MAX_SUPPORT_CONTEXT_CHARS = 6000
 SEMANTIC_PROPOSAL_PAIR_BATCH_SIZE = 16
 SEMANTIC_PROPOSAL_MAX_SUBDIVISION_DEPTH = 3
 
@@ -648,13 +653,19 @@ def generate_dependency_candidates(
         for prerequisite in available:
             if prerequisite.state_id == dependent.state_id:
                 continue
-            if not _causal_evidence_mentions(evidence, prerequisite):
+            if not _causal_evidence_mentions(evidence, prerequisite) and not (
+                _same_subject(prerequisite, dependent)
+                or bool(set(prerequisite.evidence_refs) & set(dependent.evidence_refs))
+            ):
                 continue
             add(
                 prerequisite,
                 dependent,
                 proposed_relation=None,
-                signals=('explicit_source_relation', 'causal_text_grounding'),
+                signals=(
+                    'explicit_source_relation', 'causal_text_grounding',
+                    'implicit_canonical_reference',
+                ),
                 reason=evidence,
             )
 
@@ -683,9 +694,12 @@ class CounterfactualDependencyVerifier:
         *,
         candidates: Sequence[DependencyCandidate],
         states: Sequence[StateNode],
+        support_candidates: Sequence[DependencyCandidate] | None = None,
+        incoming_relations: Sequence[StateRelation] = (),
     ) -> tuple[DependencyAssessment, ...]:
         if not candidates:
             return ()
+        support_candidates = tuple(support_candidates or candidates)
         if len(candidates) > DEPENDENCY_VERIFIER_BATCH_SIZE:
             assessments: list[DependencyAssessment] = []
             for start in range(0, len(candidates), DEPENDENCY_VERIFIER_BATCH_SIZE):
@@ -694,6 +708,8 @@ class CounterfactualDependencyVerifier:
                         observation,
                         candidates=tuple(candidates[start:start + DEPENDENCY_VERIFIER_BATCH_SIZE]),
                         states=states,
+                        support_candidates=support_candidates,
+                        incoming_relations=incoming_relations,
                     )
                 )
             return tuple(assessments)
@@ -719,7 +735,11 @@ class CounterfactualDependencyVerifier:
                 'remained unchanged, could the dependent state S2 still remain valid? Evaluate '
                 'the supplied current-state justification and provenance, not an open-world '
                 'search for hypothetical replacement support. Hold all supplied conditions and '
-                'recorded evidence fixed except the prerequisite validity. Return '
+                'recorded evidence fixed except the prerequisite validity. Use the supplied '
+                'alternative_support_context when evaluating this candidate. '
+                'A different still-current, scope-compatible support may show that this candidate '
+                'is not necessary; do not infer independent sufficiency from mere co-occurrence. '
+                'Use the context as evidence, not as a new dependency label or grouping contract. '
                 'STRICT_DEPENDENCY only when direction_supported, counterfactual_supported, '
                 'relation_evidence_supported, source_grounded, and target_grounded are all '
                 'true. Return WEAK_DEPENDENCY only when the supplied evidence supports a '
@@ -747,6 +767,14 @@ class CounterfactualDependencyVerifier:
         verification_context, allowed_evidence_refs = _verification_evidence_context(
             observation, verifiable, state_by_id
         )
+        alternative_support_context, support_context_diagnostics = (
+            _build_alternative_support_context(
+                verifiable,
+                support_candidates=support_candidates,
+                states=states,
+                incoming_relations=incoming_relations,
+            )
+        )
         user = PromptMessage(
             role='user',
             content=json.dumps(
@@ -754,6 +782,12 @@ class CounterfactualDependencyVerifier:
                     'observation': observation.content,
                     'evidence_context': verification_context,
                     'allowed_evidence_refs': sorted(allowed_evidence_refs),
+                    'alternative_support_budget': {
+                        'max_support_states_per_candidate': MAX_ALTERNATIVE_SUPPORT_STATES,
+                        'max_incoming_relations_per_candidate': MAX_INCOMING_RELATIONS,
+                        'max_serialized_context_characters': MAX_SUPPORT_CONTEXT_CHARS,
+                    },
+                    'alternative_support_context': alternative_support_context,
                     'states': [
                         _state_payload(state_by_id[state_id])
                         for state_id in sorted(relevant_ids)
@@ -846,6 +880,8 @@ class CounterfactualDependencyVerifier:
                 candidates=verifiable,
                 input_messages=(system.content, user.content),
                 error=exc,
+                support_context=alternative_support_context,
+                support_context_diagnostics=support_context_diagnostics,
             )
             raise
         verified = _parse_assessments(
@@ -862,6 +898,8 @@ class CounterfactualDependencyVerifier:
             candidates=candidates,
             raw_response=response,
             parsed_assessments=verified,
+            support_context=alternative_support_context,
+            support_context_diagnostics=support_context_diagnostics,
         )
         by_key = {_candidate_key(item.candidate): item for item in verified}
         return tuple(
@@ -909,6 +947,8 @@ class CounterfactualDependencyVerifier:
         candidates: Sequence[DependencyCandidate],
         raw_response: Mapping[str, Any],
         parsed_assessments: Sequence[DependencyAssessment],
+        support_context: Sequence[Mapping[str, Any]],
+        support_context_diagnostics: Mapping[str, Any],
     ) -> None:
         if self._trace_path is None:
             return
@@ -967,6 +1007,8 @@ class CounterfactualDependencyVerifier:
             'observation': observation.content,
             'verifier_input': {'system': input_messages[0], 'user': input_messages[1]},
             'candidates': [_candidate_payload(item) for item in candidates],
+            'alternative_support_context': list(support_context),
+            **dict(support_context_diagnostics),
             'raw_model_response': raw_response,
             'raw_model_response_text': getattr(self._llm_client, 'last_raw_response_text', None),
             'parsed_assessments': [
@@ -985,6 +1027,8 @@ class CounterfactualDependencyVerifier:
         candidates: Sequence[DependencyCandidate],
         input_messages: tuple[str, str],
         error: FinishReasonIncomplete,
+        support_context: Sequence[Mapping[str, Any]],
+        support_context_diagnostics: Mapping[str, Any],
     ) -> None:
         if self._trace_path is None:
             return
@@ -1015,6 +1059,8 @@ class CounterfactualDependencyVerifier:
             ),
             'partial_response_characters': len(raw),
             'subdivision_action': 'split_if_multi_candidate',
+            'alternative_support_context': list(support_context),
+            **dict(support_context_diagnostics),
         }
         self._trace_path.parent.mkdir(parents=True, exist_ok=True)
         with self._trace_path.open('a', encoding='utf-8') as handle:
@@ -1049,6 +1095,7 @@ class AutomaticDependencyDiscovery:
         new_states: Sequence[StateNode],
         all_states: Sequence[StateNode],
         direct_invalidation_seed_ids: Sequence[str] = (),
+        incoming_relations: Sequence[StateRelation] = (),
     ) -> tuple[tuple[DependencyCandidate, ...], tuple[DependencyAssessment, ...]]:
         candidates = generate_dependency_candidates(
             observation,
@@ -1066,7 +1113,11 @@ class AutomaticDependencyDiscovery:
         )
         candidates = _merge_candidates((*candidates, *semantic_candidates))
         assessments = await self._verifier.verify(
-            observation, candidates=candidates, states=all_states
+            observation,
+            candidates=candidates,
+            states=all_states,
+            support_candidates=candidates,
+            incoming_relations=incoming_relations,
         )
         return candidates, assessments
 
@@ -1127,16 +1178,19 @@ class AutomaticDependencyDiscovery:
         *,
         candidates: Sequence[DependencyCandidate],
         states: Sequence[StateNode],
+        incoming_relations: Sequence[StateRelation] = (),
     ) -> tuple[DependencyAssessment, ...]:
         if self._profiler is None:
             return await self._verify_typed_candidates_unprofiled(
-                observation, candidates=candidates, states=states
+                observation, candidates=candidates, states=states,
+                incoming_relations=incoming_relations,
             )
         with self._profiler.stage(
             'DEPENDENCY_VERIFICATION', observation_id=observation.observation_id
         ):
             return await self._verify_typed_candidates_unprofiled(
-                observation, candidates=candidates, states=states
+                observation, candidates=candidates, states=states,
+                incoming_relations=incoming_relations,
             )
 
     async def _verify_typed_candidates_unprofiled(
@@ -1145,6 +1199,7 @@ class AutomaticDependencyDiscovery:
         *,
         candidates: Sequence[DependencyCandidate],
         states: Sequence[StateNode],
+        incoming_relations: Sequence[StateRelation] = (),
     ) -> tuple[DependencyAssessment, ...]:
         """Verify sparse candidates in deterministic bounded structured batches."""
         assessments: list[DependencyAssessment] = []
@@ -1154,7 +1209,11 @@ class AutomaticDependencyDiscovery:
         ) -> tuple[DependencyAssessment, ...]:
             try:
                 return await self._verifier.verify(
-                    observation, candidates=batch, states=states
+                    observation,
+                    candidates=batch,
+                    states=states,
+                    support_candidates=candidates,
+                    incoming_relations=incoming_relations,
                 )
             except FinishReasonIncomplete:
                 if (
@@ -2334,6 +2393,252 @@ def _verification_evidence_context(
             if isinstance(values, Sequence) and not isinstance(values, str | bytes):
                 refs.update(str(value) for value in values)
     return '\n'.join(dict.fromkeys(value for value in context if value.strip())), refs
+
+
+def _build_alternative_support_context(
+    candidates: Sequence[DependencyCandidate],
+    *,
+    support_candidates: Sequence[DependencyCandidate],
+    states: Sequence[StateNode],
+    incoming_relations: Sequence[StateRelation],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Build a bounded, deterministic support inventory for necessity checks."""
+
+    states_by_id = {state.state_id: state for state in states}
+    rows: list[dict[str, Any]] = []
+    truncated = False
+
+    for index, candidate in enumerate(candidates):
+        dependent = states_by_id.get(candidate.dependent_state_id)
+        prerequisite = states_by_id.get(candidate.prerequisite_state_id)
+        if dependent is None:
+            continue
+
+        incoming = [
+            relation for relation in incoming_relations
+            if relation.target_state_id == dependent.state_id
+            and relation.source_state_id != candidate.prerequisite_state_id
+            and relation.relation_type in DEPENDENCY_RELATION_TYPES
+        ]
+        reasons_by_state: dict[str, set[str]] = {}
+        for relation in incoming:
+            if relation.source_state_id in states_by_id:
+                reasons_by_state.setdefault(relation.source_state_id, set()).add(
+                    'existing_incoming_edge'
+                )
+        for other in support_candidates:
+            if (
+                other.dependent_state_id == dependent.state_id
+                and _candidate_key(other) != _candidate_key(candidate)
+            ):
+                reasons_by_state.setdefault(other.prerequisite_state_id, set()).add(
+                    'same_dependent_candidate'
+                )
+        dependent_refs = set(dependent.evidence_ids) | set(dependent.evidence_refs)
+        for state in states:
+            if state.state_id != dependent.state_id and dependent_refs & (
+                set(state.evidence_ids) | set(state.evidence_refs)
+            ):
+                reasons_by_state.setdefault(state.state_id, set()).add('shared_provenance')
+
+        eligible: list[tuple[int, str, StateNode, tuple[str, ...]]] = []
+        excluded_non_current = 0
+        excluded_scope = 0
+        for state_id, raw_reasons in reasons_by_state.items():
+            state = states_by_id.get(state_id)
+            if state is None or state_id == candidate.prerequisite_state_id:
+                continue
+            if (
+                prerequisite is not None
+                and state.canonical_version_id == prerequisite.canonical_version_id
+            ):
+                continue
+            if state.status is not StateStatus.CURRENT:
+                excluded_non_current += 1
+                continue
+            if not _support_scopes_overlap(state, dependent):
+                excluded_scope += 1
+                continue
+            selection_reasons = tuple(sorted(raw_reasons))
+            priority = min(
+                0 if reason == 'existing_incoming_edge'
+                else 1 if reason == 'same_dependent_candidate'
+                else 2
+                for reason in selection_reasons
+            )
+            eligible.append((priority, state_id, state, selection_reasons))
+        eligible.sort(key=lambda item: (item[0], item[1]))
+        selected_states = [
+            _alternative_support_state_payload(state, selection_reasons)
+            for _, _, state, selection_reasons in eligible[:MAX_ALTERNATIVE_SUPPORT_STATES]
+        ]
+
+        relation_rows = []
+        for relation in incoming:
+            source = states_by_id.get(relation.source_state_id)
+            relation_rows.append(_incoming_support_relation_payload(
+                relation,
+                source=source,
+                source_current=bool(source and source.status is StateStatus.CURRENT),
+                scope_compatible=bool(source and _support_scopes_overlap(source, dependent)),
+            ))
+        relation_rows.sort(key=lambda item: (
+            not item['counts_as_current_scope_compatible_support'], item['relation_id']
+        ))
+        selected_relations = relation_rows[:MAX_INCOMING_RELATIONS]
+        row = {
+            'candidate_id': f'candidate-{index}',
+            'dependent_state_id': dependent.state_id,
+            'relevant_current_states': selected_states,
+            'incoming_relations': selected_relations,
+            'selection_reason': {
+                'priority': [
+                    'existing_incoming_edge',
+                    'same_dependent_candidate',
+                    'shared_provenance',
+                ],
+                'excluded_non_current_state_count': excluded_non_current,
+                'excluded_scope_incompatible_state_count': excluded_scope,
+                'state_limit_applied': len(eligible) > MAX_ALTERNATIVE_SUPPORT_STATES,
+                'incoming_relation_limit_applied': len(relation_rows) > MAX_INCOMING_RELATIONS,
+            },
+        }
+        rows.append(row)
+    def context_chars() -> int:
+        return len(json.dumps(rows, ensure_ascii=False, default=str))
+
+    while context_chars() > MAX_SUPPORT_CONTEXT_CHARS:
+        truncated = True
+        removed = False
+        # Rows and entries are relevance-sorted; remove the least relevant tail first.
+        for row in reversed(rows):
+            if row['incoming_relations']:
+                row['incoming_relations'].pop()
+                row['selection_reason']['char_limit_applied'] = True
+                removed = True
+                break
+            if row['relevant_current_states']:
+                row['relevant_current_states'].pop()
+                row['selection_reason']['char_limit_applied'] = True
+                removed = True
+                break
+        if not removed:
+            break
+
+    state_count = sum(len(row['relevant_current_states']) for row in rows)
+    relation_count = sum(len(row['incoming_relations']) for row in rows)
+    diagnostics_reasons = [
+        {
+            'candidate_id': row['candidate_id'],
+            'dependent_state_id': row['dependent_state_id'],
+            'selected_state_ids': [item['state_id'] for item in row['relevant_current_states']],
+            'selected_state_reasons': {
+                item['state_id']: item['selection_reasons']
+                for item in row['relevant_current_states']
+            },
+            'selected_relation_ids': [item['relation_id'] for item in row['incoming_relations']],
+            'excluded_non_current_state_count': row['selection_reason'][
+                'excluded_non_current_state_count'
+            ],
+            'excluded_scope_incompatible_state_count': row['selection_reason'][
+                'excluded_scope_incompatible_state_count'
+            ],
+        }
+        for row in rows
+    ]
+    diagnostics = {
+        'ALTERNATIVE_SUPPORT_CONTEXT_BUDGET': {
+            'MAX_ALTERNATIVE_SUPPORT_STATES': MAX_ALTERNATIVE_SUPPORT_STATES,
+            'MAX_INCOMING_RELATIONS': MAX_INCOMING_RELATIONS,
+            'MAX_SUPPORT_CONTEXT_CHARS': MAX_SUPPORT_CONTEXT_CHARS,
+        },
+        'ALTERNATIVE_SUPPORT_CONTEXT_STATE_COUNT': state_count,
+        'INCOMING_RELATION_COUNT': relation_count,
+        'SUPPORT_CONTEXT_CHARS': context_chars(),
+        'SUPPORT_CONTEXT_TRUNCATED': truncated or any(
+            row['selection_reason']['state_limit_applied']
+            or row['selection_reason']['incoming_relation_limit_applied']
+            for row in rows
+        ),
+        'SUPPORT_CONTEXT_SELECTION_REASON': diagnostics_reasons,
+    }
+    return rows, diagnostics
+
+
+def _support_scopes_overlap(left: StateNode, right: StateNode) -> bool:
+    return (
+        left.time_scope.overlaps(right.time_scope)
+        and left.condition_scope.overlaps(right.condition_scope)
+    )
+
+
+def _alternative_support_state_payload(
+    state: StateNode,
+    selection_reasons: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        'state_id': state.state_id,
+        'canonical_proposition': {
+            'subject': state.canonical_subject_id or state.entity,
+            'relation': canonical_attribute_id(state.canonical_field_id or state.attribute),
+            'value': state.value,
+            'polarity': state.polarity.value,
+            'assertion_mode': state.assertion_mode.value,
+            'cardinality': state.cardinality.value if state.cardinality else None,
+        },
+        'status': state.status.value,
+        'time_scope': {
+            'start': state.time_scope.start.isoformat() if state.time_scope.start else None,
+            'end': state.time_scope.end.isoformat() if state.time_scope.end else None,
+        },
+        'condition_scope': {
+            'conditions': dict(state.condition_scope.conditions),
+            'description': state.condition_scope.description,
+        },
+        'provenance': {
+            'observation_id': state.observation_id,
+            'observation_index': state.observation_index,
+            'sequence_index': state.sequence_index,
+            'evidence_ids': list(state.evidence_ids[:8]),
+            'evidence_refs': list(state.evidence_refs[:8]),
+            'evidence_summary': str(state.metadata.get('evidence_span') or '')[:400],
+        },
+        'selection_reasons': list(selection_reasons),
+    }
+
+
+def _incoming_support_relation_payload(
+    relation: StateRelation,
+    *,
+    source: StateNode | None,
+    source_current: bool,
+    scope_compatible: bool,
+) -> dict[str, Any]:
+    metadata = relation.metadata
+    evidence_refs = metadata.get('supporting_evidence_refs', ())
+    candidate_signals = metadata.get('candidate_signals', ())
+    return {
+        'relation_id': relation.relation_id,
+        'source_state_id': relation.source_state_id,
+        'target_state_id': relation.target_state_id,
+        'relation_type': relation.relation_type.value,
+        'strength': relation.dependency_strength.value if relation.dependency_strength else None,
+        'source_status': source.status.value if source else 'MISSING',
+        'source_scope_compatible': scope_compatible,
+        'counts_as_current_scope_compatible_support': source_current and scope_compatible,
+        'reason': relation.reason[:300],
+        'verification_provenance': {
+            'reason': relation.verification_reason[:300],
+            'supporting_evidence_ids': list(relation.supporting_evidence_ids[:8]),
+            'evidence_refs': list(evidence_refs[:8])
+            if isinstance(evidence_refs, Sequence) and not isinstance(evidence_refs, str | bytes)
+            else [],
+            'candidate_signals': list(candidate_signals[:8])
+            if isinstance(candidate_signals, Sequence)
+            and not isinstance(candidate_signals, str | bytes)
+            else [],
+        },
+    }
 
 
 def _state_payload(state: StateNode) -> dict[str, Any]:

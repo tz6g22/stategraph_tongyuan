@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import json
 from pathlib import Path
 import sys
+from contextlib import nullcontext
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +19,7 @@ from stategraph.evaluation.cme_shrunk_runtime import (
     assert_cme_shrunk_binding,
     build_cme_shrunk_runtime,
 )
+from stategraph.graphiti_adapter.state_extraction import GraphitiLLMStateExtractor
 from stategraph.state.schema import (
     AssertionPolarity,
     DependencyStrength,
@@ -48,6 +51,7 @@ def registry() -> CardinalityRegistry:
             "city": FieldPolicy(SlotCardinality.FUNCTIONAL, "city"),
             "likes": FieldPolicy(SlotCardinality.SET_VALUED, "likes"),
             "employer": FieldPolicy(SlotCardinality.SET_VALUED, "employer"),
+            "availability": FieldPolicy(SlotCardinality.FUNCTIONAL, "availability"),
         }
     )
 
@@ -109,6 +113,125 @@ class CmePostRunExecutionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["states"][0]["version_id"], replacement.state_id)
         self.assertEqual(captured["states"][0]["cardinality"], "FUNCTIONAL")
         self.assertTrue(self.completed_tracker().production_complete)
+
+    async def test_extracted_natural_negative_availability_revises_same_slot(self) -> None:
+        old = written_state(await self.write(
+            "Eva is available.",
+            StateCandidate(
+                entity="Eva", attribute="availability", value="available",
+                canonical_subject_id="eva", canonical_field_id="availability",
+            ),
+            index=0,
+        ))
+        source = "Eva is no longer available."
+        extracted, rejected = GraphitiLLMStateExtractor._parse_with_rejections(
+            {
+                "states": [{
+                    "entity": "Eva", "attribute": "availability",
+                    "canonical_field_id": "availability",
+                    "value": "available", "evidence_span": source,
+                }]
+            },
+            observation(source, index=1),
+            (),
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(extracted), 1)
+        candidate_state = extracted[0]
+        self.assertEqual(candidate_state.canonical_subject_id, "Eva")
+        self.assertEqual(candidate_state.canonical_field_id, "availability")
+        self.assertEqual(candidate_state.value, "available")
+        self.assertEqual(candidate_state.metadata['evidence_span'], source)
+        self.assertTrue(candidate_state.evidence_refs)
+        self.assertEqual(candidate_state.time_scope.start, BASE + timedelta(days=1))
+        self.assertEqual(candidate_state.condition_scope.conditions, ())
+
+        result = await self.write(source, candidate_state, index=1)
+        updated = written_state(result)
+        self.assertEqual(updated.canonical_slot_id, old.canonical_slot_id)
+        self.assertEqual(updated.polarity, AssertionPolarity.NEGATIVE)
+        self.assertEqual(updated.cardinality, SlotCardinality.FUNCTIONAL)
+        self.assertEqual(updated.status, StateStatus.CURRENT)
+        self.assertEqual(result.invalidated_state_ids, (old.state_id,))
+        evidence = await self.runtime.repository.get_evidence((updated.evidence_id,))
+        self.assertEqual(evidence[0].span, source)
+        self.assertEqual(
+            (await self.runtime.repository.get_state(old.state_id)).status,
+            StateStatus.STALE,
+        )
+
+    async def test_explicit_field_negative_availability_revises_same_slot(self) -> None:
+        old = written_state(await self.write(
+            "Eva availability is available.",
+            StateCandidate(
+                entity="Eva", attribute="availability", value="available",
+                canonical_subject_id="eva", canonical_field_id="availability",
+            ),
+            index=0,
+        ))
+        source = "Eva availability is not available."
+        extracted, rejected = GraphitiLLMStateExtractor._parse_with_rejections(
+            {
+                "states": [{
+                    "entity": "Eva", "attribute": "availability",
+                    "canonical_field_id": "availability", "value": "available",
+                    "evidence_span": source,
+                }]
+            },
+            observation(source, index=1),
+            (),
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0].polarity, AssertionPolarity.NEGATIVE)
+        result = await self.write(source, extracted[0], index=1)
+        self.assertEqual(written_state(result).canonical_slot_id, old.canonical_slot_id)
+        self.assertEqual(written_state(result).status, StateStatus.CURRENT)
+        self.assertEqual(result.invalidated_state_ids, (old.state_id,))
+
+        retrieval = await self.graph.retrieve(
+            "Is Eva available?", group_id="cme-r1", at=BASE + timedelta(days=2)
+        )
+        self.assertIn(written_state(result).state_id, retrieval.state_ids)
+        context = "\n".join(retrieval.grounded_context())
+        self.assertIn('Polarity: NEGATIVE', context)
+        self.assertIn('Assertion: the value "available" does not hold', context)
+        self.assertIn('Status: CURRENT', context)
+
+        class CaptureLLM:
+            messages = None
+
+            async def generate_response(self, messages, **kwargs):
+                self.messages = messages
+                return {"answer": "Eva is not available."}
+
+        llm = CaptureLLM()
+        await CME_RUNNER._answer_query(
+            llm=llm, question="Is Eva available?", retrieval=retrieval,
+            profiler=type("Profiler", (), {"stage": lambda *args, **kwargs: nullcontext()})(),
+        )
+        payload = json.loads(llm.messages[-1].content)
+        state_payload = next(
+            state for state in payload["current_states"]
+            if state["state_id"] == written_state(result).state_id
+        )
+        self.assertEqual(state_payload["value"], "available")
+        self.assertEqual(state_payload["polarity"], "NEGATIVE")
+        self.assertEqual(state_payload["assertion"], 'the value "available" does not hold')
+        self.assertEqual(state_payload["status"], "current")
+
+    async def test_unsupported_revision_stays_uncertain_with_reason(self) -> None:
+        old = written_state(await self.write(
+            "Rina city is London.", candidate("city", "London"), index=0
+        ))
+        result = await self.write(
+            "Rina discussed Paris.", candidate("city", "Paris"), index=1
+        )
+        current = await self.runtime.repository.get_state(old.state_id)
+        proposed = written_state(result)
+        self.assertEqual(current.status, StateStatus.CURRENT)
+        self.assertEqual(proposed.status, StateStatus.UNCERTAIN)
+        self.assertEqual(proposed.metadata['uncertainty_reason'], 'local_revision_assertion_unproven')
 
     async def test_member_add_remove_preserves_member_identity_and_completes(self) -> None:
         tea = written_state(await self.write("Rina likes tea.", candidate("likes", "tea"), index=0))

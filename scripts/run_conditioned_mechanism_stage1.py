@@ -598,11 +598,14 @@ async def _answer_query(*, llm: Any, question: str, retrieval: Any, profiler: An
     prompt = {
         "question": question,
         "premise_policy": retrieval.premise_check.response_policy.value,
+        "premise_corrections": list(retrieval.premise_check.corrections),
         "current_states": [
             {
                 "entity": item.state.entity,
                 "attribute": item.state.attribute,
                 "value": item.state.value,
+                "polarity": item.state.polarity.value,
+                "assertion": item.assertion,
                 "state_id": item.state.state_id,
                 "status": item.state.status.value,
             }
@@ -618,7 +621,11 @@ async def _answer_query(*, llm: Any, question: str, retrieval: Any, profiler: An
                     content=(
                         "Answer the question using only the supplied effective CURRENT states and "
                         "their grounding evidence. Do not use stale states or hidden knowledge. "
-                        "Respect any premise correction. If the evidence is insufficient, answer "
+                        "Each current_state includes polarity and assertion; NEGATIVE means the listed "
+                        "value does not hold. "
+                        "Respect premise corrections. When premise_policy is clarify, explain that "
+                        "the relevant state is unresolved and ask for confirmation or abstain. "
+                        "If the evidence is insufficient, answer "
                         '"unknown". Give only a concise answer in the answer field.'
                     ),
                 ),

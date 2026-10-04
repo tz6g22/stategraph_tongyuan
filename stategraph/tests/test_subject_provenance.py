@@ -156,6 +156,7 @@ class SubjectProvenanceTests(unittest.TestCase):
         self.repo = ShrunkStateRepository(CardinalityRegistry({
             'likes': FieldPolicy(SlotCardinality.SET_VALUED, 'likes'),
             'city': FieldPolicy(SlotCardinality.FUNCTIONAL, 'city'),
+            'availability': FieldPolicy(SlotCardinality.FUNCTIONAL, 'availability'),
         }))
 
     def test_direct_literal_subject_passes(self) -> None:
@@ -234,6 +235,100 @@ class SubjectProvenanceTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.repo._ground(parsed[0], evidence_records[0])
+
+    def test_native_no_longer_candidate_reaches_shrunk_revision(self) -> None:
+        source_old = 'Eva is available.'
+        old_observation = ObservationRecord(
+            observation_id='availability-old', raw_text=source_old,
+            sequence_index=0, timestamp=NOW, origin='subject-provenance-test',
+            group_id='subject-provenance-test',
+        )
+        old_candidates, old_records, old_rejected = _parse_native_response(
+            {'states': [extracted_state(
+                source_old, entity='Eva', value='available', attribute='availability',
+                subject_surface='Eva', subject_start=0,
+            )]},
+            old_observation,
+            source_text=source_old,
+        )
+        self.assertEqual(old_rejected, [])
+        source_new = 'Eva is no longer available.'
+        new_observation = ObservationRecord(
+            observation_id='availability-new', raw_text=source_new,
+            sequence_index=1, timestamp=NOW + timedelta(days=1),
+            origin='subject-provenance-test', group_id='subject-provenance-test',
+        )
+        raw = extracted_state(
+            source_new, entity='Eva', value='not available', attribute='availability',
+            subject_surface='Eva', subject_start=0,
+        )
+        candidates, records, rejected = _parse_native_response(
+            {'states': [raw]}, new_observation, source_text=source_new,
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(candidates), 1)
+        extracted = candidates[0]
+        self.assertEqual(extracted.entity, 'Eva')
+        self.assertEqual(extracted.canonical_subject_id, 'Eva')
+        self.assertEqual(extracted.canonical_field_id, 'availability')
+        self.assertEqual(extracted.value, 'available')
+        self.assertEqual(extracted.metadata['raw_extracted_value'], 'not available')
+        self.assertEqual(extracted.polarity, AssertionPolarity.NEGATIVE)
+        self.assertEqual(extracted.assertion_mode, AssertionMode.ASSERTED)
+        self.assertEqual(extracted.time_scope.start, NOW + timedelta(days=1))
+        self.assertEqual(extracted.condition_scope.conditions, ())
+        self.assertEqual(records[0].span, source_new)
+
+        from stategraph.evaluation.cme_shrunk_runtime import build_cme_shrunk_runtime
+
+        class StaticNativeExtractor:
+            native_observation_only = True
+
+            def extract(self, observation):
+                candidates_by_id = {
+                    'availability-old': (old_candidates, old_records),
+                    'availability-new': (candidates, records),
+                }
+                candidate_items, evidence_items = candidates_by_id[
+                    observation.observation_id
+                ]
+                return ExtractionResult(
+                    tuple(evidence_items), tuple(candidate_items), {}
+                )
+
+        runtime = build_cme_shrunk_runtime(extractor=StaticNativeExtractor())
+
+        async def commit():
+            old_result = await runtime.graph.ingest(Observation(
+                content=source_old, occurred_at=NOW,
+                origin='subject-provenance-test',
+                observation_id='availability-old',
+                group_id='subject-provenance-test',
+            ))
+            new_result = await runtime.graph.ingest(Observation(
+                content=source_new, occurred_at=NOW + timedelta(days=1),
+                origin='subject-provenance-test',
+                observation_id='availability-new',
+                group_id='subject-provenance-test',
+            ))
+            old = old_result.states[0]
+            updated = new_result.revisions[0]
+            return (
+                old,
+                updated,
+                await runtime.repository.get_state(old.state_id),
+                await runtime.repository.get_evidence((updated.state.evidence_id,)),
+            )
+
+        import asyncio
+
+        old, updated, persisted_old, persisted_evidence = asyncio.run(commit())
+        self.assertEqual(updated.state.canonical_slot_id, old.canonical_slot_id)
+        self.assertEqual(updated.state.cardinality, SlotCardinality.FUNCTIONAL)
+        self.assertEqual(updated.invalidated_state_ids, (old.state_id,))
+        self.assertEqual(updated.state.status.value, 'current')
+        self.assertEqual(persisted_evidence[0].span, source_new)
+        self.assertEqual(persisted_old.status.value, 'stale')
 
     def test_antecedent_outside_evidence_record_fails(self) -> None:
         source = 'Eva arrived. She likes tea.'

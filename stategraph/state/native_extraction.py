@@ -28,6 +28,8 @@ from .factual_relations import (
 )
 from .provenance import normalized_literal_ranges
 from .schema import (
+    AssertionMode,
+    AssertionPolarity,
     ConditionScope,
     EvidenceRecord,
     Observation,
@@ -91,14 +93,19 @@ STATE_EXTRACTION_OUTPUT_SCHEMA = {
                     'antecedent_source_segment_id': {'type': ['string', 'null']},
                     'attribute': {'type': 'string'},
                     'value': {'type': ['string', 'number', 'boolean', 'null']},
+                    'polarity': {
+                        'type': 'string',
+                        'enum': ['POSITIVE', 'NEGATIVE', 'UNKNOWN'],
+                    },
                     'time_scope': {
                         'type': ['object', 'null'],
                         'additionalProperties': False,
                         'properties': {
                             'start': {'type': ['string', 'null']},
                             'end': {'type': ['string', 'null']},
+                            'text': {'type': ['string', 'null']},
                         },
-                        'required': ['start', 'end'],
+                        'required': ['start', 'end', 'text'],
                     },
                     'condition_scope': {
                         'type': ['object', 'null'],
@@ -168,7 +175,7 @@ STATE_EXTRACTION_OUTPUT_SCHEMA = {
                     'subject_source_segment_id', 'subject_resolution_type',
                     'antecedent_surface', 'antecedent_start', 'antecedent_end',
                     'antecedent_source_segment_id',
-                    'attribute', 'value', 'time_scope', 'condition_scope',
+                    'attribute', 'value', 'polarity', 'time_scope', 'condition_scope',
                     'confidence', 'canonical_subject_id', 'canonical_field_id',
                     'value_span', 'condition_description', 'evidence_spans',
                     'invalidates', 'conflicts', 'evidence_span',
@@ -272,6 +279,19 @@ SUBJECT_PROVENANCE_EXTRACTION_CONTRACT = (
     'location is certain, use UNRESOLVED. For DETERMINISTIC_ANTECEDENT, evidence_spans must '
     'include the subject surface, antecedent, and value in one contiguous evidence span. The '
     'parser verifies source identity and exact spans and fails closed on any mismatch.'
+)
+
+ATOMIC_STATE_PROPOSITION_CONTRACT = (
+    'Each state is one atomic proposition with entity, canonical_attribute, semantic-core '
+    'value, polarity, time_scope, condition_scope, raw relation/value, and grounded evidence. '
+    'The value field contains only the proposition value, never a temporal or conditional '
+    'modifier. Put explicit temporal qualifiers in time_scope: ISO-8601 start/end for an '
+    'absolute interval, otherwise preserve the exact grounded qualifier in its text field. '
+    'Put conditions only in condition_scope. Preserve the complete source phrase in evidence; '
+    'value_span covers the semantic core, not its modifiers. A temporal expression is a value '
+    'when it is the attribute itself (for example a meeting day); do not classify it from its '
+    'surface words alone. If core and scopes cannot be safely separated, use UNKNOWN polarity '
+    'and do not guess a canonical value.'
 )
 TARGET_ANCHORED_RECOVERY_SYSTEM_PROMPT = (
     'You construct one atomic state proposition specifically from TARGET_SPAN; this is not '
@@ -1150,6 +1170,7 @@ class StateGraphNativeStateExtractor:
                 'every schema property in each state, using null or an empty array when it is '
                 'not supported by the source. Encode condition_scope as {"conditions": '
                 '[{"key": "...", "value": "..."}], "description": "..."} or null.'
+                + ' ' + ATOMIC_STATE_PROPOSITION_CONTRACT
                 + ' ' + SUBJECT_PROVENANCE_EXTRACTION_CONTRACT
             )
         system = PromptMessage(
@@ -3879,6 +3900,203 @@ def _resolve_subject_anchor(
     return start, end
 
 
+def _time_scope_text(raw: Any) -> str | None:
+    """Return a source phrase for a temporal scope that is not an ISO interval."""
+    if not isinstance(raw, Mapping):
+        return None
+    text = raw.get('text')
+    if isinstance(text, str) and text.strip():
+        text = ' '.join(text.split()).strip(' ,.;')
+        return re.sub(
+            r'^(?:on|at|during|in|for)\s+', '', text, flags=re.IGNORECASE
+        ).strip() or None
+    for key in ('start', 'end'):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return ' '.join(value.split()).strip(' ,.;') or None
+    return None
+
+
+def _native_extraction_attribute(raw_attribute: str) -> str:
+    """Canonicalize the known availability relation after removing a copula."""
+    normalized = canonical_field_id(raw_attribute)
+    tokens = normalized.split('_')
+    while tokens and tokens[0] in {'am', 'are', 'is', 'was', 'were', 'be'}:
+        tokens.pop(0)
+    cleaned = '_'.join(tokens)
+    return 'availability' if canonical_attribute_id(cleaned) == 'availability' else normalized
+
+
+def _availability_core_surface(
+    evidence: str, scope: str, *, allow_bare_scope: bool = False
+) -> str | None:
+    words = re.escape(scope.strip())
+    if not words:
+        return None
+    temporal_marker = r'(?:on|at|during|in|for)\s+'
+    if allow_bare_scope:
+        temporal_marker = r'(?:(?:on|at|during|in|for)\s+)?'
+    matches = list(re.finditer(
+        rf'\b(?P<core>free|available|unavailable)\b[^.!?;]*?\b'
+        rf'{temporal_marker}{words}(?!\w)',
+        evidence,
+        re.IGNORECASE,
+    ))
+    return matches[0].group('core') if len(matches) == 1 else None
+
+
+def _availability_source_core(evidence: str) -> str | None:
+    matches = list(re.finditer(r'\b(?:free|available|unavailable)\b', evidence, re.I))
+    return matches[0].group(0) if len(matches) == 1 else None
+
+
+def _availability_scope_is_grounded(
+    evidence: str, core: str, scope: str, *, allow_bare_scope: bool = False
+) -> bool:
+    """Require an availability head and temporal complement in one source clause."""
+    return _availability_core_surface(
+        evidence, scope, allow_bare_scope=allow_bare_scope
+    ) is not None
+
+
+def _normalize_atomic_state_representation(
+    *, attribute: str, value: Any, evidence: str, time_scope_text: str | None,
+) -> dict[str, Any]:
+    """Validate value/scope separation using the existing availability value family.
+
+    This does not infer dates or mutate lifecycle scope.  Textual scope is preserved
+    alongside the existing absolute TimeScope until a later temporal-resolution layer.
+    """
+    canonical_value = value
+    scope_text = time_scope_text
+    status = 'VALID'
+    if canonical_attribute_id(attribute) != 'availability' or not isinstance(value, str):
+        return {
+            'canonical_value': canonical_value, 'time_scope_text': scope_text,
+            'value_surface': value if isinstance(value, str) else None,
+            'status': status, 'reason': None,
+        }
+
+    text = ' '.join(value.split()).strip(' ,.;')
+    value_match = re.fullmatch(
+        r'(?:(?:am|is|are|was|were|be|been|remain|remains|remained|still)\s+)+'
+        r'(?:(?:not|no longer|un)\s+)?(?P<core>free|available|unavailable)'
+        r'(?P<tail>.*)',
+        text,
+        re.IGNORECASE,
+    ) or re.fullmatch(
+        r'(?:(?:not|no longer|un)\s+)?(?P<core>free|available|unavailable)(?P<tail>.*)',
+        text,
+        re.IGNORECASE,
+    )
+
+    if value_match is None:
+        # A scope-only value is repairable only when the same grounded source clause
+        # explicitly supplies the availability semantic head and its complement.
+        scope_only = re.fullmatch(
+            r'(?:on|at|during|in|for)\s+(?P<scope>.+)|(?P<bare>.+)',
+            text,
+            re.IGNORECASE,
+        )
+        proposed_scope = (
+            (scope_only.group('scope') or scope_only.group('bare')).strip(' ,.;')
+            if scope_only else ''
+        )
+        if (
+            proposed_scope and _availability_scope_is_grounded(
+                evidence, 'available', proposed_scope
+            ) and (scope_text is None or scope_text.casefold() == proposed_scope.casefold())
+        ):
+            source_core = _availability_core_surface(evidence, proposed_scope)
+            if source_core is None:
+                return {
+                    'canonical_value': value, 'time_scope_text': scope_text,
+                    'value_surface': None,
+                    'status': 'AMBIGUOUS_FAIL_CLOSED',
+                    'reason': 'AVAILABILITY_CORE_NOT_UNIQUE',
+                }
+            return {
+                'canonical_value': 'available',
+                'time_scope_text': proposed_scope,
+                'value_surface': source_core,
+                'status': 'REPAIRABLE_DETERMINISTICALLY',
+                'reason': None,
+            }
+        return {
+            'canonical_value': value, 'time_scope_text': scope_text,
+            'value_surface': None,
+            'status': 'AMBIGUOUS_FAIL_CLOSED',
+            'reason': 'AVAILABILITY_CORE_OR_SCOPE_NOT_UNAMBIGUOUSLY_SEPARABLE',
+        }
+
+    core = value_match.group('core').casefold()
+    tail = value_match.group('tail').strip(' ,.;')
+    if core in {'free', 'unavailable'} or value_match.group('tail').strip(' ,.;'):
+        canonical_value = 'available'
+        status = 'REPAIRABLE_DETERMINISTICALLY'
+    source_core = _availability_source_core(evidence)
+    if source_core is None or not (
+        core.casefold() == source_core.casefold()
+        or {core.casefold(), source_core.casefold()} <= {'free', 'available', 'unavailable'}
+    ):
+        return {
+            'canonical_value': value, 'time_scope_text': scope_text,
+            'value_surface': None,
+            'status': 'AMBIGUOUS_FAIL_CLOSED',
+            'reason': 'AVAILABILITY_CORE_NOT_GROUNDED',
+        }
+
+    if tail:
+        tail_match = re.fullmatch(
+            r'(?:(?:on|at|during|in|for)\s+)?(?P<scope>.+)', tail,
+            re.IGNORECASE,
+        )
+        if tail_match is None:
+            return {
+                'canonical_value': value, 'time_scope_text': scope_text,
+                'value_surface': None,
+                'status': 'AMBIGUOUS_FAIL_CLOSED',
+                'reason': 'AVAILABILITY_VALUE_HAS_UNCLASSIFIED_MODIFIER',
+            }
+        proposed_scope = tail_match.group('scope').strip(' ,.;')
+        if scope_text and scope_text.casefold() != proposed_scope.casefold():
+            return {
+                'canonical_value': value, 'time_scope_text': scope_text,
+                'value_surface': None,
+                'status': 'AMBIGUOUS_FAIL_CLOSED',
+                'reason': 'VALUE_AND_TIME_SCOPE_DISAGREE',
+            }
+        scope_text = proposed_scope
+        status = 'REPAIRABLE_DETERMINISTICALLY'
+
+    if scope_text:
+        source_core = _availability_core_surface(
+            evidence, scope_text, allow_bare_scope=bool(tail) or time_scope_text is not None
+        )
+        if source_core is None:
+            return {
+                'canonical_value': value, 'time_scope_text': scope_text,
+                'value_surface': None,
+                'status': 'AMBIGUOUS_FAIL_CLOSED',
+                'reason': 'TEMPORAL_SCOPE_NOT_GROUNDED_WITH_AVAILABILITY_HEAD',
+            }
+        status = (
+            'REPAIRABLE_DETERMINISTICALLY'
+            if status != 'VALID' or tail else 'VALID'
+        )
+    return {
+        'canonical_value': canonical_value,
+        'time_scope_text': scope_text,
+        'value_surface': source_core,
+        'status': status,
+        'reason': None,
+    }
+
+
 def _parse_native_response(
     response: Mapping[str, Any],
     observation: ObservationRecord,
@@ -3957,7 +4175,7 @@ def _parse_native_response(
         raw_attribute = str(raw.get('attribute') or '')
         raw_value = raw.get('value')
         entity = subject_normalized
-        attribute = canonical_field_id(raw_attribute)
+        attribute = _native_extraction_attribute(raw_attribute)
         if not entity or not attribute or 'value' not in raw:
             rejected.append({'index': index, 'reason': 'missing_required_state_field'})
             continue
@@ -4090,6 +4308,7 @@ def _parse_native_response(
             and isinstance(raw.get('subject_surface'), str)
             else entity
         )
+        value_polarity = _value_polarity(located[0][0])
         grounding = _grounding_type(
             source_grounding_subject,
             attribute,
@@ -4097,6 +4316,7 @@ def _parse_native_response(
             tuple(item[0] for item in located),
             full_source,
             grounding_context,
+            assertion_polarity=value_polarity,
         )
         if grounding is None:
             rejected.append({'index': index, 'reason': 'unsupported_grounding'})
@@ -4114,9 +4334,22 @@ def _parse_native_response(
         def contains_value(location: tuple[str, int, int]) -> bool:
             if not isinstance(raw_value, str) or not raw_value.strip():
                 return True
-            return bool(normalized_literal_ranges(
-                full_source[location[1]:location[2]], raw_value.strip()
-            ))
+            source_span = full_source[location[1]:location[2]]
+            if normalized_literal_ranges(source_span, raw_value.strip()):
+                return True
+            # A negative candidate may use a standard negated paraphrase
+            # ("not available" / "unavailable") while its exact evidence says
+            # "no longer available". Accept only when both sides carry explicit
+            # negative polarity and their grounded semantic heads match.
+            candidate_terms, candidate_negative = _normalised_semantic_tokens(raw_value)
+            source_terms, source_negative = _normalised_semantic_tokens(source_span)
+            return bool(
+                value_polarity == 'negative'
+                and candidate_negative
+                and source_negative
+                and candidate_terms
+                and candidate_terms.issubset(source_terms)
+            )
 
         if subject_resolution in {
             SubjectResolutionType.DIRECT_SURFACE,
@@ -4171,12 +4404,18 @@ def _parse_native_response(
                 seen_evidence.add(evidence.evidence_id)
             evidence_refs.append(evidence.evidence_id)
         grounded_entity = entity
-        normalized_field = canonical_field_id(
+        normalized_field_raw = canonical_field_id(
             str(raw.get('canonical_field_id') or attribute)
+        )
+        normalized_field = (
+            'availability'
+            if canonical_attribute_id(normalized_field_raw) == 'availability'
+            else normalized_field_raw
         )
         condition_scope, condition_description = _condition_scope_payload(
             raw.get('condition_scope')
         )
+        time_scope_text = _time_scope_text(raw.get('time_scope'))
         value_span = _grounded_optional_span(full_source, raw.get('value_span'))
         value_source_ranges: list[list[int]] = []
         if isinstance(raw_value, str) and raw_value.strip():
@@ -4187,10 +4426,111 @@ def _parse_native_response(
                         start + local_value,
                         start + local_value + len(raw_value.strip()),
                     ])
+        raw_value_source_ranges = list(value_source_ranges)
+        typed_polarity = (
+            AssertionPolarity.NEGATIVE
+            if value_polarity == 'negative'
+            else AssertionPolarity.UNKNOWN
+            if value_polarity in {'historical', 'conditional', 'uncertain'}
+            else AssertionPolarity.POSITIVE
+        )
+        assertion_mode = (
+            AssertionMode.HYPOTHETICAL
+            if value_polarity == 'conditional'
+            else AssertionMode.UNKNOWN
+            if value_polarity in {'historical', 'uncertain'}
+            else AssertionMode.ASSERTED
+        )
+        candidate_value = raw.get('value')
+        if value_polarity == 'negative' and isinstance(candidate_value, str):
+            candidate_value = _grounded_negative_value_head(
+                candidate_value, primary_span
+            )
+        representation = _normalize_atomic_state_representation(
+            attribute=attribute,
+            value=candidate_value,
+            evidence=primary_span,
+            time_scope_text=time_scope_text,
+        )
+        raw_attribute_parts = raw_attribute.split('/', 1)
+        if (
+            len(raw_attribute_parts) == 2
+            and canonical_attribute_id(raw_attribute_parts[0]) == 'availability'
+        ):
+            representation = {
+                **representation,
+                'status': 'AMBIGUOUS_FAIL_CLOSED',
+                'reason': 'AVAILABILITY_RELATION_AND_SCOPE_MIXED_IN_ATTRIBUTE',
+            }
+        explicit_polarity = str(raw.get('polarity') or '').upper()
+        if explicit_polarity == 'UNKNOWN':
+            typed_polarity = AssertionPolarity.UNKNOWN
+            assertion_mode = AssertionMode.UNKNOWN
+        if explicit_polarity in {'POSITIVE', 'NEGATIVE'} and (
+            (explicit_polarity == 'NEGATIVE') != (value_polarity == 'negative')
+        ):
+            rejected.append({
+                'index': index,
+                'reason': 'AMBIGUOUS_FAIL_CLOSED',
+                'contract_issue': 'MODEL_POLARITY_CONFLICTS_WITH_GROUNDED_EVIDENCE',
+                'raw_value': raw_value,
+                'evidence_span': primary_span,
+            })
+            continue
+        if representation['status'] == 'AMBIGUOUS_FAIL_CLOSED':
+            rejected.append({
+                'index': index,
+                'reason': 'AMBIGUOUS_FAIL_CLOSED',
+                'contract_issue': representation['reason'],
+                'raw_attribute': raw_attribute,
+                'raw_value': raw_value,
+                'evidence_span': primary_span,
+            })
+            continue
+        if time_scope_text and not normalized_literal_ranges(primary_span, time_scope_text):
+            rejected.append({
+                'index': index,
+                'reason': 'AMBIGUOUS_FAIL_CLOSED',
+                'contract_issue': 'TEMPORAL_SCOPE_NOT_GROUNDED_IN_EVIDENCE',
+                'raw_time_scope': raw.get('time_scope'),
+                'evidence_span': primary_span,
+            })
+            continue
+        condition_text = str(raw.get('condition_description') or condition_description or '').strip()
+        if condition_text and not normalized_literal_ranges(primary_span, condition_text):
+            rejected.append({
+                'index': index,
+                'reason': 'AMBIGUOUS_FAIL_CLOSED',
+                'contract_issue': 'CONDITION_SCOPE_NOT_GROUNDED_IN_EVIDENCE',
+                'raw_condition_scope': raw.get('condition_scope'),
+                'evidence_span': primary_span,
+            })
+            continue
+        candidate_value = representation['canonical_value']
+        semantic_value_surface = representation.get('value_surface')
+        if isinstance(semantic_value_surface, str) and semantic_value_surface:
+            value_source_ranges = []
+            for _span, start, end in located:
+                evidence_text = full_source[start:end]
+                position = evidence_text.casefold().find(semantic_value_surface.casefold())
+                if position >= 0:
+                    value_source_ranges.append([
+                        start + position, start + position + len(semantic_value_surface),
+                    ])
+            if not value_source_ranges:
+                rejected.append({
+                    'index': index,
+                    'reason': 'AMBIGUOUS_FAIL_CLOSED',
+                    'contract_issue': 'SEMANTIC_CORE_VALUE_SPAN_NOT_GROUNDED',
+                    'raw_value': raw_value,
+                    'evidence_span': primary_span,
+                })
+                continue
+            value_span = semantic_value_surface
         candidate = StateCandidate(
             entity=grounded_entity,
             attribute=attribute,
-            value=raw.get('value'),
+            value=candidate_value,
             canonical_subject_id=(
                 grounded_entity
                 if first_person_resolution is not None
@@ -4206,6 +4546,8 @@ def _parse_native_response(
                 or None,
             ),
             confidence=_confidence(raw.get('confidence', 1.0)),
+            polarity=typed_polarity,
+            assertion_mode=assertion_mode,
             evidence_refs=tuple(evidence_refs),
             effects=_selectors(raw.get('invalidates')),
             conflicts=_selectors(raw.get('conflicts')),
@@ -4245,12 +4587,49 @@ def _parse_native_response(
                     'observation_id': observation.observation_id,
                 },
                 'value_span': value_span,
+                'raw_value_span': raw.get('value_span'),
                 'value_source_ranges': value_source_ranges,
                 'candidate_value_source_ranges': value_source_ranges,
+                'raw_value_source_ranges': raw_value_source_ranges,
                 'raw_extracted_entity': raw_entity,
                 'raw_extracted_attribute': raw_attribute,
                 'raw_extracted_value': raw_value,
-                'value_polarity': _value_polarity(primary_span),
+                'raw_model_polarity': raw.get('polarity'),
+                'raw_time_scope': raw.get('time_scope'),
+                'raw_condition_scope': raw.get('condition_scope'),
+                'semantic_time_scope_text': representation['time_scope_text'],
+                'value_polarity': value_polarity,
+                'atomic_state_proposition': {
+                    'contract': 'ATOMIC_STATE_PROPOSITION_V1',
+                    'validation': representation['status'],
+                    'entity': grounded_entity,
+                    'canonical_attribute': attribute,
+                    'canonical_value': candidate_value,
+                    'polarity': typed_polarity.value,
+                    'time_scope': {
+                        'start': (
+                            _time_scope(raw.get('time_scope'), observation.timestamp).start.isoformat()
+                            if _time_scope(raw.get('time_scope'), observation.timestamp).start else None
+                        ),
+                        'end': (
+                            _time_scope(raw.get('time_scope'), observation.timestamp).end.isoformat()
+                            if _time_scope(raw.get('time_scope'), observation.timestamp).end else None
+                        ),
+                        'text': representation['time_scope_text'],
+                        'kind': (
+                            'TEXTUAL' if representation['time_scope_text'] else
+                            'STRUCTURED' if raw.get('time_scope') else 'UNSPECIFIED'
+                        ),
+                    },
+                    'condition_scope': {
+                        'conditions': list(_grounded_conditions(condition_scope, primary_span).items()),
+                        'description': str(raw.get('condition_description') or condition_description or '').strip() or None,
+                    },
+                    'raw_relation': raw_attribute,
+                    'raw_value': raw_value,
+                    'evidence_refs': list(evidence_refs),
+                    'scope_policy': 'SPECIFIC_EXCEPTION_REQUIRES_LATER_RESOLUTION',
+                },
                 'value_grounding_status': (
                     'source_evidence' if grounding[0] == 'exact' else 'contextual_source'
                 ),
@@ -4440,6 +4819,8 @@ def _grounding_type(
     spans: Sequence[str],
     source: str,
     context: str,
+    *,
+    assertion_polarity: str | None = None,
 ) -> tuple[str, str | None, float] | None:
     """Return exact/coreference/contextual grounding, or unsupported.
 
@@ -4452,7 +4833,18 @@ def _grounding_type(
     entity_in_span = _contains_token(span_text, entity)
     attribute_in_span = _attribute_grounded(attribute, span_text)
     value_text = str(value).strip() if value is not None else ''
-    if value_text and _value_polarity_conflicts(value_text, span_text):
+    value_terms, value_negative = _normalised_semantic_tokens(value_text)
+    _evidence_terms, evidence_negative = _normalised_semantic_tokens(span_text)
+    if (
+        value_text
+        and _value_polarity_conflicts(value_text, span_text)
+        and not (
+            assertion_polarity == 'negative'
+            and not value_negative
+            and evidence_negative
+            and value_terms.issubset(_evidence_terms)
+        )
+    ):
         return None
     value_in_span = _value_grounded(value_text, span_text)
     if (
@@ -4806,11 +5198,30 @@ def _value_polarity(evidence: str) -> str:
     folded = evidence.casefold()
     if re.search(r'\b(if|unless|when)\b', folded):
         return 'conditional'
+    if re.search(r'\b(may|might|possibly|perhaps|likely|uncertain|could)\b', folded):
+        return 'uncertain'
     if re.search(r'\b(no longer|not|never|unavailable|inactive|failed|closed)\b', folded):
+        return 'negative'
+    if re.search(r"\b(cannot|can\s+not|can't)\b", folded):
         return 'negative'
     if re.search(r'\b(was|were|formerly|previously|used to)\b', folded):
         return 'historical'
     return 'positive'
+
+
+def _grounded_negative_value_head(value: str, evidence: str) -> str:
+    """Separate a source-grounded negative value head from its polarity cue."""
+
+    text = value.strip()
+    candidates = []
+    folded = text.casefold()
+    for prefix in ('no longer ', 'not ', 'never ', 'un'):
+        if folded.startswith(prefix) and len(text) > len(prefix):
+            candidates.append(text[len(prefix):].strip())
+    for candidate in candidates:
+        if candidate and normalized_literal_ranges(evidence, candidate):
+            return candidate
+    return value
 
 
 def _confidence(value: Any) -> float:

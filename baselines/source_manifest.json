@@ -1,0 +1,33 @@
+{
+  "mem0": {
+    "upstream_url": "https://github.com/mem0ai/mem0",
+    "commit": "001c235229be8795e3834520467bd0d661ed8f34",
+    "branch_state": "detached HEAD",
+    "local_patch": null
+  },
+  "graphiti": {
+    "upstream_url": "https://github.com/getzep/graphiti",
+    "commit": "96ef997b265d05222233553bcf86a23e2d1dfd89",
+    "branch_state": "main",
+    "local_patch": "migration/patches/graphiti.patch"
+  },
+  "amem": {
+    "upstream_url": "https://github.com/agiresearch/A-mem",
+    "commit": "ceffb860f0712bbae97b184d440df62bc910ca8d",
+    "branch_state": "main",
+    "local_patch": null
+  },
+  "letta": {
+    "upstream_url": "https://github.com/letta-ai/letta",
+    "commit": "dca193b01cb260a558493f7feb725a004e1df7ae",
+    "branch_state": "detached HEAD",
+    "local_patch": null
+  },
+  "cupmem": {
+    "upstream_url": "https://github.com/icedreamc/STALE.git",
+    "commit": "ea7d391103a151927cd29d2f01d87597a782bdcb",
+    "branch_state": "main",
+    "local_patch": null,
+    "provenance_note": "Local cup_mem implementation is present in this checkout, but its configured upstream URL is the STALE repository, not a CUPMem-specific upstream."
+  }
+}

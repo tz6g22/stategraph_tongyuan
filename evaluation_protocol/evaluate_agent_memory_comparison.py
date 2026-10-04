@@ -55,13 +55,15 @@ MEMORA_EVALUATOR_SOURCE = (
 def _verify_all_seals() -> dict[str, dict[str, list[dict[str, Any]]]]:
     """This must complete before either gold-bearing file is opened."""
 
-    _, config_bytes, config_sha256 = load_answer_config()
     sealed: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for dataset in DATASETS:
         sealed[dataset] = {}
         expected_ids: list[str] | None = None
         for method in METHODS:
             method_dir = OUTPUT_ROOT / dataset / method
+            _, _, config_sha256 = load_answer_config(
+                method_dir / 'answer_config.yaml', require_formal=False
+            )
             prediction_path = method_dir / 'predictions.jsonl'
             seal_path = method_dir / 'predictions.seal.json'
             payload = prediction_path.read_bytes()
@@ -83,8 +85,6 @@ def _verify_all_seals() -> dict[str, dict[str, list[dict[str, Any]]]]:
             elif ids != expected_ids:
                 raise RuntimeError(f'{dataset}/{method}: prediction order mismatch')
             sealed[dataset][method] = predictions
-    if sha256_bytes(config_bytes) != config_sha256:
-        raise AssertionError('unreachable config digest mismatch')
     return sealed
 
 

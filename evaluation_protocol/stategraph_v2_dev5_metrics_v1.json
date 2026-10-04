@@ -1,0 +1,17 @@
+{
+  "protocol": "stategraph-v2-dev5-metrics-v1",
+  "scope": "fixed five-case development-only integration sanity",
+  "gold_access": "after verified prediction seal only; parse gold rows only for the frozen DEV5 IDs",
+  "fact_identity": "case-local observation identity plus casefolded Unicode alphanumeric tokens for subject, attribute, value, and polarity",
+  "information_retention_recall": "semantically exact admitted MemoryFact claims divided by gold old+new atomic states; raw evidence-only text is not counted as a semantic fact",
+  "fact_semantic_precision_recall": "exact normalized structured fact tuple and supporting observation match; rejected claims are not usable predictions",
+  "evidence_grounding": "a semantic fact is correctly grounded only if its persisted evidence belongs to the same observation/group and its stored span round-trips exactly to source text; gold support must name that same source observation",
+  "admission_accuracy": "N/A because this benchmark gold has no independent per-fact admission labels; report verified-gold-fact recall and false-verified count instead",
+  "old_state_candidate_recall": "gold root-revision old state appears in the production linker candidate pool, divided by root revision opportunities with a matching revision trace",
+  "correct_old_new_pair_rate": "chosen linker target matches the gold old state for a traceable gold root revision, divided by traceable gold root revision opportunities",
+  "direct_revision_seed_dependency_propagation": "micro-averaged exact normalized fact-pair/status identities; unmatched method-failure cases contribute no predicted events, transport/infrastructure failures invalidate the run and are not scored",
+  "over_under_invalidation": "count old gold states whose runtime lifecycle destructively differs from the gold invalidated set, and missed gold invalidations respectively",
+  "premise_accuracy": "exact response-policy match only where gold_behavior supplies a supported premise_status mapping; otherwise N/A",
+  "answer_metrics": "official frozen normalized exact match and token F1, averaged over successful DEV5 cases; method failures score zero only for answer metrics, infrastructure failures prevent evaluation",
+  "cost": "confirmed responses and token usage from durable request/response journals; no price estimate"
+}

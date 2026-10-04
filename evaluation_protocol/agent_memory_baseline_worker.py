@@ -15,7 +15,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ADAPTER_ROOT = ROOT / 'external_baselines' / 'e2e_validation'
+ADAPTER_ROOT = ROOT / 'baseline_adapters'
 sys.path.insert(0, str(ADAPTER_ROOT))
 
 from adapters import create_adapter  # noqa: E402
@@ -91,12 +91,8 @@ def _context_items(value: Any) -> list[str]:
 
 
 def _git_commit(baseline: str) -> str:
-    import subprocess
-
-    return subprocess.check_output(
-        ['git', '-C', str(ROOT / 'external_baselines' / baseline), 'rev-parse', 'HEAD'],
-        text=True,
-    ).strip()
+    sources = json.loads((ROOT / 'baselines' / 'source_manifest.json').read_text(encoding='utf-8'))
+    return sources[baseline]['commit']
 
 
 def run(baseline: str, prepared_path: Path, output_dir: Path) -> None:

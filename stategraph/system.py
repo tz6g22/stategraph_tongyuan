@@ -75,6 +75,7 @@ class IngestResult:
     direct_invalidation_seed_ids: tuple[str, ...] = ()
     propagation_steps: tuple[PropagationStep, ...] = ()
     grounding_rejections: tuple[dict[str, Any], ...] = ()
+    relation_typing_funnel: tuple[tuple[str, int], ...] = ()
 
     @property
     def states(self) -> tuple[StateNode, ...]:
@@ -362,6 +363,7 @@ class StateGraph:
             revisions: list[RevisionResult] = []
             direct_invalidation_seeds: list[str] = []
             grounding_rejections: list[dict[str, Any]] = []
+            relation_typing_funnel: tuple[tuple[str, int], ...] = ()
 
             # Link the complete observation against one pre-revision snapshot.
             # This preserves the observation-level contract: no candidate can
@@ -642,6 +644,22 @@ class StateGraph:
                         )
                         continue
                     typing_inputs.append(replace(candidate, proposed_relation=None))
+                typing_inputs = list(_dedupe_typing_inputs(typing_inputs))
+                pre_rejected = [
+                    replace(
+                        candidate,
+                        provenance={
+                            **candidate.provenance,
+                            'typing_decision': 'safe_reject',
+                            'typing_reason': 'state endpoint missing',
+                            'visibility_path': 'safe_reject',
+                            'selection_score': 0,
+                            'selection_signals': [],
+                            'budget_truncated': False,
+                        },
+                    )
+                    for candidate in pre_rejected
+                ]
                 typing_started = time.perf_counter()
                 typing_results = type_relation_candidates(
                     tuple(typing_inputs),
@@ -656,15 +674,46 @@ class StateGraph:
                 )
                 accepted: list[DependencyCandidate] = []
                 rejected: list[DependencyCandidate] = [*pre_rejected]
+                typing_counts = {
+                    'DISCOVERED_CANDIDATES': len(dependency_candidates),
+                    'TYPING_INPUT_UNIQUE_PAIRS': len(typing_results) + len(pre_rejected),
+                    'TYPING_TYPED_ACCEPT': 0,
+                    'TYPING_SAFE_REJECT': len(pre_rejected),
+                    'TYPING_UNCERTAIN_BYPASS': 0,
+                    'TYPING_BYPASS_TRUNCATED': 0,
+                }
                 for result in typing_results:
+                    trace_provenance = {
+                        **result.candidate.provenance,
+                        'typing_decision': result.visibility_path,
+                        'typing_reason': result.reason,
+                        'visibility_path': result.visibility_path,
+                        'selection_score': result.selection_score,
+                        'selection_signals': list(result.selection_signals),
+                        'budget_truncated': result.budget_truncated,
+                    }
+                    traced_candidate = replace(result.candidate, provenance=trace_provenance)
                     if result.relation_type is None:
-                        rejected.append(result.candidate)
+                        rejected.append(traced_candidate)
+                        if result.budget_truncated:
+                            typing_counts['TYPING_BYPASS_TRUNCATED'] += 1
+                        else:
+                            typing_counts['TYPING_SAFE_REJECT'] += 1
                     else:
                         accepted.append(
-                            replace(result.candidate, proposed_relation=result.relation_type)
+                            replace(
+                                traced_candidate,
+                                proposed_relation=result.relation_type,
+                            )
                         )
+                        if result.visibility_path == 'uncertain_bypass':
+                            typing_counts['TYPING_UNCERTAIN_BYPASS'] += 1
+                        else:
+                            typing_counts['TYPING_TYPED_ACCEPT'] += 1
                 typed_dependency_candidates = _dedupe_typed_candidates(accepted)
                 rejected_dependency_candidates = tuple(rejected)
+                typing_counts['VERIFIER_VISIBLE_TOTAL'] = len(typed_dependency_candidates)
+                relation_typing_funnel = tuple(sorted(typing_counts.items()))
                 if self._profiler is not None:
                     self._profiler.add_stage_time(
                         'RELATION_TYPING',
@@ -697,13 +746,29 @@ class StateGraph:
                             dict.fromkeys(direct_invalidation_seeds)
                         ),
                         grounding_rejections=tuple(grounding_rejections),
+                        relation_typing_funnel=relation_typing_funnel,
                     )
                 if verify_typed is not None and typed_dependency_candidates:
-                    verified = verify_typed(
-                        observation,
-                        candidates=typed_dependency_candidates,
-                        states=all_states,
+                    verify_kwargs: dict[str, Any] = {
+                        'candidates': typed_dependency_candidates,
+                        'states': all_states,
+                    }
+                    verify_parameters = inspect.signature(verify_typed).parameters.values()
+                    accepts_support_context = any(
+                        parameter.name == 'incoming_relations'
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in verify_parameters
                     )
+                    if accepts_support_context:
+                        verify_kwargs['incoming_relations'] = await self.repository.list_relations(
+                            observation.group_id,
+                            {
+                                RelationType.DEPENDS_ON,
+                                RelationType.DERIVED_FROM,
+                                RelationType.AFFECTS_ACTION,
+                            },
+                        )
+                    verified = verify_typed(observation, **verify_kwargs)
                     dependency_assessments = tuple(
                         await verified if inspect.isawaitable(verified) else verified
                     )
@@ -712,14 +777,31 @@ class StateGraph:
                 # production Graphiti extractor always exposes the split contract above.
                 discover = getattr(self.extractor, 'discover_and_verify_dependencies', None)
                 if discover is not None and new_states:
-                    discovered = discover(
-                        observation,
-                        new_states=new_states,
-                        all_states=all_states,
-                        direct_invalidation_seed_ids=tuple(
+                    discover_kwargs: dict[str, Any] = {
+                        'new_states': new_states,
+                        'all_states': all_states,
+                        'direct_invalidation_seed_ids': tuple(
                             dict.fromkeys(direct_invalidation_seeds)
                         ),
+                    }
+                    discover_parameters = inspect.signature(discover).parameters.values()
+                    accepts_support_context = any(
+                        parameter.name == 'incoming_relations'
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in discover_parameters
                     )
+                    if accepts_support_context:
+                        discover_kwargs['incoming_relations'] = (
+                            await self.repository.list_relations(
+                                observation.group_id,
+                                {
+                                    RelationType.DEPENDS_ON,
+                                    RelationType.DERIVED_FROM,
+                                    RelationType.AFFECTS_ACTION,
+                                },
+                            )
+                        )
+                    discovered = discover(observation, **discover_kwargs)
                     dependency_candidates, dependency_assessments = (
                         await discovered if inspect.isawaitable(discovered) else discovered
                     )
@@ -755,6 +837,7 @@ class StateGraph:
                         dict.fromkeys(direct_invalidation_seeds)
                     ),
                     grounding_rejections=tuple(grounding_rejections),
+                    relation_typing_funnel=relation_typing_funnel,
                 )
             dependency_relations = tuple(
                 _relation_from_assessment(assessment, observation)
@@ -826,6 +909,7 @@ class StateGraph:
                 ),
                 propagation_steps=propagation.propagation_steps,
                 grounding_rejections=tuple(grounding_rejections),
+                relation_typing_funnel=relation_typing_funnel,
             )
 
     async def _assert_no_active_canonical_duplicates(self, group_id: str) -> None:
@@ -1102,6 +1186,36 @@ def _dedupe_typed_candidates(
             signals=tuple(dict.fromkeys((*previous.signals, *candidate.signals))),
         )
     return tuple(by_key.values())
+
+
+def _dedupe_typing_inputs(
+    candidates: Sequence[DependencyCandidate],
+) -> tuple[DependencyCandidate, ...]:
+    """Merge discovery paths before typing so an endpoint pair is verified once."""
+    by_pair: dict[tuple[str, str], DependencyCandidate] = {}
+    for candidate in candidates:
+        key = (candidate.prerequisite_state_id, candidate.dependent_state_id)
+        previous = by_pair.get(key)
+        if previous is None:
+            by_pair[key] = candidate
+            continue
+        provenance = {**candidate.provenance, **previous.provenance}
+        shared_refs = tuple(dict.fromkeys((
+            *previous.provenance.get('shared_evidence_ids', ()),
+            *candidate.provenance.get('shared_evidence_ids', ()),
+        )))
+        if shared_refs:
+            provenance['shared_evidence_ids'] = list(shared_refs)
+        by_pair[key] = replace(
+            previous,
+            candidate_evidence=tuple(dict.fromkeys((
+                *previous.candidate_evidence, *candidate.candidate_evidence,
+            ))),
+            provenance=provenance,
+            candidate_reason=previous.candidate_reason or candidate.candidate_reason,
+            signals=tuple(dict.fromkeys((*previous.signals, *candidate.signals))),
+        )
+    return tuple(by_pair[key] for key in sorted(by_pair))
 
 
 def _candidate_evidence_nodes(

@@ -65,6 +65,30 @@ class SourceAuthorizationRefinementTests(unittest.TestCase):
         self.assertEqual(resolved.status, "REMOVE")
         self.assertEqual(resolved.stale_version_ids, (old.version_id,))
 
+    def test_negative_preference_paraphrase_does_not_authorize_other_predicates(self):
+        old = materialize_frame(candidate(
+            "Vale likes fennel.", subject="Vale", predicate="likes", value="fennel",
+        ), self.registry)
+        valid = resolve_change((old,), candidate(
+            "Fennel is no longer a preference of Vale.", subject="Vale", predicate="likes",
+            value="Fennel", seq=1, operation="REMOVE", polarity="NEGATED",
+        ), self.registry)
+        self.assertEqual(valid.status, "REMOVE")
+        self.assertEqual(valid.stale_version_ids, (old.version_id,))
+
+        other_registry = registry()
+        other_registry.register(FrameKind.FACT, "owns", Cardinality.SET_VALUED)
+        owned = materialize_frame(candidate(
+            "Vale owns fennel.", subject="Vale", predicate="owns", value="fennel",
+        ), other_registry)
+        unrelated = candidate(
+            "Fennel is no longer a preference of Vale.", subject="Vale", predicate="owns",
+            value="Fennel", seq=1, operation="REMOVE", polarity="NEGATED",
+        )
+        rejected = resolve_change((owned,), unrelated, other_registry)
+        self.assertEqual(rejected.status, "UNCERTAIN")
+        self.assertFalse(rejected.stale_version_ids)
+
     def test_patch_uses_exact_facet_not_subject_position(self):
         fields = dict(subject="Forum-12", predicate="meeting", kind="EVENT",
                       bindings=(("instance", "Forum-12"),))

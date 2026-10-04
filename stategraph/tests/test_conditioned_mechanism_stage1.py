@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +82,32 @@ class ConditionedMechanismStage1ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(fake.kwargs["max_tokens"], 128)
+
+    async def test_answer_path_receives_weak_revalidation_notice(self) -> None:
+        class FakeLLM:
+            messages = None
+
+            async def generate_response(self, messages, **kwargs):
+                self.messages = messages
+                return {"answer": "Please confirm whether the plan remains valid."}
+
+        fake = FakeLLM()
+        notice = "Selected state plan awaits revalidation after a weak prerequisite became stale."
+        retrieval = SimpleNamespace(
+            premise_check=SimpleNamespace(
+                response_policy=SimpleNamespace(value="clarify"),
+                corrections=(notice,),
+            ),
+            grounded_states=(),
+            evidence_context=lambda: [],
+        )
+        await CME._answer_query(
+            llm=fake, question="Is the plan valid?", retrieval=retrieval,
+            profiler=SimpleNamespace(stage=lambda *args, **kwargs: nullcontext()),
+        )
+        payload = json.loads(fake.messages[-1].content)
+        self.assertEqual(payload['premise_policy'], 'clarify')
+        self.assertEqual(payload['premise_corrections'], [notice])
 
     def test_audit_snapshot_contract_is_upstream_only(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

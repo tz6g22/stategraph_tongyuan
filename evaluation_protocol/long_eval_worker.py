@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'external_baselines' / 'e2e_validation'))
+sys.path.insert(0, str(ROOT / 'baseline_adapters'))
 
 from adapters import create_adapter
 

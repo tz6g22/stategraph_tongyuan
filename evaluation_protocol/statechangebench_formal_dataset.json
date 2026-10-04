@@ -1,0 +1,9 @@
+{
+  "dataset_name": "StateChangeBench",
+  "dataset_version": "v4",
+  "dataset_path": "/home/cody/data/stategraphbenchmark/statechangebench_cases_001_050_v4.jsonl",
+  "dataset_sha256": "0cd03ff7ba2904638188d00905830ebd43926df3bff615a848500337019470af",
+  "case_count": 50,
+  "lineage": "CURRENT_REVISED_RELEASE",
+  "historical_lineage_note": "v1-v3 are historical datasets; no unsupported transformation history is asserted."
+}

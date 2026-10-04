@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Protocol, Sequence
 
-from stategraph.state.schema import StateNode, StateRelation, StateStatus
+from stategraph.state.schema import AssertionPolarity, StateNode, StateRelation, StateStatus
+
+from .specificity import QueryResolution
 
 
 _PREMISE_STOPWORDS = frozenset(
@@ -56,6 +58,7 @@ class CheckedPremise:
     conflicting_state_ids: tuple[str, ...] = ()
     correction: str | None = None
     conflict_candidate_state_ids: tuple[str, ...] = ()
+    revalidation_state_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,10 +67,21 @@ class PremiseCheckResult:
     conflicting_state_ids: tuple[str, ...]
     response_policy: ResponsePolicy
     dependency_state_ids: tuple[str, ...] = ()
+    revalidation_state_ids: tuple[str, ...] = ()
+    revalidation_notices: tuple[str, ...] = ()
+    revalidation_source_state_ids: tuple[str, ...] = ()
+    revalidation_dependency_relation_ids: tuple[str, ...] = ()
+    confirmed_support_count: int = 0
+    revalidation_support_count: int = 0
+    revalidation_conflict_count: int = 0
+    revalidation_decision: str = 'NONE'
 
     @property
     def corrections(self) -> tuple[str, ...]:
-        return tuple(item.correction for item in self.premises if item.correction is not None)
+        return (
+            *tuple(item.correction for item in self.premises if item.correction is not None),
+            *self.revalidation_notices,
+        )
 
 
 class PremiseExtractor(Protocol):
@@ -174,8 +188,15 @@ class PremiseChecker:
         conflict_candidates: Iterable[StateNode] = (),
         dependencies: Iterable[StateRelation] = (),
         stale_states: Iterable[StateNode] = (),
+        query_resolution: QueryResolution | None = None,
+        premise_resolutions: Sequence[QueryResolution] = (),
     ) -> PremiseCheckResult:
-        states = tuple(state for state in current_states if state.status == StateStatus.CURRENT)
+        if query_resolution is None:
+            states = tuple(state for state in current_states if state.status == StateStatus.CURRENT)
+            query_conflicts: tuple[str, ...] = ()
+        else:
+            states = self._resolved_current_states(query_resolution)
+            query_conflicts = query_resolution.conflict_state_ids
         stale = tuple(state for state in stale_states if state.status == StateStatus.STALE)
         candidates = tuple(
             state
@@ -184,17 +205,57 @@ class PremiseChecker:
             and state.metadata.get('uncertainty_kind') == 'unresolved_conflict'
         )
         extracted = tuple(premises) if premises is not None else self.extract(query)
-        checked = tuple(self._check_one(premise, states, candidates, stale) for premise in extracted)
+        checked_rows: list[CheckedPremise] = []
+        premise_conflicts: set[str] = set()
+        revalidation_by_id: dict[str, StateNode] = {}
+        revalidation_support_ids: set[str] = set()
+        revalidation_conflict_ids: set[str] = set()
+        for index, premise in enumerate(extracted):
+            resolution = premise_resolutions[index] if index < len(premise_resolutions) else None
+            premise_states = (
+                self._resolved_current_states(resolution) if resolution is not None else states
+            )
+            if resolution is not None:
+                premise_conflicts.update(resolution.conflict_state_ids)
+            pending_rows = tuple(
+                (state, self._check_one(premise, (state,), (), ()))
+                for state in premise_states if state.metadata.get('needs_revalidation')
+            )
+            pending = tuple(
+                state for state, result in pending_rows
+                if result.status is not PremiseStatus.UNVERIFIED
+            )
+            revalidation_support_ids.update(
+                state.state_id for state, result in pending_rows
+                if result.status is PremiseStatus.SUPPORTED
+            )
+            revalidation_conflict_ids.update(
+                state.state_id for state, result in pending_rows
+                if result.status is PremiseStatus.CONFLICTED
+            )
+            revalidation_by_id.update({state.state_id: state for state in pending})
+            confirmed = tuple(
+                state for state in premise_states
+                if not state.metadata.get('needs_revalidation')
+            )
+            checked = self._check_one(premise, confirmed, candidates, stale)
+            checked_rows.append(replace(
+                checked,
+                revalidation_state_ids=tuple(sorted(state.state_id for state in pending)),
+            ))
+        checked = tuple(checked_rows)
         if not extracted and stale and self._continuity_query(query):
             checked = (self._implicit_stale_check(query, stale),)
-        conflicts = tuple(
-            dict.fromkeys(
-                state_id for result in checked for state_id in result.conflicting_state_ids
-            )
-        )
-        if conflicts:
+        conflicts = tuple(dict.fromkeys((
+            *(state_id for result in checked for state_id in result.conflicting_state_ids),
+            *query_conflicts,
+            *sorted(premise_conflicts),
+        )))
+        if query_conflicts or premise_conflicts:
+            policy = ResponsePolicy.CLARIFY
+        elif any(result.conflicting_state_ids for result in checked):
             policy = ResponsePolicy.REJECT_STALE_PREMISE
-        elif checked and all(item.status == PremiseStatus.UNVERIFIED for item in checked):
+        elif any(item.status == PremiseStatus.UNVERIFIED for item in checked):
             policy = ResponsePolicy.CLARIFY
         else:
             policy = ResponsePolicy.PROCEED
@@ -207,6 +268,8 @@ class PremiseChecker:
                 *item.conflict_candidate_state_ids,
             )
         }
+        relevant_ids.update(query_conflicts)
+        relevant_ids.update(premise_conflicts)
         dependency_ids = tuple(
             dict.fromkeys(
                 endpoint
@@ -217,7 +280,96 @@ class PremiseChecker:
                 if endpoint not in relevant_ids
             )
         )
-        return PremiseCheckResult(checked, conflicts, policy, dependency_ids)
+        revalidation_state_ids = tuple(sorted({
+            state_id for item in checked for state_id in item.revalidation_state_ids
+        }))
+        revalidation_states = tuple(
+            revalidation_by_id[state_id]
+            for state_id in revalidation_state_ids
+            if state_id in revalidation_by_id
+        )
+        source_ids = tuple(sorted({
+            source_id
+            for state in revalidation_states
+            for source_id in self._metadata_values(
+                state, 'revalidation_source_state_ids', 'revalidation_source_state_id'
+            )
+        }))
+        relation_ids = tuple(sorted({
+            relation_id
+            for state in revalidation_states
+            for relation_id in self._metadata_values(
+                state,
+                'revalidation_dependency_relation_ids',
+                'revalidation_dependency_relation_id',
+            )
+        }))
+        confirmed_support_ids = {
+            state_id for item in checked for state_id in item.supporting_state_ids
+        }
+        if not revalidation_state_ids:
+            decision = 'NONE'
+            notices: tuple[str, ...] = ()
+        elif query_conflicts or premise_conflicts:
+            decision = 'QUERY_CONFLICT_REQUIRES_CLARIFICATION'
+            notices = ()
+        elif any(item.conflicting_state_ids for item in checked):
+            decision = 'CONFIRMED_CONTRADICTION_TAKES_PRECEDENCE'
+            notices = ()
+        elif any(
+            item.revalidation_state_ids and not item.supporting_state_ids
+            for item in checked
+        ):
+            decision = 'REVALIDATION_REQUIRED'
+            notices = tuple(
+                f"Premise support from CURRENT state {state.state_id} needs revalidation "
+                f"(sources={','.join(self._metadata_values(state, 'revalidation_source_state_ids', 'revalidation_source_state_id')) or 'unknown'}; "
+                f"relations={','.join(self._metadata_values(state, 'revalidation_dependency_relation_ids', 'revalidation_dependency_relation_id')) or 'unknown'})."
+                for state in revalidation_states
+                if any(
+                    state.state_id in item.revalidation_state_ids
+                    and not item.supporting_state_ids
+                    for item in checked
+                )
+            )
+        elif confirmed_support_ids:
+            decision = 'CONFIRMED_SUPPORT_RETAINS_PRECEDENCE'
+            notices = ()
+        else:
+            decision = 'REVALIDATION_REQUIRED'
+            notices = tuple(
+                f"Premise support from CURRENT state {state.state_id} needs revalidation "
+                f"(sources={','.join(self._metadata_values(state, 'revalidation_source_state_ids', 'revalidation_source_state_id')) or 'unknown'}; "
+                f"relations={','.join(self._metadata_values(state, 'revalidation_dependency_relation_ids', 'revalidation_dependency_relation_id')) or 'unknown'})."
+                for state in revalidation_states
+            )
+        return PremiseCheckResult(
+            checked,
+            conflicts,
+            policy,
+            dependency_ids,
+            revalidation_state_ids,
+            notices,
+            source_ids,
+            relation_ids,
+            len(confirmed_support_ids),
+            len(revalidation_support_ids),
+            len(revalidation_conflict_ids),
+            decision,
+        )
+
+    @staticmethod
+    def _resolved_current_states(resolution: QueryResolution) -> tuple[StateNode, ...]:
+        return resolution.premise_states
+
+    @staticmethod
+    def _metadata_values(state: StateNode, plural_key: str, singular_key: str) -> tuple[str, ...]:
+        value = state.metadata.get(plural_key, state.metadata.get(singular_key, ()))
+        if isinstance(value, str):
+            values = (value,)
+        else:
+            values = tuple(str(item) for item in value or ())
+        return tuple(sorted(set(values)))
 
     def _check_one(
         self,
@@ -245,24 +397,42 @@ class PremiseChecker:
         expected = _normalise(premise.expected_value) if premise.expected_value else None
 
         for state in candidates:
-            value = state.normalised_value
+            # canonical_state_value is for version equivalence and may erase
+            # relation-family anchors such as ``available``; premise checks
+            # need the grounded surface value before applying polarity.
+            value = _normalise(str(state.value))
             value_tokens = _tokens(value)
             if self._effect_rejects(premise, premise_tokens, state):
                 conflicting.append(state.state_id)
                 continue
+            state_polarity = AssertionPolarity(state.polarity)
+            if state_polarity is AssertionPolarity.UNKNOWN:
+                conflicting.append(state.state_id)
+                continue
+            direct_match = bool(value_tokens & premise_tokens)
+            lexical_opposite = self._contains_opposite(premise_tokens, value_tokens)
+            asserted_negative = self._asserts_negative(premise_tokens, value_tokens)
+            if state_polarity is AssertionPolarity.NEGATIVE:
+                if asserted_negative:
+                    supporting.append(state.state_id)
+                elif direct_match or lexical_opposite:
+                    conflicting.append(state.state_id)
+                continue
             if expected is not None:
                 if expected == value:
-                    supporting.append(state.state_id)
+                    (conflicting if asserted_negative else supporting).append(state.state_id)
+                elif lexical_opposite:
+                    conflicting.append(state.state_id)
                 else:
                     conflicting.append(state.state_id)
-            elif value_tokens & premise_tokens:
-                supporting.append(state.state_id)
-            elif self._contains_opposite(premise_tokens, value_tokens):
+            elif direct_match:
+                (conflicting if asserted_negative else supporting).append(state.state_id)
+            elif lexical_opposite:
                 conflicting.append(state.state_id)
 
         if conflicting:
             corrections = '; '.join(
-                f'{state.entity}.{state.attribute} is {state.value}'
+                self._render_state_assertion(state)
                 for state in candidates
                 if state.state_id in conflicting
             )
@@ -284,7 +454,7 @@ class PremiseChecker:
         if stale_candidates:
             stale_ids = tuple(state.state_id for state in stale_candidates)
             corrections = '; '.join(
-                f'{state.entity}.{state.attribute} is stale ({state.value})'
+                f'{self._render_state_assertion(state)} [stale]'
                 for state in stale_candidates
             )
             return CheckedPremise(
@@ -302,6 +472,13 @@ class PremiseChecker:
         )
 
     @staticmethod
+    def _render_state_assertion(state: StateNode) -> str:
+        value = str(state.value)
+        if AssertionPolarity(state.polarity) is AssertionPolarity.NEGATIVE:
+            value = f'not {value}'
+        return f'{state.entity}.{state.attribute} is {value}'
+
+    @staticmethod
     def _continuity_query(query: str) -> bool:
         tokens = _tokens(query)
         return bool(tokens & {'still', 'remain', 'remains', 'continue', 'continues', 'yet', 'anymore'})
@@ -311,7 +488,7 @@ class PremiseChecker:
         relevant = tuple(stale_states)
         ids = tuple(state.state_id for state in relevant)
         correction = '; '.join(
-            f'{state.entity}.{state.attribute} is stale ({state.value})'
+            f'{PremiseChecker._render_state_assertion(state)} [stale]'
             for state in relevant
         )
         return CheckedPremise(
@@ -383,6 +560,18 @@ class PremiseChecker:
             for right in value_tokens:
                 if left == f'un{right}' or right == f'un{left}':
                     return True
+        return False
+
+    def _asserts_negative(self, premise_tokens: set[str], value_tokens: set[str]) -> bool:
+        if premise_tokens & {'not', 'never', 'without', 'cannot', "can't", 'cant'}:
+            return bool(value_tokens & premise_tokens) or any(
+                any(token in premise_tokens for token in positive | negative)
+                and any(token in value_tokens for token in positive | negative)
+                for positive, negative in self._opposites
+            )
+        for positive, negative in self._opposites:
+            if premise_tokens & negative and value_tokens & positive:
+                return True
         return False
 
     @staticmethod

@@ -1,0 +1,21 @@
+Propose the atomic facts explicitly supported by this single source observation.
+Do not use outside knowledge or infer unstated facts. Return JSON only with a
+"facts" array. Each item must contain fact_text (a concise natural-language
+statement faithful to the source), evidence_quote (an exact substring copied
+from the observation), observed_subject (source form or null),
+canonical_subject (normalized identity or null), attribute (or null), value
+(or null), polarity (POSITIVE, NEGATIVE, or null), time_interpretation (or
+null), condition_interpretation (or null), confidence (0..1), and
+field_support. field_support maps fact_text, observed_subject,
+canonical_subject, attribute, value, polarity, time_scope, and condition_scope
+to SUPPORTED, UNRESOLVED, or UNSUPPORTED. Only mark a field SUPPORTED when
+the cited evidence_quote supports it. Do not emit offsets. Do not decide
+whether an old state should be changed; do not propose dependencies,
+propagation, retrieval, or answers. If a source quote cannot be uniquely
+identified, return an empty facts array rather than inventing an anchor.
+
+The evidence identity supplied with the observation is:
+{evidence_id}
+
+Observation:
+{observation}

@@ -1,0 +1,44 @@
+{
+  "git_commit": "PENDING_PRE_COMMIT",
+  "git_tag": "iridis-migration-freeze-2026-10-05",
+  "branch": "freeze/iridis-migration-2026-10-05",
+  "git_remote": "https://github.com/tz6g22/stategraph_tongyuan.git",
+  "datasets": {
+    "statechangebench_v5": {
+      "path": "data/benchmarks/statechangebench_cases_001_050_v5.jsonl",
+      "sha256": "77d9c6c90e01a5bc5c1838d64cf523bd828c9a88c6f13711586409b976f60725",
+      "included": true
+    },
+    "third_party": "See migration/DATASET_MANIFEST.md; source datasets are excluded from Git."
+  },
+  "external_baselines": {
+    "source_manifest": "baselines/source_manifest.json",
+    "venvs_in_git": false,
+    "adapter_root": "baseline_adapters"
+  },
+  "model": {
+    "repo": "bartowski/Qwen_Qwen3.5-27B-GGUF",
+    "file": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+    "sha256": "81657841d62f1821c748d0fea6c260b7d3508844fe4e9250253ef81c4e4d9edf",
+    "local_path": "/home/cody/models/qwen3.5-27b-q4/Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+    "included": false
+  },
+  "llama_cpp": {
+    "repo": "https://github.com/ggml-org/llama.cpp",
+    "tag": "b11379",
+    "commit": "1537a0a8b2f8711d840878b0a0677ab2213c882c",
+    "included": false
+  },
+  "environments": {
+    "snapshots": "migration/env/",
+    "venvs_in_git": false,
+    "cupmem_dedicated_venv": false
+  },
+  "unfinished_tasks": [
+    "Complete remaining baseline x dataset compatibility pairs; see outputs/qwen27b_baseline_adapter/COMPATIBILITY_MATRIX.md.",
+    "Letta requires a representation-compatible local embedding backend.",
+    "Preserve fixed Qwen context semantics; some native baseline prompts exceed 4096 tokens.",
+    "CUPMem checkout upstream provenance points to STALE rather than a CUPMem-specific repository.",
+    "No formal full benchmark was run or authorized in the freeze stage."
+  ]
+}

@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("method", choices=("mem0", "amem"))
     args = parser.parse_args()
-    sys.path.insert(0, str(ROOT / "external_baselines" / "e2e_validation"))
+    sys.path.insert(0, str(ROOT / "baseline_adapters"))
     from adapters import create_adapter
 
     manifest = json.loads((OUT / "METHOD_MANIFEST.json").read_text())

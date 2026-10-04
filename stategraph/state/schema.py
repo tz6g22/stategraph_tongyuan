@@ -978,7 +978,13 @@ def resolve_state_alias_id(state_id: str, states_by_id: Mapping[str, StateNode])
 
 @dataclass(frozen=True, slots=True)
 class StateCandidate:
-    """State extraction output before evidence and lifecycle fields are attached."""
+    """Atomic state extraction output before lifecycle fields are attached.
+
+    ``value`` is the semantic core only; temporal and conditional qualifiers belong
+    in ``time_scope`` / ``condition_scope``. Native extraction preserves non-ISO
+    temporal text, raw relation/value, and grounded evidence references in metadata
+    under ``atomic_state_proposition`` rather than folding modifiers into the value.
+    """
 
     entity: str
     attribute: str

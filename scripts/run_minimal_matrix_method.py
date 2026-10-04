@@ -112,7 +112,7 @@ async def run_scb(method: str) -> list[dict[str, Any]]:
             except Exception as exc:
                 rows.append({"case_id": case["case_id"], "query": case["query"], "status": "INCOMPLETE", "error_class": type(exc).__name__, "error": str(exc), "api_calls": len(client.calls), "latency_seconds": time.perf_counter()-started})
     else:
-        from external_baselines.e2e_validation.adapters import create_adapter
+        from baseline_adapters.adapters import create_adapter
         for case in payload["cases"]:
             started = time.perf_counter(); adapter = None
             try:

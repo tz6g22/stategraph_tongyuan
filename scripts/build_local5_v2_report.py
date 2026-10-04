@@ -72,4 +72,4 @@ for c in MANIFEST['cases']:
         if x:
             lines.append(f"| {c['case_id']} | {m} | {x.get('metrics',{}).get('em',0):.3f} | {x.get('metrics',{}).get('f1',0):.3f} |")
 (OUT/'REPORT.md').write_text('\n'.join(lines))
-(OUT/'ADAPTER_FIX_AUDIT.md').write_text('# Adapter fix audit\n\nAllowed execution-layer files changed: `external_baselines/e2e_validation/adapters.py`, `scripts/run_stategraph_local5.py`, and `scripts/answer_eval_statechange5.py`. Core algorithms and evaluator were not changed. StateGraph, Graphiti, Mem0, and A-MEM completed the fixed 5-case run. Letta repair was explicitly abandoned by the user and is not a valid completed method in the final comparison.\n')
+(OUT/'ADAPTER_FIX_AUDIT.md').write_text('# Adapter fix audit\n\nAllowed execution-layer files changed: `baseline_adapters/adapters.py`, `scripts/run_stategraph_local5.py`, and `scripts/answer_eval_statechange5.py`. Core algorithms and evaluator were not changed. StateGraph, Graphiti, Mem0, and A-MEM completed the fixed 5-case run. Letta repair was explicitly abandoned by the user and is not a valid completed method in the final comparison.\n')

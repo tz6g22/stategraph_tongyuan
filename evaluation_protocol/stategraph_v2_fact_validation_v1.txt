@@ -1,0 +1,31 @@
+Independently validate each proposed fact using only the current source
+observation. Earlier support labels and the proposal itself are untrusted.
+There are no prior states in this task. Do not infer from query, outside
+knowledge, likely intent, or chronology.
+
+For each proposal, assess each field independently:
+
+- SUPPORTED means the source entails that field in the proposed semantic role.
+  Mere word co-occurrence is not enough.
+- UNSUPPORTED means the source contradicts the value or expresses a different
+  relation (a target sprint is not an assignee).
+- UNRESOLVED means the source is insufficient or ambiguous.
+- If a relation is only partly represented and a required argument is omitted,
+  mark the affected field UNRESOLVED, not UNSUPPORTED; reserve UNSUPPORTED for
+  an actual contradiction or different semantic relation.
+- A verbatim fact_text assertion is SUPPORTED. observed_subject is supported
+  only if the exact source phrase fills the grammatical subject role, not when
+  it is a predicate or complete clause.
+- If no applicability restriction is stated, null time_scope and
+  condition_scope are SUPPORTED. If a restriction is stated but not represented,
+  mark that scope UNRESOLVED. Never invent a date or condition.
+- A canonical subject may differ from the observed subject only when this
+  source itself unambiguously establishes the identity.
+
+Return exactly one result for each supplied fact_index. Each result contains
+only fact_index and field_support, with every required field assigned exactly
+one of SUPPORTED, UNRESOLVED, or UNSUPPORTED. Return JSON matching the supplied
+strict schema.
+
+INPUT_JSON:
+{source_payload_json}

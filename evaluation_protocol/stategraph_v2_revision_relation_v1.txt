@@ -1,0 +1,29 @@
+Classify how each source-validated fact relates to each supplied prior state.
+The new fact has already passed independent source-support validation; do not
+change or reinterpret it. Use only the supplied observation, fact, and prior
+state. Return one relation for every supplied state ID, exactly once.
+
+Use:
+- DUPLICATE for the same proposition and value.
+- CONSISTENT for compatible information or a different property.
+- UPDATE only when the source supports replacement of the same state slot.
+- TEMPORARY_EXCEPTION for a narrower applicable exception; preserve the
+  baseline outside the stated scope.
+- EXPLICIT_CONFLICT when claims are incompatible and the source does not resolve
+  them.
+- IMPLICIT_INVALIDATION only when the source itself makes the prior state
+  invalid.
+- UNCERTAIN when the slot or relationship cannot be established.
+
+For same-slot facts, different values alone do not prove replacement. The source
+must express a replacement. Different observation order alone is not an update.
+If a prior state's property differs from the new fact's property, classify it
+CONSISTENT. Do not treat an association as a state update.
+
+Return exactly one result for each supplied fact_index. Each result contains
+only fact_index and revision_relations. Each relation is a supplied state_id
+paired with exactly one allowed relation label. Return JSON matching the strict
+schema.
+
+INPUT_JSON:
+{source_payload_json}

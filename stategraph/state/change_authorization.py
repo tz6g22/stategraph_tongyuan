@@ -155,6 +155,14 @@ class DeterministicLocalChangeAuthorizationJudge:
             predicate_negation = r"(?:\bnot|\bno longer|n't)\s+" + _term(head) + r"\s+" + _term(value)
             if field_grounded and re.search(predicate_negation, clause, re.I):
                 return supported
+            if (candidate.kind_hint is FrameKind.FACT
+                    and normalise(candidate.predicate) in {"like", "likes", "preference", "preferences"}):
+                preference_withdrawal = (
+                    _term(value) + r"\s+(?:is|was)\s+no longer\s+"
+                    r"(?:a\s+)?preference\s+of\s+" + _term(subject)
+                )
+                if re.search(preference_withdrawal, clause, re.I):
+                    return supported
             if candidate.kind_hint is FrameKind.ROLE and candidate.facet == "status":
                 organization = dict(candidate.key_bindings).get("organization", "")
                 direct = (_term(subject) + r"\s+(?:(?:is|has|was)\s+)?"

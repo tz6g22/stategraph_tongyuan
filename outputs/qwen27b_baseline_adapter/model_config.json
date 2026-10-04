@@ -1,0 +1,32 @@
+{
+  "base_model": "Qwen/Qwen3.5-27B",
+  "quantized_repo": "bartowski/Qwen_Qwen3.5-27B-GGUF",
+  "filename": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+  "path": "/home/cody/models/qwen3.5-27b-q4/Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+  "sha256": "81657841d62f1821c748d0fea6c260b7d3508844fe4e9250253ef81c4e4d9edf",
+  "quantization": "Q4_K_M",
+  "llama_cpp_tag": "b11379",
+  "llama_cpp_commit": "1537a0a8b2f8711d840878b0a0677ab2213c882c",
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "model_alias": "qwen3.5-27b-q4",
+  "gpu": "NVIDIA RTX 4070 Ti 12GB, WSL2",
+  "gpu_layers": 36,
+  "remaining_layers": "CPU offload",
+  "context": 4096,
+  "batch": 512,
+  "ubatch": 128,
+  "parallel": 1,
+  "flash_attention": true,
+  "kv_cache_k": "q8_0",
+  "kv_cache_v": "q8_0",
+  "generation_defaults": {
+    "temperature": 0,
+    "top_p": 1,
+    "seed": 42,
+    "max_completion_tokens": "task-specific; adapter bounds to remaining 4096-token context",
+    "adapter_enforces_context_budget": true
+  },
+  "qwen_thinking": false,
+  "server_startup_time_recorded": false,
+  "embedding_backends_are_separate_from_llm": true
+}

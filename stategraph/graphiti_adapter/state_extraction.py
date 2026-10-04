@@ -12,6 +12,8 @@ from typing import Any, Mapping, Sequence
 
 from stategraph.state.extraction import GraphitiFact
 from stategraph.state.schema import (
+    AssertionMode,
+    AssertionPolarity,
     ConditionScope,
     Observation,
     ObservationRecord,
@@ -165,11 +167,13 @@ class GraphitiLLMStateExtractor:
         *,
         candidates: Sequence[Any],
         states: Sequence[Any],
+        incoming_relations: Sequence[Any] = (),
     ):
         return await self._dependency_discovery.verify_typed_candidates(
             observation,
             candidates=candidates,
             states=states,
+            incoming_relations=incoming_relations,
         )
 
     async def ground_existing_slot(self, observation, state, existing):
@@ -1170,12 +1174,12 @@ def _validate_value_polarity(
 
     if _CONDITIONAL_CUE_RE.search(evidence):
         polarity = 'conditional'
+    elif _UNCERTAIN_CUE_RE.search(evidence):
+        polarity = 'uncertain'
     elif _NEGATIVE_CUE_RE.search(evidence) or _NEGATIVE_STATE_VALUE_RE.search(evidence):
         polarity = 'negative'
     elif _HISTORICAL_CUE_RE.search(evidence):
         polarity = 'historical'
-    elif _UNCERTAIN_CUE_RE.search(evidence):
-        polarity = 'uncertain'
     else:
         polarity = 'positive'
 
@@ -1188,7 +1192,27 @@ def _validate_value_polarity(
     )
     if _HISTORICAL_CUE_RE.search(evidence):
         metadata['temporal_qualifier'] = 'historical_or_superseded'
-    return replace(candidate, metadata=metadata), None
+    # CME's shrunk writer consumes the typed candidate polarity, not this
+    # diagnostic metadata.  Carry only explicit negative evidence across that
+    # boundary; uncertain/historical/conditional cues remain fail-closed.
+    typed_polarity = (
+        AssertionPolarity.NEGATIVE
+        if polarity == 'negative'
+        else AssertionPolarity.UNKNOWN
+        if polarity in {'historical', 'conditional', 'uncertain'}
+        else candidate.polarity
+    )
+    assertion_mode = candidate.assertion_mode
+    if polarity == 'conditional':
+        assertion_mode = AssertionMode.HYPOTHETICAL
+    elif polarity in {'historical', 'uncertain'}:
+        assertion_mode = AssertionMode.UNKNOWN
+    return replace(
+        candidate,
+        metadata=metadata,
+        polarity=typed_polarity,
+        assertion_mode=assertion_mode,
+    ), None
 
 
 def _candidate_dump(candidate: StateCandidate) -> dict[str, Any]:

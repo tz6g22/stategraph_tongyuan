@@ -8,6 +8,7 @@ premise corrections.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from stategraph.retrieval import CurrentStateRetrieval
 from stategraph.state import StateStatus
@@ -19,6 +20,8 @@ class AnswerContext:
     context: tuple[str, ...]
     state_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
+    confirmed_state_ids: tuple[str, ...] = ()
+    revalidation_states: tuple[dict[str, Any], ...] = ()
 
 
 def build_answer_context(retrieval: CurrentStateRetrieval) -> AnswerContext:
@@ -46,6 +49,13 @@ def build_answer_context(retrieval: CurrentStateRetrieval) -> AnswerContext:
         context=tuple(retrieval.grounded_context()),
         state_ids=retrieval.all_state_ids,
         evidence_ids=evidence_ids,
+        confirmed_state_ids=tuple(
+            item.state.state_id for item in retrieval.grounded_states
+            if not item.state.metadata.get('needs_revalidation')
+        ),
+        revalidation_states=tuple(
+            dict(signal) for signal in retrieval.revalidation_signals
+        ),
     )
 
 

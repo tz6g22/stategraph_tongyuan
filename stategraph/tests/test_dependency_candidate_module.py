@@ -57,6 +57,26 @@ class DependencyCandidateModuleTests(unittest.TestCase):
         self.assertEqual([(c.prerequisite_state_id, c.dependent_state_id) for c in candidates], [('s1', 's2')])
         self.assertIsNone(candidates[0].proposed_relation)
 
+    def test_same_canonical_subject_causal_reference_generates_candidate_without_name(self) -> None:
+        prerequisite = _state(
+            'job', entity='user', attribute='current_job', value='Microsoft',
+            observation_id='o1', evidence='My current job is at Microsoft.',
+        )
+        dependent = _state(
+            'location', entity='user', attribute='work_location', value='Sydney',
+            observation_id='o2', evidence='My location follows because of my current job.',
+        )
+        candidates = generate_dependency_candidates(
+            Observation(dependent.metadata['evidence_span'], NOW, 'g', observation_id='o2'),
+            new_states=(dependent,), all_states=(prerequisite, dependent),
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            (candidates[0].prerequisite_state_id, candidates[0].dependent_state_id),
+            ('job', 'location'),
+        )
+        self.assertIn('implicit_canonical_reference', candidates[0].signals)
+
     def test_conditional_prerequisite_is_candidate_only(self) -> None:
         prerequisite = _state(
             's1', entity='person', attribute='availability', value='available',

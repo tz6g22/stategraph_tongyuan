@@ -17,6 +17,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = ROOT / 'outputs' / 'agent_memory_4way_2x10'
 CONFIG_PATH = ROOT / 'evaluation_protocol' / 'shared_answer_generation.yaml'
+FORMAL_DATASET_CONFIG_PATH = ROOT / 'evaluation_protocol' / 'statechangebench_formal_dataset.json'
 DATASETS = ('memoryagentbench_conflict', 'memora')
 METHODS = ('stategraph', 'graphiti', 'mem0', 'amem')
 RUN_ID = 'agent-memory-4way-2x10-v1'
@@ -61,14 +62,59 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def load_answer_config() -> tuple[dict[str, Any], bytes, str]:
-    config_bytes = CONFIG_PATH.read_bytes()
+def load_answer_config(
+    path: Path | None = None, *, require_formal: bool = True
+) -> tuple[dict[str, Any], bytes, str]:
+    config_bytes = (path or CONFIG_PATH).read_bytes()
     config = yaml.safe_load(config_bytes)
-    if config['model']['provider'] != 'openai' or config['model']['name'] != 'gpt-5-nano':
+    if require_formal and (
+        config['model']['provider'] != 'openai' or config['model']['name'] != 'gpt-5-nano'
+    ):
         raise RuntimeError('shared answer configuration is not pinned to OpenAI gpt-5-nano')
+    if config['model']['provider'] == 'openai':
+        config['model'].setdefault('reasoning_effort', 'minimal')
+    if require_formal and config['model']['reasoning_effort'] != 'minimal':
+        raise RuntimeError('formal answer protocol requires minimal reasoning effort')
     if config['context']['ordering'] != 'retrieval_order':
         raise RuntimeError('comparison requires retrieval-order context')
     return config, config_bytes, sha256_bytes(config_bytes)
+
+
+def load_statechangebench_dataset(*, source_only: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    config_bytes = FORMAL_DATASET_CONFIG_PATH.read_bytes()
+    config = json.loads(config_bytes)
+    source_path = Path(config['dataset_path'])
+    source_bytes = source_path.read_bytes()
+    if sha256_bytes(source_bytes) != config['dataset_sha256']:
+        raise RuntimeError('formal StateChangeBench dataset SHA256 mismatch')
+    rows = read_jsonl(source_path)
+    expected_ids = [f'SCB_{index:03d}' for index in range(1, config['case_count'] + 1)]
+    case_ids = [row['case_id'] for row in rows]
+    if len(rows) != config['case_count'] or case_ids != expected_ids:
+        raise RuntimeError('formal StateChangeBench case count/order mismatch')
+    if source_only:
+        rows = [statechangebench_runtime_case(row) for row in rows]
+    return config, rows, sha256_bytes(config_bytes)
+
+
+def statechangebench_runtime_case(row: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist inference inputs; benchmark labels never enter runtime payloads."""
+    return {
+        'case_id': row['case_id'],
+        'history': [{'id': item['id'], 'text': item['text']} for item in row['history']],
+        'new_observation': {
+            'id': row['new_observation']['id'],
+            'text': row['new_observation']['text'],
+        },
+        'query': row['query'],
+    }
+
+
+def answer_base_url(model_config: dict[str, Any]) -> str:
+    return os.environ.get(
+        model_config.get('base_url_env', ''),
+        os.environ.get('OPENAI_BASE_URL', model_config['base_url']),
+    ).rstrip('/')
 
 
 def bounded_context(items: list[Any], config: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -146,7 +192,7 @@ def call_deepseek(
     """
 
     model_config = config['model']
-    base_url = os.environ.get(model_config['base_url_env'], model_config['base_url']).rstrip('/')
+    base_url = answer_base_url(model_config)
     if model_config['provider'] == 'openai':
         from openai import OpenAI
 
@@ -154,7 +200,7 @@ def call_deepseek(
             'model': model_config['name'],
             'input': messages,
             'max_output_tokens': max_tokens or model_config['max_tokens'],
-            'reasoning': {'effort': 'minimal'},
+            'reasoning': {'effort': model_config['reasoning_effort']},
             'store': False,
         }
         if json_object:
@@ -180,10 +226,11 @@ def call_deepseek(
         }
     payload: dict[str, Any] = {
         'model': model_config['name'],
-        'temperature': model_config['temperature'],
         'max_tokens': max_tokens or model_config['max_tokens'],
         'messages': messages,
     }
+    if model_config.get('temperature') is not None:
+        payload['temperature'] = model_config['temperature']
     if model_config.get('seed') is not None:
         payload['seed'] = model_config['seed']
     if json_object:

@@ -82,7 +82,7 @@ def allowed_category(path: Path) -> str:
         return 'EXTERNAL_BASELINE'
     if value.startswith('stategraph/state/extraction_v2.py'):
         return 'REQUIRED_LEGACY_COMPATIBILITY'
-    if value.startswith('external_baselines/graphiti/'):
+    if value.startswith('baselines/graphiti/'):
         return 'EXTERNAL_BASELINE'
     if value.startswith('stategraph/backend/graphiti.py'):
         return 'REQUIRED_OPTIONAL_BACKEND'
@@ -429,7 +429,7 @@ def main() -> int:
         'stategraph/evaluation/**': 'evaluation/runtime adapter, not native runtime',
         'stategraph/tests/**': 'legacy compatibility fixtures',
         'scripts/**': 'benchmark/evaluation/migration scripts',
-        'external_baselines/graphiti/**': 'external baseline',
+        'baselines/graphiti/**': 'external baseline',
     }
     write_json('PROJECT_STATE_CORRECTION.json', {
         'current_stage': 'GRAPHITI DECOUPLING',

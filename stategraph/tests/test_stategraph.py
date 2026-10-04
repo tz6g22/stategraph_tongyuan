@@ -1103,8 +1103,18 @@ class AnswerContextSerializationTests(unittest.IsolatedAsyncioTestCase):
             self._state('Alice', 'availability', 'free'), (evidence,), 1.0
         ).render()
 
-        self.assertIn('STATE\nSubject: R-1\nField: State\nValue: Closed\nStatus: CURRENT', canonical)
-        self.assertIn('Subject: Alice\nField: availability\nValue: free\nStatus: CURRENT', fallback)
+        self.assertIn(
+            'STATE\nSubject: R-1\nField: State\nValue: Closed\n'
+            'Time scope: UNSPECIFIED\nCondition scope: UNSPECIFIED\n'
+            'Polarity: POSITIVE\nStatus: CURRENT',
+            canonical,
+        )
+        self.assertIn(
+            'Subject: Alice\nField: availability\nValue: free\n'
+            'Time scope: UNSPECIFIED\nCondition scope: UNSPECIFIED\n'
+            'Polarity: POSITIVE\nStatus: CURRENT',
+            fallback,
+        )
 
     def test_large_shared_evidence_is_bounded_per_state_not_repeated_in_full(self) -> None:
         long_evidence = (
@@ -1142,7 +1152,12 @@ class AnswerContextSerializationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         rendered = '\n'.join((await graph.retrieve('R-1 state')).grounded_context())
-        self.assertIn('Value: Closed\nStatus: CURRENT', rendered)
+        self.assertIn(
+            'Value: Closed\nTime scope: UNSPECIFIED\nCondition scope: UNSPECIFIED\n'
+            'Polarity: POSITIVE\nQuery-local resolution: ACTIVE_FOR_QUERY\n'
+            'State/query scope relation: EXACT\nStatus: CURRENT',
+            rendered,
+        )
         self.assertNotIn('Value: Assess\nStatus: STALE', rendered)
 
 

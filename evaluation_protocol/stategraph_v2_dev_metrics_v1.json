@@ -1,0 +1,25 @@
+{
+  "metric_version": "stategraph-dev5-module-metrics-v1",
+  "split": "DEVELOPMENT_SANITY_ONLY",
+  "matching": {
+    "fact_identity": ["supporting observation id", "normalized entity/canonical subject", "normalized attribute", "normalized value", "polarity"],
+    "normalization": "casefold; Unicode alphanumeric tokens; punctuation, hyphen, and underscore become token boundaries",
+    "evidence": "evidence unit must point to the same source observation and its exact span must round-trip within that observation",
+    "no_semantic_llm_judge": true
+  },
+  "denominators": {
+    "information_retention_recall": "all gold old-state and new-state facts in the selected case history",
+    "fact_semantic_precision_recall": "all non-rejected structured MemoryFact claims versus gold facts, paired by source observation",
+    "evidence_precision_recall": "structured claims with exact evidence-unit grounding; true positives additionally require exact gold fact identity",
+    "old_state_candidate_recall": "gold root-revision pairs for which a new-state candidate was proposed",
+    "correct_old_new_pair_rate": "all gold root-revision pairs",
+    "direct_revision_prf": "gold root-revision pairs with explicit update/invalidation/temporary-exception relation versus traced production revision edges",
+    "seed_prf": "gold direct invalidation target states versus production direct seed states",
+    "dependency_prf": "gold typed dependency endpoint pairs versus persisted production dependency relations",
+    "propagation_prf": "gold propagated invalidation target states versus production propagation-step targets",
+    "false_destructive_rate": "false CURRENT-to-STALE/HISTORICAL transitions divided by all destructive transitions"
+  },
+  "method_failures": "A terminal METHOD_FAILURE contributes missing method output to recall denominators; infrastructure-incomplete cases are not scored.",
+  "answer_metrics": "Normalized exact match and token F1 use the frozen official StateChangeBench normalization and are development diagnostics only.",
+  "gold_access": "Only after every DEV5 prediction is sealed and seal/source/config hashes verify."
+}

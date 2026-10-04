@@ -13,7 +13,8 @@ from stategraph.state.schema import (
 )
 from stategraph.state.shrunk import (
     CardinalityRegistry, ChangeVerificationResponse, FieldPolicy,
-    SemanticVerdict, ShrunkStateRepository,
+    SemanticVerdict, ShrunkStateRepository, _ScopeRelation, _negative_matches_old,
+    _proposition, _scope_relation,
 )
 
 BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -27,6 +28,10 @@ def registry():
         'meeting.time': FieldPolicy(SlotCardinality.FUNCTIONAL, 'time'),
         'meeting.location': FieldPolicy(SlotCardinality.FUNCTIONAL, 'location'),
         'meeting.status': FieldPolicy(SlotCardinality.FUNCTIONAL, 'status'),
+        'availability': FieldPolicy(SlotCardinality.FUNCTIONAL, 'availability'),
+        'favorite_color': FieldPolicy(SlotCardinality.FUNCTIONAL, 'favorite_color'),
+        'status': FieldPolicy(SlotCardinality.FUNCTIONAL, 'status'),
+        'membership': FieldPolicy(SlotCardinality.SET_VALUED, 'membership'),
     })
 
 
@@ -348,6 +353,404 @@ class ShrunkRevisionTests(unittest.IsolatedAsyncioTestCase):
         current = await self.repo.list_states(statuses={StateStatus.CURRENT})
         self.assertEqual(len(current), 1)
         self.assertEqual(current[0].value, 'Oslo')
+
+
+class SemanticNegativeRevisionTests(unittest.IsolatedAsyncioTestCase):
+    async def write(self, field, value, *, step, negative=False, text=None,
+                    scope=None):
+        candidate, evidence = assertion(
+            field, value, subject='Eva', step=step, negative=negative,
+            text=text, scope=scope,
+        )
+        return await self.repo.ingest(candidate, evidence)
+
+    async def asyncSetUp(self):
+        self.repo = ShrunkStateRepository(registry())
+
+    async def test_negative_same_semantic_value_revises(self):
+        old = await self.write('availability', 'available', step=0,
+                               text='Eva availability is available.')
+        result = await self.write('availability', 'available', step=1,
+                                  negative=True,
+                                  text='Eva availability is not available.')
+        self.assertEqual(result.invalidated_state_ids, (old.state.state_id,))
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.STALE)
+
+    async def test_natural_negative_copular_forms_share_revision_semantics(self):
+        for step, phrase in enumerate((
+            'Eva availability is not available.',
+            'Eva is no longer available.',
+            'Eva is unavailable.',
+        ), 1):
+            with self.subTest(phrase=phrase):
+                self.repo = ShrunkStateRepository(registry())
+                old = await self.write('availability', 'available', step=0,
+                                       text='Eva availability is available.')
+                negative_value = 'unavailable' if phrase == 'Eva is unavailable.' else 'available'
+                result = await self.write('availability', negative_value, step=step,
+                                          negative=True, text=phrase)
+                self.assertEqual(result.invalidated_state_ids, (old.state.state_id,))
+
+    async def test_same_explicit_weekday_proposition_revises(self):
+        old = await self.write('availability', 'available on Wednesday', step=0,
+                               text='Eva availability is available on Wednesday.')
+        result = await self.write('availability', 'available on Wednesday', step=1,
+                                  negative=True,
+                                  text='Eva availability is no longer available on Wednesday.')
+        self.assertEqual(result.invalidated_state_ids, (old.state.state_id,))
+
+    async def test_narrow_negative_does_not_revise_unscoped_positive(self):
+        old = await self.write('availability', 'available', step=0,
+                               text='Eva availability is available.')
+        result = await self.write('availability', 'available on Wednesday', step=1,
+                                  negative=True,
+                                  text='Eva availability is not available on Wednesday.')
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.CURRENT)
+        self.assertEqual(result.state.status, StateStatus.UNCERTAIN)
+
+    async def test_temporal_mismatch_does_not_revise_thursday(self):
+        old = await self.write('availability', 'available on Thursday', step=0,
+                               text='Eva availability is available on Thursday.')
+        result = await self.write('availability', 'available on Wednesday', step=1,
+                                  negative=True,
+                                  text='Eva availability is not available on Wednesday.')
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_negative_other_value_does_not_revise_same_functional_slot(self):
+        old = await self.write('favorite_color', 'red', step=0,
+                               text='Eva favorite_color is red.')
+        result = await self.write('favorite_color', 'blue', step=1,
+                                  negative=True,
+                                  text='Eva favorite_color is not blue.')
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.CURRENT)
+        self.assertEqual(result.state.status, StateStatus.UNCERTAIN)
+
+    async def test_no_longer_approved_revises_same_value(self):
+        old = await self.write('status', 'approved', step=0,
+                               text='Eva status is approved.')
+        result = await self.write('status', 'approved', step=1, negative=True,
+                                  text='Eva status is no longer approved.')
+        self.assertEqual(result.invalidated_state_ids, (old.state.state_id,))
+
+    async def test_no_longer_member_removes_exact_set_member(self):
+        old = await self.write('membership', 'member', step=0,
+                               text='Eva membership is a member.')
+        result = await self.write('membership', 'member', step=1, negative=True,
+                                  text='Eva membership is no longer a member.')
+        self.assertEqual(result.invalidated_state_ids, (old.state.state_id,))
+
+    async def test_duplicate_current_versions_are_all_safely_revised(self):
+        old = await self.write('availability', 'available', step=0,
+                               text='Eva availability is available.')
+        duplicate = replace(old.state, state_id='duplicate-current-version')
+        await self.repo._store.apply((duplicate,))
+        result = await self.write('availability', 'available', step=1, negative=True,
+                                  text='Eva availability is not available.')
+        self.assertEqual(set(result.invalidated_state_ids),
+                         {old.state.state_id, duplicate.state_id})
+        self.assertEqual({state.status for state in await self.repo.list_states()
+                          if state.state_id in result.invalidated_state_ids},
+                         {StateStatus.STALE})
+
+    async def test_conflicting_current_values_only_matching_proposition_is_revised(self):
+        available = await self.write('availability', 'available', step=0,
+                                     text='Eva availability is available.')
+        busy = await self.write('availability', 'busy', step=1,
+                                text='Eva availability is busy.')
+        # Model a pre-existing conflicting active snapshot without changing
+        # either node's grounded value or evidence.
+        await self.repo._store.apply((replace(available.state, status=StateStatus.CURRENT),))
+        result = await self.write('availability', 'available', step=2, negative=True,
+                                  text='Eva availability is not available.')
+        self.assertEqual(result.invalidated_state_ids, (available.state.state_id,))
+        self.assertEqual((await self.repo.get_state(available.state.state_id)).status,
+                         StateStatus.STALE)
+        self.assertEqual((await self.repo.get_state(busy.state.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_ambiguous_negative_evidence_fails_closed(self):
+        old = await self.write('availability', 'available', step=0,
+                               text='Eva availability is available.')
+        result = await self.write('availability', 'available', step=1, negative=True,
+                                  text='Eva may not be available.')
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual(result.state.status, StateStatus.UNCERTAIN)
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_positive_reaffirmation_does_not_invalidate(self):
+        old = await self.write('availability', 'available', step=0,
+                               text='Eva availability is available.')
+        result = await self.write('availability', 'available', step=1,
+                                  text='Eva remains available.')
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual(result.state.status, StateStatus.UNCERTAIN)
+        self.assertEqual((await self.repo.get_state(old.state.state_id)).status,
+                         StateStatus.CURRENT)
+
+    def atomic_candidate(self, value, *, step, polarity, time_text=None,
+                         condition=None, text=None, canonical_value=None,
+                         time_bounds=None):
+        text = text or (
+            f"Eva is {'no longer ' if polarity == AssertionPolarity.NEGATIVE else ''}"
+            f"{value}" + (f" on {time_text}" if time_text else '') + '.'
+        )
+        candidate, evidence = assertion(
+            'availability', value, subject='Eva', step=step,
+            negative=polarity == AssertionPolarity.NEGATIVE, text=text,
+            condition=condition, scope=time_bounds,
+        )
+        candidate = replace(candidate, metadata={
+            'atomic_state_proposition': {
+                'contract': 'ATOMIC_STATE_PROPOSITION_V1',
+                'validation': 'VALID',
+                'entity': 'Eva',
+                'canonical_attribute': 'availability',
+                'canonical_value': canonical_value or (
+                    'available' if value in {'free', 'available'} else value
+                ),
+                'polarity': polarity.value,
+                'time_scope': {
+                    'start': time_bounds.start.isoformat() if time_bounds and time_bounds.start else None,
+                    'end': time_bounds.end.isoformat() if time_bounds and time_bounds.end else None,
+                    'text': time_text,
+                    'kind': ('TEXTUAL' if time_text else
+                             'STRUCTURED' if time_bounds else 'UNSPECIFIED'),
+                },
+                'condition_scope': {
+                    'conditions': list(candidate.condition_scope.conditions),
+                    'description': candidate.condition_scope.description,
+                },
+                'raw_relation': 'availability',
+                'raw_value': value,
+                'evidence_refs': [evidence.evidence_id],
+                'scope_policy': 'SPECIFIC_EXCEPTION_REQUIRES_LATER_RESOLUTION',
+            },
+        })
+        return candidate, evidence
+
+    async def seed_atomic_current(self, value, *, step, time_text=None,
+                                  condition=None, text=None):
+        candidate, evidence = self.atomic_candidate(
+            value, step=step, polarity=AssertionPolarity.POSITIVE,
+            time_text=time_text, condition=condition, text=text,
+        )
+        grounded = replace(
+            candidate,
+            subject_provenance=ShrunkStateRepository._ground(candidate, evidence),
+        )
+        node = replace(
+            self.repo._node(grounded, evidence),
+            state_id=f'old-{step}-{value}-{time_text}',
+            status=StateStatus.CURRENT,
+        )
+        await self.repo._store.save_evidence(evidence)
+        await self.repo._store.apply((node,))
+        return node
+
+    async def test_atomic_scope_and_relation_family_drive_exact_revision(self):
+        broad = await self.seed_atomic_current('available', step=0, text='Eva is available.')
+        scoped = await self.seed_atomic_current(
+            'free', step=1, time_text='Wednesday', text='Eva was free on Wednesday.'
+        )
+        candidate, evidence = self.atomic_candidate(
+            'available', step=2, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertEqual(result.invalidated_state_ids, (scoped.state_id,))
+        self.assertEqual((await self.repo.get_state(scoped.state_id)).status,
+                         StateStatus.STALE)
+        self.assertEqual((await self.repo.get_state(broad.state_id)).status,
+                         StateStatus.CURRENT)
+        self.assertEqual(result.state.status, StateStatus.CURRENT)
+
+    async def test_atomic_scope_rejects_disjoint_and_broad_scoped_mismatch(self):
+        thursday = await self.seed_atomic_current(
+            'available', step=0, time_text='Thursday',
+            text='Eva is available on Thursday.',
+        )
+        candidate, evidence = self.atomic_candidate(
+            'available', step=1, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(thursday.state_id)).status,
+                         StateStatus.CURRENT)
+        self.repo = ShrunkStateRepository(registry())
+        broad = await self.seed_atomic_current('available', step=0,
+                                               text='Eva is available.')
+        candidate, evidence = self.atomic_candidate(
+            'available', step=1, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(broad.state_id)).status,
+                         StateStatus.CURRENT)
+
+        self.repo = ShrunkStateRepository(registry())
+        broad = await self.seed_atomic_current('available', step=0,
+                                               text='Eva is available.')
+        thursday = await self.seed_atomic_current(
+            'available', step=1, time_text='Thursday',
+            text='Eva is available on Thursday.',
+        )
+        candidate, evidence = self.atomic_candidate(
+            'available', step=2, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(broad.state_id)).status,
+                         StateStatus.CURRENT)
+        self.assertEqual((await self.repo.get_state(thursday.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_same_value_different_scope_is_not_provenance_merge(self):
+        broad = await self.seed_atomic_current(
+            'available', step=0, text='Eva is available.'
+        )
+        candidate, evidence = self.atomic_candidate(
+            'available', step=1, polarity=AssertionPolarity.POSITIVE,
+            time_text='Wednesday', text='Eva is available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertIsNone(result.duplicate_of)
+        self.assertEqual(result.state.status, StateStatus.UNCERTAIN)
+        self.assertEqual((await self.repo.get_state(broad.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_atomic_condition_mismatch_fails_closed(self):
+        flight = ConditionScope.from_mapping({'flight_cancelled': 'true'})
+        other = ConditionScope.from_mapping({'flight_cancelled': 'false'})
+        old = await self.seed_atomic_current(
+            'available', step=0, time_text='Wednesday', condition=flight,
+            text='Eva is available on Wednesday.',
+        )
+        candidate, evidence = self.atomic_candidate(
+            'available', step=1, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', condition=other,
+            text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertFalse(result.invalidated_state_ids)
+        self.assertEqual((await self.repo.get_state(old.state_id)).status,
+                         StateStatus.CURRENT)
+
+    async def test_scope_relation_and_canonical_value_are_writer_inputs(self):
+        free, free_evidence = self.atomic_candidate(
+            'free', step=0, polarity=AssertionPolarity.POSITIVE,
+            time_text='Wednesday', text='Eva was free on Wednesday.',
+        )
+        unavailable, unavailable_evidence = self.atomic_candidate(
+            'available', step=1, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        old = self.repo._node(free, free_evidence)
+        new = self.repo._node(unavailable, unavailable_evidence)
+        old_prop = _proposition(old, free_evidence)
+        new_prop = _proposition(new, unavailable_evidence)
+        self.assertEqual(old_prop.value, 'available')
+        self.assertEqual(old_prop.raw_value, 'free')
+        self.assertEqual(new_prop.value, 'available')
+        self.assertEqual(old_prop.value_key, new_prop.value_key)
+        self.assertEqual(_scope_relation(new_prop, old_prop), _ScopeRelation.EXACT)
+        self.assertTrue(_negative_matches_old(new_prop, old_prop))
+
+        broad, broad_evidence = self.atomic_candidate(
+            'available', step=0, polarity=AssertionPolarity.POSITIVE,
+            text='Eva is available.',
+        )
+        broad_prop = _proposition(self.repo._node(broad, broad_evidence), broad_evidence)
+        self.assertEqual(_scope_relation(new_prop, broad_prop), _ScopeRelation.NARROWER)
+        self.assertFalse(_negative_matches_old(new_prop, broad_prop))
+
+    async def test_exact_scope_selects_matching_value_and_revises_semantic_duplicates(self):
+        available = await self.seed_atomic_current(
+            'available', step=0, time_text='Wednesday',
+            text='Eva is available on Wednesday.',
+        )
+        busy_candidate, busy_evidence = self.atomic_candidate(
+            'busy', step=1, polarity=AssertionPolarity.POSITIVE,
+            time_text='Wednesday', text='Eva is busy on Wednesday.',
+            canonical_value='busy',
+        )
+        busy = replace(
+            self.repo._node(busy_candidate, busy_evidence),
+            state_id='old-busy-wednesday', status=StateStatus.CURRENT,
+        )
+        duplicate = await self.seed_atomic_current(
+            'free', step=2, time_text='Wednesday',
+            text='Eva was free on Wednesday.',
+        )
+        await self.repo._store.save_evidence(busy_evidence)
+        await self.repo._store.apply((busy,))
+        # The available/free pair is one canonical proposition; add the first
+        # version back as an active duplicate to exercise deterministic handling.
+        await self.repo._store.apply((replace(available, status=StateStatus.CURRENT),))
+        candidate, evidence = self.atomic_candidate(
+            'available', step=3, polarity=AssertionPolarity.NEGATIVE,
+            time_text='Wednesday', text='Eva is no longer available on Wednesday.',
+        )
+        result = await self.repo.ingest(candidate, evidence)
+        self.assertEqual(set(result.invalidated_state_ids), {available.state_id, duplicate.state_id})
+        self.assertEqual((await self.repo.get_state(busy.state_id)).status,
+                         StateStatus.CURRENT)
+        self.assertEqual({(await self.repo.get_state(state_id)).status
+                          for state_id in result.invalidated_state_ids},
+                         {StateStatus.STALE})
+
+    async def test_scope_classifier_keeps_unresolvable_relations_unknown(self):
+        def proposition(time_text, *, step, condition=None, time_bounds=None,
+                        ambiguous=False):
+            candidate, evidence = self.atomic_candidate(
+                'available', step=step, polarity=AssertionPolarity.POSITIVE,
+                time_text=time_text, condition=condition,
+                time_bounds=time_bounds,
+                text=f'Eva is available on {time_text or "some day"}.',
+            )
+            if ambiguous:
+                metadata = dict(candidate.metadata)
+                atom = dict(metadata['atomic_state_proposition'])
+                atom['validation'] = 'AMBIGUOUS_FAIL_CLOSED'
+                metadata['atomic_state_proposition'] = atom
+                candidate = replace(candidate, metadata=metadata)
+            return _proposition(self.repo._node(candidate, evidence), evidence)
+
+        exact = proposition('Wednesday', step=0)
+        self.assertEqual(_scope_relation(exact, exact), _ScopeRelation.EXACT)
+        self.assertEqual(_scope_relation(proposition(None, step=1), exact),
+                         _ScopeRelation.BROADER)
+        self.assertEqual(_scope_relation(exact, proposition(None, step=2)),
+                         _ScopeRelation.NARROWER)
+        self.assertEqual(_scope_relation(proposition('Thursday', step=3), exact),
+                         _ScopeRelation.DISJOINT)
+        self.assertEqual(_scope_relation(proposition('Wednesday afternoon', step=4), exact),
+                         _ScopeRelation.NARROWER)
+        flight = ConditionScope.from_mapping({'flight_cancelled': 'true'})
+        holiday = ConditionScope.from_mapping({'holiday': 'true'})
+        self.assertEqual(_scope_relation(
+            proposition('Wednesday', step=5, condition=flight),
+            proposition('Wednesday', step=6, condition=holiday),
+        ), _ScopeRelation.OVERLAP)
+        self.assertEqual(_scope_relation(
+            proposition('Wednesday', step=7, ambiguous=True), exact,
+        ), _ScopeRelation.UNKNOWN)
+        broad_interval = TimeScope(BASE, BASE + timedelta(days=10))
+        narrow_interval = TimeScope(BASE + timedelta(days=2), BASE + timedelta(days=4))
+        self.assertEqual(_scope_relation(
+            proposition(None, step=8, time_bounds=narrow_interval),
+            proposition(None, step=9, time_bounds=broad_interval),
+        ), _ScopeRelation.NARROWER)
 
 
 class VerifierBoundaryTests(unittest.IsolatedAsyncioTestCase):

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from stategraph.state.dependency import DependencyCandidate
-from stategraph.state.schema import RelationType, StateNode
+from stategraph.state.schema import RelationType, StateNode, canonical_attribute_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +16,14 @@ class RelationTypingResult:
     relation_type: RelationType | None
     reason: str
     evidence_span: str | None
+    visibility_path: str = 'safe_reject'
+    selection_score: int = 0
+    selection_signals: tuple[str, ...] = ()
+    budget_truncated: bool = False
+
+
+MAX_UNCERTAIN_TYPING_BYPASS_PER_DEPENDENT = 2
+MAX_UNCERTAIN_TYPING_BYPASS_PER_BATCH = 16
 
 
 _STOPWORDS = frozenset(
@@ -26,10 +34,11 @@ _STOPWORDS = frozenset(
     }
 )
 _MARKER = re.compile(
-    r'\b(?:because|requires?|only\s+(?:if|when)|provided\s+that|after|'
+    r'\b(?:because|due\s+to|as\s+a\s+result\s+of|requires?|only\s+(?:if|when)|provided\s+that|after|'
     r'without|unless|derived\s+from|computed\s+from|calculated\s+from|'
     r'inferred\s+from|summar(?:y|ized)\s+from|based\s+on|depends?\s+on|'
-    r'relies?\s+on|necessary\s+for)\b',
+    r'relies?\s+on|necessary\s+for|causes?|leads?\s+to|enables?|'
+    r'affects?|results?\s+in|is\s+required\s+for|is\s+needed\s+for)\b',
     re.IGNORECASE,
 )
 _DERIVATION = re.compile(
@@ -334,12 +343,25 @@ def _source_context(evidence: str) -> tuple[frozenset[str], re.Match[str] | None
     return _tokens(text), marker
 
 
+def _same_subject(left: StateNode, right: StateNode) -> bool:
+    return bool(left.identity_key[0]) and left.identity_key[0] == right.identity_key[0]
+
+
 def _base_type(
     candidate: DependencyCandidate,
     prerequisite: StateNode,
     dependent: StateNode,
 ) -> tuple[RelationType | None, str, str | None]:
     evidence = _evidence(candidate)
+    same_slot = (
+        _same_subject(prerequisite, dependent)
+        and canonical_attribute_id(prerequisite.canonical_field_id or prerequisite.attribute)
+        == canonical_attribute_id(dependent.canonical_field_id or dependent.attribute)
+    )
+    if prerequisite.state_id == dependent.state_id:
+        return None, 'source and target are the same state identity', None
+    if same_slot:
+        return None, 'prerequisite and dependent represent the same canonical state slot', None
     if candidate.proposed_relation is not None:
         # Discovery labels are hints, not proof.  Preserve an upstream type only
         # when the candidate also carries a directional/grounded signal; an
@@ -347,35 +369,49 @@ def _base_type(
         if not _has_directional_signal(candidate, prerequisite, dependent):
             return None, 'proposed relation lacks directional evidence', None
         return candidate.proposed_relation, 'preserved grounded upstream proposed relation', evidence
-    source_tokens, marker = _source_context(evidence)
-    same_slot = (
-        prerequisite.entity.strip().casefold() == dependent.entity.strip().casefold()
-        and prerequisite.attribute.strip().casefold() == dependent.attribute.strip().casefold()
-    )
-    if same_slot:
-        return None, 'prerequisite and dependent represent the same state slot', None
+    _, marker = _source_context(evidence)
     # Association-only signals never reach the verifier.  A candidate must have
     # a directional proposal/selector/provenance signal; a causal marker alone is
     # accepted only when its evidence is grounded by the candidate path.
     if not _has_directional_signal(candidate, prerequisite, dependent):
         return None, 'candidate lacks a directional dependency signal', None
-    if (
-        marker is not None
-        and not source_tokens.intersection(_tokens(prerequisite.entity))
-    ):
-        return None, 'causal evidence lacks a grounded prerequisite signal', None
-    if prerequisite.observation_id == dependent.observation_id:
-        old_evidence = str(prerequisite.metadata.get('evidence_span') or '')
-        new_evidence = str(dependent.metadata.get('evidence_span') or '')
-        if old_evidence and new_evidence and old_evidence.casefold() == new_evidence.casefold():
-            return None, 'same-observation evidence is not independent provenance', None
+    source_named = bool(_tokens(evidence) & _tokens(prerequisite.entity))
+    implicit_source_grounded = (
+        _same_subject(prerequisite, dependent)
+        or bool(set(prerequisite.evidence_refs) & set(dependent.evidence_refs))
+        or bool(set(candidate.signals) & {
+            'explicit_semantic_relation', 'existing_semantic_relation',
+        })
+    )
+    if marker is not None and not source_named and not implicit_source_grounded:
+        return None, 'causal evidence lacks grounded source reference', None
+    same_observation_evidence = (
+        prerequisite.observation_id == dependent.observation_id
+        and str(prerequisite.metadata.get('evidence_span') or '').strip()
+        and str(dependent.metadata.get('evidence_span') or '').strip()
+        and str(prerequisite.metadata.get('evidence_span')).casefold()
+        == str(dependent.metadata.get('evidence_span')).casefold()
+    )
     if _DERIVATION.search(evidence):
-        return RelationType.DERIVED_FROM, 'explicit derivation provenance', evidence
-    if _ACTION_CUE.search(evidence) and _ACTION_PRECONDITION.search(evidence):
-        return RelationType.AFFECTS_ACTION, 'explicit action-precondition provenance', evidence
-    if marker is None:
-        return RelationType.DEPENDS_ON, 'directional candidate; verification decides strength', evidence
-    return RelationType.DEPENDS_ON, 'grounded causal/conditional provenance; verification decides strength', evidence
+        relation = RelationType.DERIVED_FROM
+        reason = 'explicit derivation provenance'
+    elif _ACTION_CUE.search(evidence) and _ACTION_PRECONDITION.search(evidence):
+        relation = RelationType.AFFECTS_ACTION
+        reason = 'explicit action-precondition provenance'
+    elif marker is None:
+        relation = RelationType.DEPENDS_ON
+        reason = 'directional candidate; verification decides strength'
+    else:
+        relation = RelationType.DEPENDS_ON
+        reason = 'grounded causal/conditional provenance; verification decides strength'
+    implicit_directional = bool(set(candidate.signals) & {
+        'explicit_source_relation', 'causal_text_grounding',
+    })
+    if not source_named and implicit_source_grounded and (marker is not None or implicit_directional):
+        reason = f'typing_uncertain: prerequisite reference is implicit; {reason}'
+    if same_observation_evidence:
+        reason = f'typing_uncertain: endpoints share one observation span; {reason}'
+    return relation, reason, evidence
 
 
 def _has_directional_signal(
@@ -404,11 +440,9 @@ def type_relation_candidates(
 ) -> tuple[RelationTypingResult, ...]:
     """Type candidates conservatively without deciding dependency strength.
 
-    Untyped causal candidates are first checked for independent grounded source
-    evidence.  When several historical states can explain one dependent, the
-    latest evidence-grounded source wins; older alternatives are rejected rather
-    than all being accepted as relations.  This is provenance resolution, not
-    a gold- or case-specific rule.
+    Structurally impossible endpoints are rejected. Plausible candidates with
+    implicit references or competing provenance receive a deterministic,
+    bounded verifier-visible lane.
     """
 
     order = state_order or {}
@@ -444,11 +478,87 @@ def type_relation_candidates(
         own_key = (own_overlap, order.get(prerequisite.state_id, 0), index)
         if peers and max(peers) > own_key:
             provisional[index] = RelationTypingResult(
-                result.candidate, None,
-                'older or weaker provenance superseded by a later grounded source',
-                None,
+                result.candidate, result.relation_type,
+                'typing_uncertain: older or weaker provenance may still be jointly required',
+                result.evidence_span,
             )
-    return tuple(provisional)
+
+    typed = [item for item in provisional if item.relation_type is not None and not item.reason.startswith('typing_uncertain:')]
+    uncertain = [item for item in provisional if item.relation_type is not None and item.reason.startswith('typing_uncertain:')]
+    def score(item: RelationTypingResult) -> tuple[int, tuple[str, ...]]:
+        candidate = item.candidate
+        signals = set(candidate.signals)
+        score_value = 0
+        ranked = []
+        if signals & {'explicit_semantic_relation', 'used_by_relation', 'derived_claim_relation', 'action_precondition'}:
+            score_value += 4
+            ranked.append('explicit_semantic_relation')
+        if signals & {'explicit_source_relation', 'causal_text_grounding', 'existing_semantic_relation'}:
+            score_value += 3
+            ranked.append('directional_candidate_signal')
+        if candidate.provenance.get('shared_evidence_ids'):
+            score_value += 2
+            ranked.append('shared_grounded_provenance')
+        source = states[candidate.prerequisite_state_id]
+        target = states[candidate.dependent_state_id]
+        if _same_subject(source, target):
+            score_value += 2
+            ranked.append('same_canonical_subject')
+        if item.evidence_span and _MARKER.search(item.evidence_span):
+            score_value += 2
+            ranked.append('causal_or_conditional_evidence')
+        if (
+            source.time_scope.overlaps(target.time_scope)
+            and source.condition_scope.overlaps(target.condition_scope)
+        ):
+            score_value += 1
+            ranked.append('scope_compatible')
+        return score_value, tuple(ranked)
+
+    uncertain = sorted(
+        uncertain,
+        key=lambda item: (
+            -score(item)[0], item.candidate.dependent_state_id,
+            item.candidate.prerequisite_state_id,
+        ),
+    )
+    selected: set[tuple[str, str]] = set()
+    per_dependent: dict[str, int] = {}
+    for item in uncertain:
+        key = (item.candidate.prerequisite_state_id, item.candidate.dependent_state_id)
+        dependent_id = item.candidate.dependent_state_id
+        if (
+            len(selected) >= MAX_UNCERTAIN_TYPING_BYPASS_PER_BATCH
+            or per_dependent.get(dependent_id, 0) >= MAX_UNCERTAIN_TYPING_BYPASS_PER_DEPENDENT
+        ):
+            continue
+        selected.add(key)
+        per_dependent[dependent_id] = per_dependent.get(dependent_id, 0) + 1
+
+    output = []
+    for item in provisional:
+        if item.relation_type is None:
+            output.append(item)
+            continue
+        ranking_score, ranking_signals = score(item)
+        key = (item.candidate.prerequisite_state_id, item.candidate.dependent_state_id)
+        if item.reason.startswith('typing_uncertain:'):
+            if key in selected:
+                output.append(RelationTypingResult(
+                    item.candidate, item.relation_type, item.reason, item.evidence_span,
+                    'uncertain_bypass', ranking_score, ranking_signals, False,
+                ))
+            else:
+                output.append(RelationTypingResult(
+                    item.candidate, None, 'uncertain verifier budget truncated', item.evidence_span,
+                    'uncertain_bypass_truncated', ranking_score, ranking_signals, True,
+                ))
+        else:
+            output.append(RelationTypingResult(
+                item.candidate, item.relation_type, item.reason, item.evidence_span,
+                'typed', ranking_score, ranking_signals, False,
+            ))
+    return tuple(output)
 
 
 __all__ = [
@@ -457,4 +567,6 @@ __all__ = [
     'structural_dependency_direction',
     'dependency_semantics_valid',
     'type_relation_candidates',
+    'MAX_UNCERTAIN_TYPING_BYPASS_PER_DEPENDENT',
+    'MAX_UNCERTAIN_TYPING_BYPASS_PER_BATCH',
 ]

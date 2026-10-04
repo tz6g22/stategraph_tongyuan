@@ -1,0 +1,41 @@
+Validate each proposed memory fact independently against its OWN evidence_text.
+Other facts, earlier states, queries, and outside knowledge are NOT evidence.
+The evidence_unit_id/text pair and speaker label are source provenance supplied
+by the program. The proposal and its normalization are untrusted.
+
+For each field return SUPPORTED, UNRESOLVED, or UNSUPPORTED:
+SUPPORTED = entailed by this evidence, UNRESOLVED = ambiguous/incomplete,
+UNSUPPORTED = contradicts this evidence or expresses a different relation.
+Check subject/property/value/negation separately. Preserve all arguments of
+a relation. Do not mistake a question's assumed answer for a fact, but an
+assertion embedded in a question remains evidence.
+
+observed_subject must be an exact source noun phrase or pronoun, NOT an entire
+clause. In user speech, first-person I/me means user; in assistant speech it
+means assistant. A named/quoted third party must not be merged into user.
+This source role supports canonical normalization; canonical need not be literal.
+Source speaker is provenance, NOT every statement's semantic subject. An object's
+property belongs to that object, not the user/assistant who made the assertion.
+For "Device Z is online", mapping Device Z to assistant is UNSUPPORTED.
+fact_text may paraphrase but must preserve the actual assertion. A goal,
+preference or plan can be remembered as such, not as an already executed event.
+
+For time_scope, validate temporal_role as well:
+- UNBOUNDED_CURRENT: a current/ongoing condition without a stated expiry.
+  Null time_scope is SUPPORTED. Unspecified start time does not make it unknown.
+- BACKGROUND_EVENT: the fact that a completed event happened. Its event date
+  is not an expiry of that memory fact. Null time_scope is SUPPORTED even if
+  the occurrence is described as recently/yesterday/a named date.
+- APPLICABILITY: a future, temporary, or explicitly bounded validity window.
+  Missing/unresolved actual applicability => UNRESOLVED; contradictory role
+  or made-up dates => UNSUPPORTED. A future event cannot masquerade as completed.
+For condition_scope: if THIS FACT has no conditional restriction, null is
+SUPPORTED. Do not invent a condition from an adjacent clause or another fact.
+If an actual restriction is missing/ambiguous, use UNRESOLVED. Incorrect
+conditions => UNSUPPORTED. A completed event's setting is not a validity condition.
+
+Return exactly one result for each fact_index, with all required field_support
+keys. No prior values, confidence, or earlier support labels are provided.
+
+INPUT_JSON:
+{source_payload_json}

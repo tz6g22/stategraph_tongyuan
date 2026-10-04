@@ -4,7 +4,10 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
-from stategraph import EvidenceNode, StateNode, StateStatus, TimeScope
+from stategraph import (
+    DependencyStrength, EvidenceNode, RelationType, StateNode, StateRelation,
+    StateStatus, TimeScope,
+)
 from stategraph.retrieval import CurrentStateRetriever, Premise, PremiseChecker, ResponsePolicy
 from stategraph.storage import InMemoryStateRepository
 
@@ -148,6 +151,62 @@ class RetrievalPremiseModuleTests(unittest.IsolatedAsyncioTestCase):
             'What is Alice location?', group_id='retrieval-test', at=NOW
         )
         self.assertEqual(result.state_ids, ('location',))
+
+    async def test_query_relevant_weak_revalidation_is_carried_to_answer_context(self) -> None:
+        prerequisite = _state(
+            'availability', 'availability', 'available', status=StateStatus.STALE
+        )
+        dependent = _state('plan', 'plan', 'visit museum').with_metadata(
+            needs_revalidation=True,
+            revalidation_reason='weak_prerequisite_invalidated',
+        )
+        repo = await _repository(prerequisite, dependent)
+        await repo.apply((), (StateRelation(
+            source_state_id=prerequisite.state_id,
+            target_state_id=dependent.state_id,
+            relation_type=RelationType.DEPENDS_ON,
+            relation_id='availability-weak-plan',
+            dependency_strength=DependencyStrength.WEAK,
+            group_id='retrieval-test',
+        ),))
+
+        result = await CurrentStateRetriever(repo).retrieve(
+            'What is Alice plan?', group_id='retrieval-test', at=NOW
+        )
+        self.assertIn('plan', result.state_ids)
+        self.assertEqual(
+            result.premise_check.response_policy, ResponsePolicy.CLARIFY
+        )
+        self.assertEqual(result.premise_check.revalidation_state_ids, ('plan',))
+        context = '\n'.join(result.grounded_context())
+        self.assertIn('awaits revalidation', context)
+        self.assertIn('Do not present it as verified', context)
+
+    async def test_query_unrelated_to_weak_pending_state_is_not_blocked(self) -> None:
+        prerequisite = _state(
+            'availability', 'availability', 'available', status=StateStatus.STALE
+        )
+        dependent = _state('plan', 'plan', 'visit museum').with_metadata(
+            needs_revalidation=True,
+            revalidation_reason='weak_prerequisite_invalidated',
+        )
+        location = _state('location', 'location', 'Paris')
+        repo = await _repository(prerequisite, dependent, location)
+        await repo.apply((), (StateRelation(
+            source_state_id=prerequisite.state_id,
+            target_state_id=dependent.state_id,
+            relation_type=RelationType.DEPENDS_ON,
+            relation_id='availability-weak-plan',
+            dependency_strength=DependencyStrength.WEAK,
+            group_id='retrieval-test',
+        ),))
+
+        result = await CurrentStateRetriever(repo).retrieve(
+            'What is Alice location?', group_id='retrieval-test', at=NOW
+        )
+        self.assertEqual(result.state_ids, ('location',))
+        self.assertEqual(result.premise_check.response_policy, ResponsePolicy.PROCEED)
+        self.assertEqual(result.premise_check.revalidation_state_ids, ())
 
     async def test_stale_downstream_state_is_excluded(self) -> None:
         repo = await _repository(

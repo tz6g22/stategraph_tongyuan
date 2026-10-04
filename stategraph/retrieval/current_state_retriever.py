@@ -15,13 +15,20 @@ from stategraph.state.schema import (
     StateRelation,
     StateStatus,
     attributes_compatible,
+    canonical_semantic_scope,
     resolve_state_alias_id,
     utc_now,
 )
 from stategraph.state.factual_relations import canonical_state_relation
 from stategraph.storage.base import StateRepository
 
-from .premise_checker import Premise, PremiseCheckResult, PremiseChecker
+from .premise_checker import Premise, PremiseCheckResult, PremiseChecker, ResponsePolicy
+from .specificity import (
+    QueryLocalClassification,
+    QueryResolution,
+    QueryResolvedState,
+    resolve_query_states,
+)
 
 
 class EvidenceSearch(Protocol):
@@ -93,6 +100,16 @@ def _display_value(value: object) -> str:
     return str(value)
 
 
+def _metadata_values(
+    state: StateNode, plural_key: str, singular_key: str | None = None
+) -> tuple[str, ...]:
+    value = state.metadata.get(plural_key)
+    if value is None and singular_key is not None:
+        value = state.metadata.get(singular_key, ())
+    values = (value,) if isinstance(value, str) else tuple(str(item) for item in value or ())
+    return tuple(sorted(set(values)))
+
+
 def _minimal_evidence_span(state: StateNode, evidence: EvidenceNode) -> str:
     """Bound evidence to a generic local excerpt around the represented state.
 
@@ -132,6 +149,16 @@ class GroundedState:
     state: StateNode
     evidence: tuple[EvidenceNode, ...]
     score: float
+    query_local_classification: str | None = None
+    state_scope_relation: str | None = None
+    shadowed_by_state_id: str | None = None
+
+    @property
+    def assertion(self) -> str:
+        value = _display_value(self.state.value)
+        if self.state.polarity.value == 'NEGATIVE':
+            return f'the value {json.dumps(value, ensure_ascii=False)} does not hold'
+        return value
 
     def render(self) -> str:
         """Serialize one retrieved state as a self-contained answer record."""
@@ -150,16 +177,75 @@ class GroundedState:
         citations = ' | '.join(citations_list) or '(no evidence span available)'
         subject = self.state.canonical_subject_id or self.state.entity
         field = self.state.canonical_field_id or self.state.attribute
-        return '\n'.join(
-            (
-                'STATE',
-                f'Subject: {subject}',
-                f'Field: {field}',
-                f'Value: {_display_value(self.state.value)}',
-                f'Status: {self.state.status.value.upper()}',
-                f'Evidence: {citations}',
+        lines = [
+            'STATE',
+            f'Subject: {subject}',
+            f'Field: {field}',
+            f'Value: {_display_value(self.state.value)}',
+        ]
+        atomic = self.state.metadata.get('atomic_state_proposition')
+        atomic_scope = atomic.get('time_scope') if isinstance(atomic, Mapping) else None
+        semantic_time = (
+            atomic_scope.get('text') if isinstance(atomic_scope, Mapping) else None
+        ) or self.state.metadata.get('semantic_time_scope_text')
+        if semantic_time:
+            lines.append(f'Time scope: {semantic_time}')
+        else:
+            scope = canonical_semantic_scope(
+                self.state.time_scope, observed_at=self.state.observed_at
             )
-        )
+            if scope.start is not None or scope.end is not None:
+                start = scope.start.isoformat() if scope.start else '-infinity'
+                end = scope.end.isoformat() if scope.end else '+infinity'
+                lines.append(
+                    'Time scope: '
+                    f'{start} .. {end}'
+                )
+            else:
+                lines.append('Time scope: UNSPECIFIED')
+        if self.state.condition_scope.conditions or self.state.condition_scope.description:
+            conditions = ', '.join(
+                f'{key}={value}' for key, value in self.state.condition_scope.conditions
+            )
+            if self.state.condition_scope.description:
+                conditions = ', '.join(filter(None, (conditions, self.state.condition_scope.description)))
+            lines.append(f'Condition scope: {conditions}')
+        else:
+            lines.append('Condition scope: UNSPECIFIED')
+        if self.state.polarity.value == 'NEGATIVE':
+            lines.extend(('Polarity: NEGATIVE', f'Assertion: {self.assertion}'))
+        else:
+            lines.append('Polarity: POSITIVE')
+        if self.query_local_classification:
+            lines.append(f'Query-local resolution: {self.query_local_classification}')
+        if self.state_scope_relation:
+            lines.append(f'State/query scope relation: {self.state_scope_relation}')
+        if self.shadowed_by_state_id:
+            lines.append(f'Shadowed by state: {self.shadowed_by_state_id}')
+        if self.state.metadata.get('needs_revalidation'):
+            lines.append('Revalidation: ' + json.dumps({
+                'classification': self.query_local_classification or 'ACTIVE_NEEDS_REVALIDATION',
+                'needs_revalidation': True,
+                'reason': self.state.metadata.get('revalidation_reason', 'unspecified'),
+                'source_state_ids': _metadata_values(
+                    self.state, 'revalidation_source_state_ids', 'revalidation_source_state_id'
+                ),
+                'dependency_relation_ids': _metadata_values(
+                    self.state,
+                    'revalidation_dependency_relation_ids',
+                    'revalidation_dependency_relation_id',
+                ),
+                'reasons': _metadata_values(self.state, 'revalidation_reasons'),
+            }, ensure_ascii=False, sort_keys=True))
+        lines.append(f'Status: {self.state.status.value.upper()}')
+        if self.state.status is StateStatus.CURRENT:
+            lines.append(
+                'Reliability: ACTIVE_NEEDS_REVALIDATION'
+                if self.state.metadata.get('needs_revalidation')
+                else 'Reliability: ACTIVE_CONFIRMED'
+            )
+        lines.append(f'Evidence: {citations}')
+        return '\n'.join(lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +258,7 @@ class CurrentStateRetrieval:
     subject_scoped: bool = False
     retrieval_trace: dict[str, Any] | None = None
     historical_states: tuple[GroundedState, ...] = ()
+    revalidation_signals: tuple[dict[str, Any], ...] = ()
 
     @property
     def state_ids(self) -> tuple[str, ...]:
@@ -276,8 +363,16 @@ class CurrentStateRetriever:
                 group_id=group_id,
                 statuses={StateStatus.STALE, StateStatus.HISTORICAL},
             )
-        current = [state for state in available if state.is_effective(at)]
-        current = self._resolve_temporary_exceptions(query, current)
+        effective = [state for state in available if state.is_effective(at)]
+        current_candidates = [
+            state for state in effective if state.status is StateStatus.CURRENT
+        ]
+        query_resolution = resolve_query_states(query, current_candidates)
+        current = list(query_resolution.active_states)
+        query_conflict_states = list(query_resolution.conflicting_states)
+        uncertain_current = [
+            state for state in effective if state.status is StateStatus.UNCERTAIN
+        ]
         conflict_candidates = [
             state
             for state in available
@@ -332,13 +427,33 @@ class CurrentStateRetriever:
         ]
         shadowed = self._shadowed_current_states(query, current, stale_for_query, evidence_ids)
         current = [state for state in current if state.state_id not in shadowed]
+        premise_query_resolution = QueryResolution(
+            query_resolution.query_scope,
+            tuple(
+                row for row in query_resolution.states
+                if row.state.state_id not in shadowed
+            ),
+        )
+        premise_source_candidates = [
+            state for state in current_candidates if state.state_id not in shadowed
+        ]
         historical = [
             state for state in stale_history
             if state.status == StateStatus.HISTORICAL
             and state.time_scope.is_effective(at)
             and self._history_query(query)
         ]
-        selectable = [*current, *conflict_candidates, *historical]
+        selectable_by_id = {
+            state.state_id: state
+            for state in (
+                *current,
+                *query_conflict_states,
+                *uncertain_current,
+                *conflict_candidates,
+                *historical,
+            )
+        }
+        selectable = list(selectable_by_id.values())
         canonical_subject_ids = self._resolve_canonical_subjects(
             query, selectable, evidence_ids
         )
@@ -385,19 +500,106 @@ class CurrentStateRetriever:
             if state.state_id not in relational_ids
             and self._relation_entity_key(state.entity) not in blocked_entities
         ]
+        selected_ids = {state.state_id for state in selected}
+        selected.extend(
+            state for state in sorted(query_conflict_states, key=lambda item: item.state_id)
+            if state.state_id not in selected_ids
+        )
 
         # Premise correction sees the full current/candidate graph, not only top-k context.
+        premise_resolutions = tuple(
+            resolve_query_states(premise.text, premise_source_candidates)
+            for premise in premise_claims
+        )
         premise_check = self._premise_checker.check(
             query,
-            current,
+            [*current, *query_conflict_states],
             premise_claims,
             conflict_candidates=conflict_candidates,
             dependencies=dependencies,
             stale_states=stale_for_query,
+            query_resolution=premise_query_resolution,
+            premise_resolutions=premise_resolutions,
         )
+        selected_ids = {state.state_id for state in selected}
+        selected_revalidation_ids = {
+            state.state_id for state in selected
+            if state.status is StateStatus.CURRENT
+            and state.metadata.get('needs_revalidation')
+        }
+        relevant_revalidation_ids = set(premise_check.revalidation_state_ids)
+        relevant_revalidation_ids.update(selected_revalidation_ids)
+        relations_by_id = {relation.relation_id: relation for relation in dependencies}
+        revalidation_signals: list[dict[str, Any]] = []
+        for state_id in sorted(relevant_revalidation_ids):
+            state = states_by_id.get(state_id)
+            if state is None or not state.metadata.get('needs_revalidation'):
+                continue
+            relation_ids = _metadata_values(
+                state,
+                'revalidation_dependency_relation_ids',
+                'revalidation_dependency_relation_id',
+            )
+            revalidation_signals.append({
+                'state_id': state_id,
+                'status': state.status.value,
+                'needs_revalidation': True,
+                'revalidation_reason': state.metadata.get('revalidation_reason', 'unspecified'),
+                'revalidation_source_state_ids': list(_metadata_values(
+                    state, 'revalidation_source_state_ids', 'revalidation_source_state_id'
+                )),
+                'revalidation_dependency_relation_ids': list(relation_ids),
+                'revalidation_dependency_types': sorted({
+                    relations_by_id[relation_id].relation_type.value
+                    for relation_id in relation_ids if relation_id in relations_by_id
+                }),
+                'revalidation_reasons': list(_metadata_values(state, 'revalidation_reasons')),
+            })
+        unresolved_selected = [
+            state_id for state_id in sorted(selected_revalidation_ids)
+            if not query_resolution.has_confirmed_equivalent_support(state_id)
+            and state_id not in premise_check.revalidation_state_ids
+        ]
+        if unresolved_selected and premise_check.response_policy is ResponsePolicy.PROCEED:
+            notices = tuple(
+                f"State {signal['state_id']} is CURRENT but awaits revalidation "
+                f"(sources={','.join(signal['revalidation_source_state_ids']) or 'unknown'}; "
+                f"relations={','.join(signal['revalidation_dependency_relation_ids']) or 'unknown'}). "
+                "Do not present it as verified; clarify or abstain."
+                for signal in revalidation_signals
+                if signal['state_id'] in unresolved_selected
+            )
+            premise_check = replace(
+                premise_check,
+                response_policy=ResponsePolicy.CLARIFY,
+                revalidation_state_ids=tuple(sorted(
+                    set(premise_check.revalidation_state_ids) | set(unresolved_selected)
+                )),
+                revalidation_notices=(*premise_check.revalidation_notices, *notices),
+                revalidation_source_state_ids=tuple(sorted(
+                    set(premise_check.revalidation_source_state_ids)
+                    | {
+                        source_id
+                        for signal in revalidation_signals
+                        if signal['state_id'] in unresolved_selected
+                        for source_id in signal['revalidation_source_state_ids']
+                    }
+                )),
+                revalidation_dependency_relation_ids=tuple(sorted(
+                    set(premise_check.revalidation_dependency_relation_ids)
+                    | {
+                        relation_id
+                        for signal in revalidation_signals
+                        if signal['state_id'] in unresolved_selected
+                        for relation_id in signal['revalidation_dependency_relation_ids']
+                    }
+                )),
+                revalidation_decision='REVALIDATION_REQUIRED',
+            )
         grounded: list[GroundedState] = []
         grounded_candidates: list[GroundedState] = []
         grounded_historical: list[GroundedState] = []
+        resolved_by_id = {item.state.state_id: item for item in query_resolution.states}
         for state in selected:
             evidence = await self._repository.get_evidence(state.evidence_ids)
             found_ids = {item.evidence_id for item in evidence}
@@ -406,11 +608,20 @@ class CurrentStateRetriever:
                 raise EvidenceGroundingError(
                     f'state {state.state_id} references missing evidence: {missing}'
                 )
+            resolution = resolved_by_id.get(state.state_id)
             item = GroundedState(
-                state, tuple(evidence), self._score(query, state, evidence_ids)
+                state,
+                tuple(evidence),
+                self._score(query, state, evidence_ids),
+                resolution.classification.value if resolution else None,
+                resolution.scope_relation.value if resolution else None,
+                resolution.shadowed_by_state_id if resolution else None,
             )
             if state.status == StateStatus.CURRENT:
-                grounded.append(item)
+                if resolution and resolution.classification is QueryLocalClassification.CONFLICTING_FOR_QUERY:
+                    grounded_candidates.append(item)
+                else:
+                    grounded.append(item)
             elif state.status == StateStatus.HISTORICAL:
                 grounded_historical.append(item)
             else:
@@ -435,6 +646,60 @@ class CurrentStateRetriever:
                 'normalized_query_tokens': list(self._field_tokens(query)),
                 'canonical_subject_ids': list(canonical_subject_ids),
                 'subject_scoped': subject_scoped,
+                'QUERY_SCOPE': query_resolution.query_scope.as_dict(),
+                'QUERY_CONDITION_SCOPE': dict(query_resolution.query_scope.condition_scope.conditions),
+                'STATE_SCOPE_RELATION': {
+                    row.state.state_id: row.scope_relation.value
+                    for row in query_resolution.states
+                },
+                'STATE_SPECIFICITY': {
+                    row.state.state_id: list(row.specificity)
+                    for row in query_resolution.states
+                },
+                'STATE_PROPOSITION_VALUE_KEY': {
+                    row.state.state_id: row.state.canonical_value_key
+                    for row in query_resolution.states
+                },
+                'STATE_POLARITY': {
+                    row.state.state_id: row.state.polarity.value
+                    for row in query_resolution.states
+                },
+                'QUERY_LOCAL_CLASSIFICATION': {
+                    row.state.state_id: row.classification.value
+                    for row in query_resolution.states
+                },
+                'QUERY_LOCAL_REASON': {
+                    row.state.state_id: row.reason
+                    for row in query_resolution.states
+                    if row.reason
+                },
+                'SHADOWED_BY_STATE_ID': {
+                    row.state.state_id: row.shadowed_by_state_id
+                    for row in query_resolution.states
+                    if row.shadowed_by_state_id
+                },
+                'QUERY_CONFLICT_STATE_IDS': list(query_resolution.conflict_state_ids),
+                'PREMISE_RESOLUTION_INPUT_COUNT': len(premise_resolutions) * len(current_candidates),
+                'PREMISE_RESOLUTION_ACTIVE_COUNT': sum(
+                    len(item.premise_states) for item in premise_resolutions
+                ),
+                'PREMISE_RESOLUTION_SHADOWED_COUNT': sum(
+                    len(item.shadowed_states) for item in premise_resolutions
+                ),
+                'PREMISE_RESOLUTION_CONFLICT_COUNT': sum(
+                    len(item.conflicting_states) for item in premise_resolutions
+                ),
+                'QUERY_RELEVANT_NEEDS_REVALIDATION_COUNT': len(revalidation_signals),
+                'PREMISE_CONFIRMED_SUPPORT_COUNT': premise_check.confirmed_support_count,
+                'PREMISE_REVALIDATION_SUPPORT_COUNT': premise_check.revalidation_support_count,
+                'PREMISE_REVALIDATION_CONFLICT_COUNT': premise_check.revalidation_conflict_count,
+                'PREMISE_REVALIDATION_SOURCE_IDS': list(premise_check.revalidation_source_state_ids),
+                'PREMISE_REVALIDATION_DECISION': premise_check.revalidation_decision,
+                'ANSWER_PAYLOAD_CONFIRMED_STATE_COUNT': sum(
+                    not item.state.metadata.get('needs_revalidation')
+                    for item in grounded
+                ),
+                'ANSWER_PAYLOAD_NEEDS_REVALIDATION_COUNT': len(revalidation_signals),
                 'evidence_ids': sorted(evidence_ids),
                 'candidates': candidate_trace,
                 'coverage_assignments': coverage_assignments,
@@ -442,11 +707,19 @@ class CurrentStateRetriever:
                 'relational_traversal': relational_trace,
                 'final_state_ids': [state.state_id for state in selected],
                 'shadowed_current_state_ids': sorted(shadowed),
+                'query_shadowed_state_ids': [
+                    row.state.state_id for row in query_resolution.states
+                    if row.classification is QueryLocalClassification.SHADOWED_FOR_QUERY
+                ],
+                'query_exception_state_ids': [
+                    state.state_id for state in query_resolution.exception_states
+                ],
                 'stale_query_candidates': [state.state_id for state in stale_for_query],
                 'historical_query': bool(historical),
                 'limit': limit,
             },
             historical_states=tuple(grounded_historical),
+            revalidation_signals=tuple(revalidation_signals),
         )
 
     async def retrieve_history(
@@ -1586,39 +1859,6 @@ class CurrentStateRetriever:
             1, len(intent_tokens | state_tokens)
         )
         return cls._field_overlap(intent, state) + lexical
-
-    @staticmethod
-    def _resolve_temporary_exceptions(query: str, states: list[StateNode]) -> list[StateNode]:
-        """Prefer an applicable narrow exception over its still-valid general state."""
-
-        query_tokens = set(re.findall(r'\w+', query.casefold(), flags=re.UNICODE))
-        suppressed: set[str] = set()
-        for broad in states:
-            for narrow in states:
-                if (
-                    broad.state_id == narrow.state_id
-                    or broad.identity_key[0] != narrow.identity_key[0]
-                    or not attributes_compatible(broad.attribute, narrow.attribute)
-                ):
-                    continue
-                if broad.normalised_value == narrow.normalised_value:
-                    continue
-                condition_values = {
-                    token
-                    for _, value in narrow.condition_scope.conditions
-                    for token in re.findall(r'\w+', value.casefold(), flags=re.UNICODE)
-                }
-                condition_applies = (
-                    narrow.condition_scope.is_more_specific_than(broad.condition_scope)
-                    and condition_values.issubset(query_tokens)
-                )
-                time_applies = (
-                    broad.time_scope.contains(narrow.time_scope)
-                    and broad.time_scope != narrow.time_scope
-                )
-                if condition_applies or time_applies:
-                    suppressed.add(broad.state_id)
-        return [state for state in states if state.state_id not in suppressed]
 
     @staticmethod
     def _history_query(query: str) -> bool:
